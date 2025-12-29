@@ -99,7 +99,9 @@ The API is live and can be accessed at:
 
 ## Scheduled Updates (Optional)
 
-To keep your narratives fresh without manual intervention, set up the Heroku Scheduler:
+The application features built-in "lazy" refreshing: whenever a user hits the API and the cache is older than 1 hour, it automatically pulls new data and regenerates narratives. 
+
+To keep your narratives proactively fresh (ensuring no visitor ever waits for a refresh), set up the Heroku Scheduler:
 
 1. **Add the Scheduler:**
    - **CLI:** `heroku addons:create scheduler:standard -a your-app-name`
