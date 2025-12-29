@@ -45,7 +45,7 @@ def generate_narratives():
         f"?lsp__name=SpaceX"
         f"&net__gte={three_months_ago.strftime('%Y-%m-%d')}"
         f"&net__lte={current_time.strftime('%Y-%m-%d')}"
-        f"&limit=50"
+        f"&limit=40"
         f"&ordering=-net"
     )
     response = requests.get(url)
@@ -94,13 +94,11 @@ def generate_narratives():
 
 In the style of Cities Skylines notifications: kind of witty and dry. Factual, complete, somewhat technical - think Kerbal Space Program.
 
-IMPORTANT: Return ONLY a Python list assignment and nothing else. No conversational filler, no introductory text, no markdown formatting (unless specifically asked for a python block).
+IMPORTANT: Return ONLY a Python list assignment and nothing else. Be extremely concise for each entry to avoid truncation. No conversational filler, no introductory text, no markdown formatting.
 
-Examples of the desired style:
+Examples:
 - Falcon 9 hoists MTG-S1/Sentinel-4A to geosync from LC-39A; Ariane's loss is our nominal gain, booster recovered without drama.
 - 500th Falcon 9 ignites with 27 Starlinks from SLC-40; B1067 clocks 29th flight, orbit insertion as predictable as gravity.
-- Another 28 Starlinks flung to LEO via Falcon 9 at SLC-40; deployment flawless, booster sticks the landing like it's bored.
-- 24 KuiperSats for Amazon lofted by Falcon 9 at SLC-40; ironic assist to rivals, payloads separate cleanly in orbit.
 - Starship Flight 10 ignites from Starbase; hot-staging clean, ship splashes precisely in Indian Ocean, Super Heavy boosts back nominally.
 
 Format each as: month/day HHMM: description
@@ -116,7 +114,7 @@ Output as a Python list assignment: launch_descriptions = [...]"""
             "model": "grok-3",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 2000
+            "max_tokens": 4000
         }
         response = requests.post("https://api.x.ai/v1/chat/completions", headers=headers, json=payload)
         if response.status_code != 200:
@@ -129,28 +127,29 @@ Output as a Python list assignment: launch_descriptions = [...]"""
         raise ValueError(f"Grok API call failed: {str(e)}")
     
     try:
-        # Try to find a python code block first
-        code_block_match = re.search(r"```(?:python)?\s*(launch_descriptions\s*=\s*\[.*?\])```", generated_text, re.DOTALL)
-        if code_block_match:
-            code_content = code_block_match.group(1)
-            # Extract just the list part from the assignment
-            list_match = re.search(r"\[.*\]", code_content, re.DOTALL)
-            if list_match:
-                list_str = list_match.group(0)
-            else:
-                list_str = code_content
-        else:
-            # Fallback to finding brackets
+        # Robust extraction: find all strings that match the pattern "month/day HHMM: description"
+        # We look for "MM/DD HHMM: text" inside double or single quotes.
+        # This works even if the list is truncated.
+        descriptions = re.findall(r'["\'](\d{1,2}/\d{1,2} \d{4}: .*?)["\']', generated_text)
+        
+        if not descriptions:
+            # Fallback for alternative formatting: try to find a python-like list
             start_idx = generated_text.find('[')
             end_idx = generated_text.rfind(']') + 1
-            if start_idx == -1 or end_idx == 0:
-                raise ValueError("No list found in response")
-            list_str = generated_text[start_idx:end_idx]
+            if start_idx != -1 and end_idx > start_idx:
+                try:
+                    list_str = generated_text[start_idx:end_idx]
+                    descriptions = ast.literal_eval(list_str)
+                except:
+                    pass
         
-        descriptions = ast.literal_eval(list_str)
+        if not descriptions:
+            raise ValueError("No valid launch descriptions found in response")
         
         if not isinstance(descriptions, list) or not all(isinstance(d, str) for d in descriptions):
             raise ValueError("Parsed content is not a list of strings")
+            
+        print(f"Successfully parsed {len(descriptions)} narratives.")
     except Exception as e:
         raise ValueError(f"Failed to parse Grok response: {str(e)}")
     
