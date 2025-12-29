@@ -10,12 +10,24 @@ A FastAPI application that fetches recent SpaceX launches and generates witty, "
 - **In-memory Caching**: Caches narratives to improve performance and minimize API costs without external dependencies.
 - **Heroku Ready**: Optimized for Heroku deployment.
 
+## Live API
+
+The API is live and can be accessed at:
+`https://launch-narrative-api-dafccc521fb8.herokuapp.com/`
+
 ## API Endpoints
 
-- `GET /`: The Dashboard UI.
-- `GET /recent_launches_narratives`: Returns narratives as a JSON list.
-- `GET /metrics`: Returns application performance metrics.
-- `POST /refresh`: Forces a refresh of the narrative cache.
+- **Dashboard UI**: `GET /`
+  - URL: `https://launch-narrative-api-dafccc521fb8.herokuapp.com/`
+- **Narratives List**: `GET /recent_launches_narratives`
+  - URL: `https://launch-narrative-api-dafccc521fb8.herokuapp.com/recent_launches_narratives`
+  - Returns a JSON object with a list of witty launch descriptions.
+- **Metrics**: `GET /metrics`
+  - URL: `https://launch-narrative-api-dafccc521fb8.herokuapp.com/metrics`
+  - Returns real-time application performance metrics.
+- **Cache Refresh**: `POST /refresh`
+  - URL: `https://launch-narrative-api-dafccc521fb8.herokuapp.com/refresh`
+  - Triggers a manual refresh of the launch data and Grok narratives.
 
 ## Local Setup
 
