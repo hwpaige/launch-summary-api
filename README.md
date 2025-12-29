@@ -7,7 +7,7 @@ A FastAPI application that fetches recent SpaceX launches and generates witty, "
 - **Witty Narratives**: Generates short, dry, and technical descriptions of SpaceX launches.
 - **FastAPI**: Modern, high-performance web framework.
 - **Beautiful Dashboard**: Built-in UI to monitor narratives and API metrics (Requests, Cache Hits, Grok API usage).
-- **Redis Caching**: Caches narratives to improve performance and minimize API costs.
+- **In-memory Caching**: Caches narratives to improve performance and minimize API costs without external dependencies.
 - **Heroku Ready**: Optimized for Heroku deployment.
 
 ## API Endpoints
@@ -33,7 +33,6 @@ A FastAPI application that fetches recent SpaceX launches and generates witty, "
    Create a `.env` file:
    ```env
    XAI_API_KEY=your_xai_api_key_here
-   REDIS_URL=redis://localhost:6379/0
    ```
 5. **Run the application:**
    ```powershell
@@ -49,21 +48,17 @@ A FastAPI application that fetches recent SpaceX launches and generates witty, "
    ```bash
    heroku create your-app-name
    ```
-2. **Add Heroku Redis add-on:**
-   ```bash
-   heroku addons:create heroku-redis:mini -a your-app-name
-   ```
-3. **Set the xAI API Key:**
+2. **Set the xAI API Key:**
    ```bash
    heroku config:set XAI_API_KEY=your_xai_api_key_here -a your-app-name
    ```
-4. **Deploy the code:**
+3. **Deploy the code:**
    ```bash
    git add .
    git commit -m "Initial commit"
    git push heroku main
    ```
-5. **Set up periodic refreshes (Optional):**
+4. **Set up periodic refreshes (Optional):**
    Use the Heroku Scheduler add-on to call the `/refresh` endpoint periodically:
    ```bash
    heroku addons:create scheduler:standard -a your-app-name

@@ -4,7 +4,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 import requests
 import ast
-import redis
 import re
 from dotenv import load_dotenv
 
@@ -12,28 +11,28 @@ load_dotenv()  # Load environment variables from .env if present
 
 app = FastAPI()
 
-# Initialize Redis (Heroku will set REDIS_URL env var after adding the add-on)
-redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-r = redis.from_url(redis_url)
-CACHE_KEY = "launch_narratives"
-METRICS_KEY = "launch_metrics"
+# In-memory storage for caching and metrics
+cache = {
+    "launch_narratives": None,
+    "last_updated": None
+}
+metrics = {
+    "total_requests": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "api_calls": 0
+}
+
 CACHE_TTL = 3600  # 1 hour TTL in seconds; adjust as needed
 
 def increment_metric(field):
-    """Increment a metric in Redis."""
-    try:
-        r.hincrby(METRICS_KEY, field, 1)
-    except Exception as e:
-        print(f"Metrics error: {e}")
+    """Increment a metric in memory."""
+    if field in metrics:
+        metrics[field] += 1
 
 def get_metrics():
-    """Retrieve metrics from Redis."""
-    try:
-        metrics = r.hgetall(METRICS_KEY)
-        return {k.decode('utf-8'): int(v.decode('utf-8')) for k, v in metrics.items()}
-    except Exception as e:
-        print(f"Metrics error: {e}")
-        return {}
+    """Retrieve metrics from memory."""
+    return metrics
 
 def generate_narratives():
     """Fetch launches and generate narratives using Grok."""
@@ -158,21 +157,22 @@ Output as a Python list assignment: launch_descriptions = [...]"""
 def get_narratives():
     """Serve from cache if available; generate otherwise."""
     increment_metric("total_requests")
-    try:
-        cached = r.get(CACHE_KEY)
-        if cached:
+    
+    current_time = datetime.now(timezone.utc)
+    
+    # Check if cache is valid (not None and within TTL)
+    if cache["launch_narratives"] and cache["last_updated"]:
+        elapsed = (current_time - cache["last_updated"]).total_seconds()
+        if elapsed < CACHE_TTL:
             increment_metric("cache_hits")
-            return {"descriptions": ast.literal_eval(cached.decode('utf-8'))}
-    except Exception as e:
-        # Fallback if redis fails
-        print(f"Redis error: {e}")
+            return {"descriptions": cache["launch_narratives"]}
     
     increment_metric("cache_misses")
     descriptions = generate_narratives()
-    try:
-        r.setex(CACHE_KEY, CACHE_TTL, str(descriptions))
-    except Exception as e:
-        print(f"Redis error: {e}")
+    
+    # Update cache
+    cache["launch_narratives"] = descriptions
+    cache["last_updated"] = current_time
         
     return {"descriptions": descriptions}
 
@@ -359,7 +359,8 @@ def dashboard(request: Request):
 def refresh_cache():
     """Force refresh the cache (call this via scheduler)."""
     descriptions = generate_narratives()
-    r.setex(CACHE_KEY, CACHE_TTL, str(descriptions))
+    cache["launch_narratives"] = descriptions
+    cache["last_updated"] = datetime.now(timezone.utc)
     return {"status": "Cache refreshed"}
 
 if __name__ == "__main__":
