@@ -5,34 +5,90 @@ from fastapi.responses import HTMLResponse
 import requests
 import ast
 import re
+import redis
+import json
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
 
 app = FastAPI()
 
-# In-memory storage for caching and metrics
-cache = {
+# Redis Configuration for persistence across Heroku builds
+def get_redis_client():
+    # List of potential Redis environment variables used by various Heroku add-ons
+    redis_env_vars = ["REDIS_URL", "REDISCLOUD_URL", "REDISTOGO_URL"]
+    
+    # Also check for HEROKU_REDIS_*_URL
+    for key in os.environ:
+        if key.startswith("HEROKU_REDIS_") and key.endswith("_URL"):
+            redis_env_vars.append(key)
+
+    for var in redis_env_vars:
+        url = os.getenv(var)
+        if url:
+            try:
+                # Heroku Redis often requires SSL with cert verification disabled for self-signed certs
+                if url.startswith("rediss://"):
+                    client = redis.from_url(url, decode_responses=True, ssl_cert_reqs=None)
+                else:
+                    client = redis.from_url(url, decode_responses=True)
+                client.ping()
+                print(f"Connected to Redis via {var}")
+                return client
+            except Exception as e:
+                print(f"Failed to connect to Redis via {var}: {e}")
+    
+    print("No Redis instance found or connection failed. Using in-memory fallback (non-persistent).")
+    return None
+
+r = get_redis_client()
+
+# In-memory storage fallback (used only if Redis is unavailable)
+_local_cache = {
     "launch_narratives": None,
     "last_updated": None
 }
-metrics = {
+_local_metrics = {
     "total_requests": 0,
     "cache_hits": 0,
     "cache_misses": 0,
     "api_calls": 0
 }
 
-CACHE_TTL = 3600  # 1 hour TTL in seconds; adjust as needed
+CACHE_KEY = "launch_narratives_v2"
+CACHE_TIME_KEY = "last_updated_v2"
+METRICS_KEY = "app_metrics_v2"
+CACHE_TTL = 3600  # 1 hour TTL in seconds
 
 def increment_metric(field):
-    """Increment a metric in memory."""
-    if field in metrics:
-        metrics[field] += 1
+    """Increment a metric in Redis or memory."""
+    if r:
+        try:
+            r.hincrby(METRICS_KEY, field, 1)
+            return
+        except Exception as e:
+            print(f"Redis error in increment_metric: {e}")
+    
+    # Fallback to in-memory
+    if field in _local_metrics:
+        _local_metrics[field] += 1
 
 def get_metrics():
-    """Retrieve metrics from memory."""
-    return metrics
+    """Retrieve metrics from Redis or memory."""
+    if r:
+        try:
+            data = r.hgetall(METRICS_KEY)
+            # Convert string values from Redis to integers
+            return {k: int(v) for k, v in data.items()} if data else {
+                "total_requests": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "api_calls": 0
+            }
+        except Exception as e:
+            print(f"Redis error in get_metrics: {e}")
+    
+    return _local_metrics
 
 def generate_narratives():
     """Fetch launches and generate narratives using Grok."""
@@ -161,20 +217,44 @@ def get_narratives():
     increment_metric("total_requests")
     
     current_time = datetime.now(timezone.utc)
-    
+    cached_narratives = None
+    last_updated = None
+
+    # Try to get from Redis
+    if r:
+        try:
+            data = r.get(CACHE_KEY)
+            time_str = r.get(CACHE_TIME_KEY)
+            if data and time_str:
+                cached_narratives = json.loads(data)
+                last_updated = datetime.fromisoformat(time_str)
+        except Exception as e:
+            print(f"Redis error in get_narratives: {e}")
+    else:
+        # Fallback to in-memory
+        cached_narratives = _local_cache["launch_narratives"]
+        last_updated = _local_cache["last_updated"]
+
     # Check if cache is valid (not None and within TTL)
-    if cache["launch_narratives"] and cache["last_updated"]:
-        elapsed = (current_time - cache["last_updated"]).total_seconds()
+    if cached_narratives and last_updated:
+        elapsed = (current_time - last_updated).total_seconds()
         if elapsed < CACHE_TTL:
             increment_metric("cache_hits")
-            return {"descriptions": cache["launch_narratives"]}
+            return {"descriptions": cached_narratives}
     
     increment_metric("cache_misses")
     descriptions = generate_narratives()
     
-    # Update cache
-    cache["launch_narratives"] = descriptions
-    cache["last_updated"] = current_time
+    # Update cache (Redis and/or in-memory)
+    if r:
+        try:
+            r.set(CACHE_KEY, json.dumps(descriptions))
+            r.set(CACHE_TIME_KEY, current_time.isoformat())
+        except Exception as e:
+            print(f"Redis error updating cache: {e}")
+    
+    _local_cache["launch_narratives"] = descriptions
+    _local_cache["last_updated"] = current_time
         
     return {"descriptions": descriptions}
 
@@ -362,14 +442,26 @@ def refresh_cache():
     """Force refresh the cache (call this via scheduler)."""
     print("Manual cache refresh triggered.")
     descriptions = generate_narratives()
-    cache["launch_narratives"] = descriptions
-    cache["last_updated"] = datetime.now(timezone.utc)
+    current_time = datetime.now(timezone.utc)
+    
+    # Update Redis
+    if r:
+        try:
+            r.set(CACHE_KEY, json.dumps(descriptions))
+            r.set(CACHE_TIME_KEY, current_time.isoformat())
+        except Exception as e:
+            print(f"Redis error in refresh_cache: {e}")
+            
+    # Update in-memory fallback
+    _local_cache["launch_narratives"] = descriptions
+    _local_cache["last_updated"] = current_time
+    
     count = len(descriptions)
     print(f"Cache successfully refreshed with {count} narratives.")
     return {
         "status": "Cache refreshed",
         "count": count,
-        "timestamp": cache["last_updated"].isoformat()
+        "timestamp": current_time.isoformat()
     }
 
 if __name__ == "__main__":
