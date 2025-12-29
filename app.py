@@ -94,6 +94,8 @@ def generate_narratives():
 
 In the style of Cities Skylines notifications: kind of witty and dry. Factual, complete, somewhat technical - think Kerbal Space Program.
 
+IMPORTANT: Return ONLY a Python list assignment and nothing else. No conversational filler, no introductory text, no markdown formatting (unless specifically asked for a python block).
+
 Examples of the desired style:
 - Falcon 9 hoists MTG-S1/Sentinel-4A to geosync from LC-39A; Ariane's loss is our nominal gain, booster recovered without drama.
 - 500th Falcon 9 ignites with 27 Starlinks from SLC-40; B1067 clocks 29th flight, orbit insertion as predictable as gravity.
@@ -122,6 +124,7 @@ Output as a Python list assignment: launch_descriptions = [...]"""
         
         data = response.json()
         generated_text = data['choices'][0]['message']['content']
+        print(f"DEBUG: Raw Grok response: {generated_text}")
     except Exception as e:
         raise ValueError(f"Grok API call failed: {str(e)}")
     
@@ -358,10 +361,17 @@ def dashboard(request: Request):
 @app.post("/refresh")
 def refresh_cache():
     """Force refresh the cache (call this via scheduler)."""
+    print("Manual cache refresh triggered.")
     descriptions = generate_narratives()
     cache["launch_narratives"] = descriptions
     cache["last_updated"] = datetime.now(timezone.utc)
-    return {"status": "Cache refreshed"}
+    count = len(descriptions)
+    print(f"Cache successfully refreshed with {count} narratives.")
+    return {
+        "status": "Cache refreshed",
+        "count": count,
+        "timestamp": cache["last_updated"].isoformat()
+    }
 
 if __name__ == "__main__":
     import uvicorn
