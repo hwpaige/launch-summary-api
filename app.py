@@ -112,7 +112,7 @@ Output as a Python list assignment: launch_descriptions = [...]"""
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "grok-beta",
+            "model": "grok-3",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
             "max_tokens": 2000
