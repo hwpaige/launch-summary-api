@@ -90,8 +90,8 @@ def get_metrics():
     
     return _local_metrics
 
-def generate_narratives():
-    """Fetch launches and generate narratives using Grok."""
+def generate_narratives(existing_narratives=None):
+    """Fetch launches and generate narratives using Grok, appending new ones only."""
     increment_metric("api_calls")
     current_time = datetime.now(timezone.utc)
     three_months_ago = current_time - timedelta(days=90)
@@ -138,14 +138,33 @@ def generate_narratives():
         })
     
     if not launches:
-        return []
+        return existing_narratives if existing_narratives else []
+
+    # Identify new launches not in the current cache
+    existing_keys = set()
+    if existing_narratives:
+        for narr in existing_narratives:
+            # Extract "MM/DD HHMM" from the start of the narrative
+            parts = narr.split(': ', 1)
+            if parts:
+                existing_keys.add(parts[0])
+    
+    new_launches = [l for l in launches if l['date_time'] not in existing_keys]
+    
+    if existing_narratives and not new_launches:
+        print("No new launches found. Cache is up to date.")
+        return existing_narratives
+
+    # If we have existing narratives, only process the new ones to append
+    # If no cache exists, process all fetched launches
+    launches_to_process = new_launches if existing_narratives else launches
     
     launch_list = "\n".join([
         f"{l['date_time']}: {l['mission']} from {l['pad']}, {l['rocket']} to {l['orbit']}, status {l['status']}"
-        for l in launches
+        for l in launches_to_process
     ])
     
-    prompt = f"""Generate a list of short news like descriptions for these recent SpaceX launches:
+    prompt = f"""Generate a list of short news like descriptions for these SpaceX launches:
 {launch_list}
 
 In the style of Cities Skylines notifications: kind of witty and dry. Factual, complete, somewhat technical - think Kerbal Space Program.
@@ -184,32 +203,38 @@ Output as a Python list assignment: launch_descriptions = [...]"""
     
     try:
         # Robust extraction: find all strings that match the pattern "month/day HHMM: description"
-        # We look for "MM/DD HHMM: text" inside double or single quotes.
-        # This works even if the list is truncated.
-        descriptions = re.findall(r'["\'](\d{1,2}/\d{1,2} \d{4}: .*?)["\']', generated_text)
+        new_descriptions = re.findall(r'["\'](\d{1,2}/\d{1,2} \d{4}: .*?)["\']', generated_text)
         
-        if not descriptions:
-            # Fallback for alternative formatting: try to find a python-like list
+        if not new_descriptions:
+            # Fallback for alternative formatting
             start_idx = generated_text.find('[')
             end_idx = generated_text.rfind(']') + 1
             if start_idx != -1 and end_idx > start_idx:
                 try:
                     list_str = generated_text[start_idx:end_idx]
-                    descriptions = ast.literal_eval(list_str)
+                    new_descriptions = ast.literal_eval(list_str)
                 except:
                     pass
         
-        if not descriptions:
+        if not new_descriptions:
             raise ValueError("No valid launch descriptions found in response")
         
-        if not isinstance(descriptions, list) or not all(isinstance(d, str) for d in descriptions):
+        if not isinstance(new_descriptions, list) or not all(isinstance(d, str) for d in new_descriptions):
             raise ValueError("Parsed content is not a list of strings")
             
-        print(f"Successfully parsed {len(descriptions)} narratives.")
+        print(f"Successfully generated {len(new_descriptions)} new narratives.")
+        
+        if existing_narratives:
+            # Prepend new ones and limit the total list size
+            combined = new_descriptions + existing_narratives
+            # We assume they are mostly sorted, but we could do a final sort if needed.
+            # However, since we don't have the year in the string, a simple string sort is risky.
+            # Prepending preserves the newest-first order from the API.
+            return combined[:50]
+        
+        return new_descriptions
     except Exception as e:
         raise ValueError(f"Failed to parse Grok response: {str(e)}")
-    
-    return descriptions
 
 @app.get("/recent_launches_narratives")
 def get_narratives():
@@ -243,7 +268,7 @@ def get_narratives():
             return {"descriptions": cached_narratives}
     
     increment_metric("cache_misses")
-    descriptions = generate_narratives()
+    descriptions = generate_narratives(existing_narratives=cached_narratives)
     
     # Update cache (Redis and/or in-memory)
     if r:
@@ -441,7 +466,21 @@ def dashboard(request: Request):
 def refresh_cache():
     """Force refresh the cache (call this via scheduler)."""
     print("Manual cache refresh triggered.")
-    descriptions = generate_narratives()
+    
+    # Try to get the current cache to pass it for incremental update
+    cached_narratives = None
+    if r:
+        try:
+            data = r.get(CACHE_KEY)
+            if data:
+                cached_narratives = json.loads(data)
+        except:
+            pass
+    
+    if not cached_narratives:
+        cached_narratives = _local_cache["launch_narratives"]
+
+    descriptions = generate_narratives(existing_narratives=cached_narratives)
     current_time = datetime.now(timezone.utc)
     
     # Update Redis
