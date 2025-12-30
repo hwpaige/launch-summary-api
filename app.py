@@ -54,11 +54,14 @@ _local_metrics = {
     "cache_misses": 0,
     "api_calls": 0
 }
+_local_metrics_history = []
 
 CACHE_KEY = "launch_narratives_v2"
 CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
+METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 3600  # 1 hour TTL in seconds
+_last_snapshot_time = 0
 
 def increment_metric(field):
     """Increment a metric in Redis or memory."""
@@ -73,22 +76,65 @@ def increment_metric(field):
     if field in _local_metrics:
         _local_metrics[field] += 1
 
-def get_metrics():
+def record_snapshot():
+    """Record a snapshot of current metrics for historical tracking."""
+    global _last_snapshot_time
+    now = datetime.now(timezone.utc).timestamp()
+    if now - _last_snapshot_time < 25: # Throttle to ~30s
+        return
+    _last_snapshot_time = now
+    
+    current_metrics = get_metrics(include_history=False)
+    snapshot = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "data": current_metrics
+    }
+    
+    if r:
+        try:
+            r.lpush(METRICS_HISTORY_KEY, json.dumps(snapshot))
+            r.ltrim(METRICS_HISTORY_KEY, 0, 29) # Keep last 30 snapshots
+        except Exception as e:
+            print(f"Redis error in record_snapshot: {e}")
+    
+    _local_metrics_history.append(snapshot)
+    if len(_local_metrics_history) > 30:
+        _local_metrics_history.pop(0)
+
+def get_metrics(include_history=True):
     """Retrieve metrics from Redis or memory."""
+    current = {
+        "total_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "api_calls": 0
+    }
+    
     if r:
         try:
             data = r.hgetall(METRICS_KEY)
-            # Convert string values from Redis to integers
-            return {k: int(v) for k, v in data.items()} if data else {
-                "total_requests": 0,
-                "cache_hits": 0,
-                "cache_misses": 0,
-                "api_calls": 0
-            }
+            if data:
+                current = {k: int(v) for k, v in data.items()}
         except Exception as e:
             print(f"Redis error in get_metrics: {e}")
-    
-    return _local_metrics
+    else:
+        current = _local_metrics.copy()
+        
+    if not include_history:
+        return current
+        
+    history = []
+    if r:
+        try:
+            history_data = r.lrange(METRICS_HISTORY_KEY, 0, -1)
+            history = [json.loads(s) for s in history_data]
+            history.reverse() # Oldest first for charting
+        except Exception as e:
+            print(f"Redis error fetching history: {e}")
+    else:
+        history = _local_metrics_history
+        
+    return {"current": current, "history": history}
 
 def generate_narratives(existing_narratives=None):
     """Fetch launches and generate narratives using Grok, appending new ones only."""
@@ -286,6 +332,7 @@ def get_narratives():
 @app.get("/metrics")
 def get_app_metrics():
     """Endpoint to fetch application metrics."""
+    record_snapshot()
     return get_metrics()
 
 @app.get("/", response_class=HTMLResponse)
@@ -300,10 +347,12 @@ def dashboard(request: Request):
     <title>SpaceX Launch Narratives Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
         .ticker-item { border-left: 4px solid #3b82f6; }
+        .chart-container { height: 60px; width: 100%; margin-top: 1rem; }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-200 min-h-screen">
@@ -327,33 +376,60 @@ def dashboard(request: Request):
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <!-- Metrics Grid -->
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
-            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl">
-                <div class="flex items-center justify-between mb-4">
-                    <span class="text-slate-400 text-sm font-medium">Total Requests</span>
-                    <i data-lucide="activity" class="text-blue-400 w-5 h-5"></i>
+            <!-- Total Requests Card -->
+            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col justify-between">
+                <div>
+                    <div class="flex items-center justify-between mb-4">
+                        <span class="text-slate-400 text-sm font-medium">Total Requests</span>
+                        <i data-lucide="activity" class="text-blue-400 w-5 h-5"></i>
+                    </div>
+                    <div class="text-3xl font-bold" id="metric-total-requests">0</div>
                 </div>
-                <div class="text-3xl font-bold" id="metric-total-requests">0</div>
+                <div class="chart-container">
+                    <canvas id="chart-requests"></canvas>
+                </div>
             </div>
-            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl">
-                <div class="flex items-center justify-between mb-4">
-                    <span class="text-slate-400 text-sm font-medium">Cache Hits</span>
-                    <i data-lucide="database" class="text-emerald-400 w-5 h-5"></i>
+
+            <!-- Cache Hits Card -->
+            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col justify-between">
+                <div>
+                    <div class="flex items-center justify-between mb-4">
+                        <span class="text-slate-400 text-sm font-medium">Cache Hits</span>
+                        <i data-lucide="database" class="text-emerald-400 w-5 h-5"></i>
+                    </div>
+                    <div class="text-3xl font-bold text-emerald-400" id="metric-cache-hits">0</div>
                 </div>
-                <div class="text-3xl font-bold text-emerald-400" id="metric-cache-hits">0</div>
+                <div class="chart-container">
+                    <canvas id="chart-hits"></canvas>
+                </div>
             </div>
-            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl">
-                <div class="flex items-center justify-between mb-4">
-                    <span class="text-slate-400 text-sm font-medium">Grok API Calls</span>
-                    <i data-lucide="brain-circuit" class="text-purple-400 w-5 h-5"></i>
+
+            <!-- API Calls Card -->
+            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col justify-between">
+                <div>
+                    <div class="flex items-center justify-between mb-4">
+                        <span class="text-slate-400 text-sm font-medium">Grok API Calls</span>
+                        <i data-lucide="brain-circuit" class="text-purple-400 w-5 h-5"></i>
+                    </div>
+                    <div class="text-3xl font-bold text-purple-400" id="metric-api-calls">0</div>
                 </div>
-                <div class="text-3xl font-bold text-purple-400" id="metric-api-calls">0</div>
+                <div class="chart-container">
+                    <canvas id="chart-api"></canvas>
+                </div>
             </div>
-            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl">
-                <div class="flex items-center justify-between mb-4">
-                    <span class="text-slate-400 text-sm font-medium">Cache Efficiency</span>
-                    <i data-lucide="zap" class="text-yellow-400 w-5 h-5"></i>
+
+            <!-- Efficiency Card -->
+            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col justify-between">
+                <div>
+                    <div class="flex items-center justify-between mb-4">
+                        <span class="text-slate-400 text-sm font-medium">Cache Efficiency</span>
+                        <i data-lucide="zap" class="text-yellow-400 w-5 h-5"></i>
+                    </div>
+                    <div class="text-3xl font-bold text-yellow-400" id="metric-efficiency">0%</div>
                 </div>
-                <div class="text-3xl font-bold" id="metric-efficiency">0%</div>
+                <div class="chart-container">
+                    <canvas id="chart-efficiency"></canvas>
+                </div>
             </div>
         </div>
 
@@ -384,14 +460,53 @@ def dashboard(request: Request):
     <script>
         lucide.createIcons();
 
+        // Chart instances
+        const charts = {};
+
+        function initChart(id, color) {
+            const ctx = document.getElementById(id).getContext('2d');
+            return new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: Array(30).fill(''),
+                    datasets: [{
+                        data: Array(30).fill(null),
+                        borderColor: color,
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        tension: 0.4,
+                        fill: true,
+                        backgroundColor: color + '20'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false }, tooltip: { enabled: true } },
+                    scales: {
+                        x: { display: false },
+                        y: { display: false, beginAtZero: true }
+                    }
+                }
+            });
+        }
+
+        charts.requests = initChart('chart-requests', '#3b82f6');
+        charts.hits = initChart('chart-hits', '#10b981');
+        charts.api = initChart('chart-api', '#a855f7');
+        charts.efficiency = initChart('chart-efficiency', '#eab308');
+
         async function fetchMetrics() {
             try {
                 const response = await fetch('/metrics');
                 const data = await response.json();
                 
-                const total = data.total_requests || 0;
-                const hits = data.cache_hits || 0;
-                const apiCalls = data.api_calls || 0;
+                const current = data.current || {};
+                const history = data.history || [];
+                
+                const total = current.total_requests || 0;
+                const hits = current.cache_hits || 0;
+                const apiCalls = current.api_calls || 0;
                 
                 document.getElementById('metric-total-requests').textContent = total.toLocaleString();
                 document.getElementById('metric-cache-hits').textContent = hits.toLocaleString();
@@ -399,6 +514,29 @@ def dashboard(request: Request):
                 
                 const efficiency = total > 0 ? Math.round((hits / total) * 100) : 0;
                 document.getElementById('metric-efficiency').textContent = efficiency + '%';
+
+                // Update charts
+                if (history.length > 0) {
+                    const updateChart = (chart, key, isEfficiency = false) => {
+                        const values = history.map(h => {
+                            if (isEfficiency) {
+                                const t = h.data.total_requests || 0;
+                                return t > 0 ? (h.data.cache_hits / t) * 100 : 0;
+                            }
+                            return h.data[key] || 0;
+                        });
+                        
+                        // Pad with nulls if history is short
+                        const padded = [...Array(30 - values.length).fill(null), ...values];
+                        chart.data.datasets[0].data = padded;
+                        chart.update('none');
+                    };
+
+                    updateChart(charts.requests, 'total_requests');
+                    updateChart(charts.hits, 'cache_hits');
+                    updateChart(charts.api, 'api_calls');
+                    updateChart(charts.efficiency, '', true);
+                }
             } catch (error) {
                 console.error('Error fetching metrics:', error);
             }

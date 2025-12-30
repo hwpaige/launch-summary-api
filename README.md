@@ -1,122 +1,109 @@
 # SpaceX Launch Summary API
 
-A FastAPI application that fetches recent SpaceX launches and generates witty, "Cities Skylines" style narratives using the xAI Grok API.
+A witty, high-performance API that provides "Cities Skylines" style narratives for recent SpaceX launches. It uses the xAI Grok API to transform technical launch data into dry, humorous descriptions suitable for scrolling tickers, dashboards, and monitoring tools.
 
-## Features
-
-- **Witty Narratives**: Generates short, dry, and technical descriptions of SpaceX launches.
-- **FastAPI**: Modern, high-performance web framework.
-- **Beautiful Dashboard**: Built-in UI to monitor narratives and API metrics (Requests, Cache Hits, Grok API usage).
-- **Persistent Caching**: Uses Heroku Key Value Store (Redis) to cache narratives and metrics across Heroku builds and dyno restarts.
-- **Heroku Ready**: Optimized for Heroku deployment with automatic database discovery.
-
-## Live API
+## Live API Access
 
 The API is live and can be accessed at:
-`https://launch-narrative-api-dafccc521fb8.herokuapp.com/`
+**[https://launch-narrative-api-dafccc521fb8.herokuapp.com/](https://launch-narrative-api-dafccc521fb8.herokuapp.com/)**
+
+---
 
 ## API Endpoints
 
-- **Dashboard UI**: `GET /`
-  - URL: `https://launch-narrative-api-dafccc521fb8.herokuapp.com/`
-- **Narratives List**: `GET /recent_launches_narratives`
-  - URL: `https://launch-narrative-api-dafccc521fb8.herokuapp.com/recent_launches_narratives`
-  - Returns a JSON object with a list of witty launch descriptions.
-- **Metrics**: `GET /metrics`
-  - URL: `https://launch-narrative-api-dafccc521fb8.herokuapp.com/metrics`
-  - Returns real-time application performance metrics.
-- **Cache Refresh**: `POST /refresh`
-  - URL: `https://launch-narrative-api-dafccc521fb8.herokuapp.com/refresh`
-  - Triggers a manual refresh of the launch data and Grok narratives.
+### 1. Get Launch Narratives
+Returns a chronological list (newest first) of witty descriptions for recent SpaceX launches.
 
-## Local Setup
+*   **Endpoint:** `GET /recent_launches_narratives`
+*   **Response Format:** JSON
+*   **Caching:** Results are cached for 1 hour. The API uses incremental generation to append new launches without changing existing witty descriptions.
 
-1. **Clone the repository.**
-2. **Create a virtual environment:**
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-3. **Install dependencies:**
-   ```powershell
-   pip install -r requirements.txt
-   ```
-4. **Set environment variables:**
-   Create a `.env` file:
-   ```env
-   XAI_API_KEY=your_xai_api_key_here
-   REDIS_URL=redis://localhost:6379  # Optional: for persistent local caching
-   ```
-5. **Run the application:**
-   ```powershell
-   python app.py
-   ```
-   Access the dashboard at [http://localhost:5000](http://localhost:5000).
+**Example Response:**
+```json
+{
+  "descriptions": [
+    "12/17 1527: Falcon 9 Block 5 launches Starlink Group 15-13 from SLC-4E; another batch to LEO, booster lands with textbook precision, mission nominal.",
+    "12/17 1342: Falcon 9 Block 5 deploys Starlink Group 6-99 from LC-39A; LEO constellation grows, booster recovery a routine snooze, success confirmed.",
+    "12/15 0525: Falcon 9 Block 5 sends Starlink Group 6-82 to LEO from SLC-40; satellites deployed without a hitch, booster sticks the landing, all systems go."
+  ]
+}
+```
 
-   *Note: If you see "Could not find platform independent libraries <prefix>" on Windows, ensure your `PYTHONHOME` is set or run via the virtual environment's python directly: `.\.venv\Scripts\python.exe app.py`.*
+### 2. Get API Metrics
+Provides real-time and historical performance data, including request counts, cache efficiency, and interactive history.
 
-## Deployment to Heroku
+*   **Endpoint:** `GET /metrics`
+*   **Response Format:** JSON
 
-### Option A: Heroku CLI (Recommended)
+**Example Response:**
+```json
+{
+  "current": {
+    "total_requests": 450,
+    "cache_hits": 412,
+    "cache_misses": 38,
+    "api_calls": 12
+  },
+  "history": [
+    {
+      "timestamp": "2025-12-29T20:30:00Z",
+      "data": { "total_requests": 420, "cache_hits": 385 }
+    }
+  ]
+}
+```
 
-1. **Create a new Heroku app:**
-   ```bash
-   heroku create your-app-name
-   ```
-2. **Add Heroku Key Value Store (Redis):**
-   ```bash
-   heroku addons:create heroku-redis:mini -a your-app-name
-   ```
-3. **Set the xAI API Key:**
-   ```bash
-   heroku config:set XAI_API_KEY=your_xai_api_key_here -a your-app-name
-   ```
-4. **Deploy the code:**
-   ```bash
-   git add .
-   git commit -m "Add Redis for persistent caching"
-   git push heroku main
-   ```
+### 3. Force Cache Refresh
+Manually triggers the API to poll for new launches and generate new narratives using Grok.
 
-### Option B: Heroku Dashboard (GUI)
+*   **Endpoint:** `POST /refresh`
+*   **Behavior:** Incremental. It only generates narratives for launches not already in the cache.
 
-1. **Log in** to the [Heroku Dashboard](https://dashboard.heroku.com/).
-2. **Select your app** from the list.
-3. **Add Heroku Key Value Store (formerly Heroku Redis):**
-   - Click the **Resources** tab.
-   - In the **Add-ons** search box, type `Heroku Key Value Store`.
-   - Select it, choose a plan (e.g., `Mini`), and click **Submit Order Form**.
-4. **Configure API Keys:**
-   - Click the **Settings** tab.
-   - Click **Reveal Config Vars**.
-   - Add a new variable:
-     - **KEY**: `XAI_API_KEY`
-     - **VALUE**: `your_actual_xai_api_key`
-   - Click **Add**.
-5. **Deploy:**
-   - Go to the **Deploy** tab.
-   - Connect your GitHub repository or follow the **Heroku Git** instructions to push your code.
+---
 
-## Scheduled Updates (Optional)
+## Interactive Dashboard
 
-The application features built-in "lazy" refreshing: whenever a user hits the API and the cache is older than 1 hour, it automatically pulls new data and regenerates narratives. 
+Access the root URL (`/`) in any web browser to view the **API Status Dashboard**.
+*   **Real-time Monitoring:** Interactive sparkline charts for traffic and efficiency.
+*   **Live Feed:** A visual list of the latest generated narratives.
+*   **Manual Control:** A "Force Refresh" button to trigger the `/refresh` endpoint.
 
-To keep your narratives proactively fresh (ensuring no visitor ever waits for a refresh), set up the Heroku Scheduler:
+---
 
-1. **Add the Scheduler:**
-   - **CLI:** `heroku addons:create scheduler:standard -a your-app-name`
-   - **GUI:** Go to the **Resources** tab, search for `Heroku Scheduler`, and add it.
-2. **Configure the Job:**
-   - Open the Scheduler (click on it in the **Resources** tab).
-   - Click **Add Job**.
-   - Set the command to: `curl -X POST https://your-app-name.herokuapp.com/refresh`
-   - Set the frequency (e.g., **Every Hour**).
-   - Click **Save Job**.
+## Usage Examples
 
-## Monitoring
+### cURL
+```bash
+curl https://launch-narrative-api-dafccc521fb8.herokuapp.com/recent_launches_narratives
+```
 
-Visit your Heroku app's root URL (e.g., `https://your-app-name.herokuapp.com/`) to access the real-time monitoring dashboard. Metrics and narratives are persisted in the Heroku Key Value Store (Redis), so they will survive new builds and restarts.
+### JavaScript (Fetch API)
+```javascript
+fetch('https://launch-narrative-api-dafccc521fb8.herokuapp.com/recent_launches_narratives')
+  .then(response => response.json())
+  .then(data => console.log(data.descriptions));
+```
+
+### Python (Requests)
+```python
+import requests
+
+url = "https://launch-narrative-api-dafccc521fb8.herokuapp.com/recent_launches_narratives"
+response = requests.get(url)
+launches = response.json().get("descriptions", [])
+
+for launch in launches:
+    print(launch)
+```
+
+---
+
+## Data Refresh Policy
+The API utilizes a **Hybrid Refresh Strategy** to ensure stability and speed:
+1.  **Lazy Refresh:** The cache automatically refreshes if the data is older than 1 hour when the narratives endpoint is hit.
+2.  **Proactive Refresh:** Designed to be used with a scheduler (e.g., Heroku Scheduler) hitting the `/refresh` endpoint hourly to keep the cache warm.
+
+---
 
 ## License
-
 MIT
