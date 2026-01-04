@@ -65,7 +65,28 @@ METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
 HISTORY_LIMIT = 10080 # 7 days at 1 minute intervals
+SEEDING_STATUS_KEY = "seeding_status_v2"
 _last_snapshot_time = 0
+
+_local_seeding_status = {"is_running": False, "last_status": "Idle", "total_pulled": 0, "oldest_launch": None}
+
+def update_seeding_status(is_running, last_status, total_pulled=0, oldest_launch=None):
+    """Update the seeding status in Redis and memory."""
+    global _local_seeding_status
+    status = {
+        "is_running": is_running,
+        "last_status": last_status,
+        "total_pulled": total_pulled,
+        "oldest_launch": oldest_launch,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    _local_seeding_status = status
+    if r:
+        try:
+            r.set(SEEDING_STATUS_KEY, json.dumps(status))
+        except Exception as e:
+            print(f"Redis error in update_seeding_status: {e}")
+    return status
 
 def increment_metric(field):
     """Increment a metric in Redis or memory."""
@@ -401,8 +422,8 @@ def fetch_launches(existing_previous=None):
             new_launches = [l for l in parsed_prev if l.get('id') not in existing_ids]
             # Prepend new ones to maintain newest-first order
             combined_prev = new_launches + existing_previous
-            # Limit history to 50 items for efficiency
-            combined_prev = combined_prev[:50]
+            # Limit history to 2000 items for efficiency and to allow seeding
+            combined_prev = combined_prev[:2000]
         else:
             combined_prev = parsed_prev
         
@@ -421,6 +442,109 @@ def fetch_launches(existing_previous=None):
     except Exception as e:
         print(f"Error in fetch_launches: {e}")
         return {'previous': existing_previous or [], 'upcoming': []}
+
+def seed_historical_launches():
+    """Seed the historical launch cache by pulling increasingly older launches in batches of 5 until we hit the api limit."""
+    print("Starting historical launch seeding...")
+    cache_key = "launches_cache_v2"
+    
+    # Get initial state
+    existing_previous = []
+    if r:
+        try:
+            cached = r.get(cache_key)
+            if cached:
+                existing_previous = json.loads(cached).get('previous', [])
+        except: pass
+    
+    total_so_far = len(existing_previous)
+    oldest_so_far = existing_previous[-1].get('net') if existing_previous else None
+    update_seeding_status(True, "Starting batch fetch...", total_so_far, oldest_so_far)
+
+    # We use a loop to keep fetching until we hit a limit or run out of data
+    while True:
+        # Get current state from cache to determine offset
+        existing_previous = []
+        upcoming = []
+        if r:
+            try:
+                cached = r.get(cache_key)
+                if cached:
+                    data = json.loads(cached)
+                    existing_previous = data.get('previous', [])
+                    upcoming = data.get('upcoming', [])
+            except: pass
+        
+        offset = len(existing_previous)
+        total_so_far = offset
+        oldest_so_far = existing_previous[-1].get('net') if existing_previous else None
+        
+        update_seeding_status(True, f"Fetching at offset {offset}...", total_so_far, oldest_so_far)
+        print(f"Seeding: Fetching 5 older launches at offset {offset}...")
+        
+        try:
+            headers = {'Authorization': f'Token {LL_API_KEY}'}
+            # Pull increasingly older launches in batches of 5
+            increment_metric("api_calls")
+            url = f'https://ll.thespacedevs.com/2.3.0/launches/previous/?lsp__name=SpaceX&limit=5&offset={offset}&mode=detailed'
+            response = requests.get(url, headers=headers, timeout=15)
+            
+            if response.status_code == 429:
+                print("Hit API rate limit (429) during seeding. Stopping for now.")
+                update_seeding_status(False, "Hit API rate limit (429).", total_so_far, oldest_so_far)
+                break
+                
+            response.raise_for_status()
+            data = response.json()
+            results = data.get('results', [])
+            
+            if not results:
+                print("No more historical launches found. Seeding complete.")
+                update_seeding_status(False, "Seeding complete. No more data.", total_so_far, oldest_so_far)
+                break
+                
+            parsed_new = [parse_launch_data(l, is_detailed=True) for l in results]
+            
+            # Append older launches to the end of our history
+            combined_prev = existing_previous + parsed_new
+            
+            # Limit history to 2000 items for efficiency
+            combined_prev = combined_prev[:2000]
+            
+            # Update cache in Redis
+            result = {
+                "upcoming": upcoming,
+                "previous": combined_prev,
+                "last_updated": datetime.now(timezone.utc).isoformat()
+            }
+            if r:
+                try:
+                    r.set(cache_key, json.dumps(result))
+                except: pass
+            
+            total_so_far = len(combined_prev)
+            oldest_so_far = combined_prev[-1].get('net')
+            print(f"Added {len(parsed_new)} historical launches. Total: {total_so_far}")
+            update_seeding_status(True, f"Added {len(parsed_new)} launches.", total_so_far, oldest_so_far)
+            
+            # Brief sleep between batches
+            time.sleep(1)
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                print("Hit API rate limit (429) during seeding. Stopping.")
+                update_seeding_status(False, "Hit API rate limit (429).", total_so_far, oldest_so_far)
+                break
+            else:
+                msg = f"HTTP error during seeding: {e}"
+                print(msg)
+                update_seeding_status(False, msg, total_so_far, oldest_so_far)
+                break
+        except Exception as e:
+            msg = f"Unexpected error during seeding: {e}"
+            print(msg)
+            update_seeding_status(False, msg, total_so_far, oldest_so_far)
+            break
 
 def parse_metar(raw_metar: str):
     """Parse METAR string to extract weather data."""
@@ -796,6 +920,30 @@ def get_app_metrics(range: str = "1h"):
     record_snapshot()
     return get_metrics(range_type=range)
 
+@app.get("/seed_status")
+def get_seed_status():
+    """Endpoint to check the status of historical seeding."""
+    if r:
+        try:
+            data = r.get(SEEDING_STATUS_KEY)
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            print(f"Redis error in get_seed_status: {e}")
+    return _local_seeding_status
+
+@app.post("/seed_history")
+def trigger_seed_history():
+    """Endpoint to manually trigger historical launch seeding."""
+    status = get_seed_status()
+    if status.get("is_running"):
+        return {"status": "Seeding already in progress"}
+    
+    # Start seeding in a background thread
+    seeding_thread = threading.Thread(target=seed_historical_launches, daemon=True)
+    seeding_thread.start()
+    return {"status": "Historical seeding started"}
+
 def start_background_worker():
     def run():
         # Wait a bit for the app to start
@@ -807,6 +955,11 @@ def start_background_worker():
             refresh_narratives_internal()
             refresh_launches_internal()
             refresh_weather_internal()
+            
+            # Start seeding historical launches in a separate thread to avoid blocking bootstrap
+            print("Triggering historical launch seeding...")
+            seeding_thread = threading.Thread(target=seed_historical_launches, daemon=True)
+            seeding_thread.start()
         except Exception as e:
             print(f"Bootstrap error: {e}")
 
@@ -1067,6 +1220,39 @@ def dashboard(request: Request):
 
         <!-- Launches Section -->
         <div id="content-launches" class="hidden space-y-8">
+            <!-- Historical Seeding Control -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden p-6 mb-8">
+                <div class="flex flex-col md:flex-row items-center justify-between gap-6">
+                    <div class="flex items-start gap-4">
+                        <div class="p-3 bg-purple-500/10 rounded-xl">
+                            <i data-lucide="history" class="w-6 h-6 text-purple-400"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-lg font-semibold flex items-center gap-2 mb-1">
+                                Historical Data Seeding
+                            </h3>
+                            <p class="text-sm text-slate-400 max-w-md">Pull increasingly older launches from SpaceX history to populate the cache. This operation respects API rate limits and runs in the background.</p>
+                        </div>
+                    </div>
+                    <div class="flex flex-col sm:flex-row items-center gap-6 w-full md:w-auto">
+                        <div id="seeding-stats" class="bg-slate-800/50 px-4 py-2 rounded-xl border border-slate-700/50 min-w-[200px]">
+                            <div class="flex items-center justify-between mb-1">
+                                <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Seeding Stats</span>
+                                <span id="seed-status-tag" class="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-slate-700 text-slate-400">Idle</span>
+                            </div>
+                            <div class="text-sm font-mono flex flex-col">
+                                <span class="flex justify-between gap-4">Pulled: <span id="seed-count" class="text-white font-bold">0</span></span>
+                                <span class="flex justify-between gap-4">Oldest: <span id="seed-oldest" class="text-white font-bold text-xs">--</span></span>
+                            </div>
+                        </div>
+                        <button id="btn-seed-history" onclick="triggerSeeding()" class="w-full sm:w-auto px-6 py-3 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl font-bold transition-all shadow-lg shadow-purple-900/20 flex items-center justify-center gap-2 whitespace-nowrap">
+                            <i data-lucide="database-zap" class="w-5 h-5"></i>
+                            Seed History
+                        </button>
+                    </div>
+                </div>
+            </div>
+
             <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
                 <div class="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
                     <h2 class="text-lg font-semibold flex items-center gap-2">
@@ -1653,11 +1839,78 @@ def dashboard(request: Request):
             }
         }
 
+        // --- Seeding Logic ---
+        let seedingPollInterval = null;
+
+        async function triggerSeeding() {
+            const btn = document.getElementById('btn-seed-history');
+            btn.disabled = true;
+            btn.innerHTML = '<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Triggering...';
+            lucide.createIcons();
+
+            try {
+                const response = await fetch('/seed_history', { method: 'POST' });
+                const data = await response.json();
+                console.log('Seeding response:', data);
+                
+                // Small delay to let the background thread start and update status
+                setTimeout(startSeedingPoll, 1000);
+            } catch (error) {
+                console.error('Error triggering seeding:', error);
+                btn.disabled = false;
+                btn.innerHTML = '<i data-lucide="database-zap" class="w-5 h-5"></i> Seed History';
+                lucide.createIcons();
+            }
+        }
+
+        function startSeedingPoll() {
+            if (seedingPollInterval) clearInterval(seedingPollInterval);
+            pollSeedingStatus();
+            seedingPollInterval = setInterval(pollSeedingStatus, 3000);
+        }
+
+        async function pollSeedingStatus() {
+            try {
+                const response = await fetch('/seed_status');
+                const data = await response.json();
+                
+                const btn = document.getElementById('btn-seed-history');
+                const tag = document.getElementById('seed-status-tag');
+                const count = document.getElementById('seed-count');
+                const oldest = document.getElementById('seed-oldest');
+
+                count.textContent = (data.total_pulled || 0).toLocaleString();
+                oldest.textContent = data.oldest_launch ? data.oldest_launch.split('T')[0] : '--';
+                
+                if (data.is_running) {
+                    btn.disabled = true;
+                    btn.innerHTML = '<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Seeding...';
+                    tag.textContent = 'Active';
+                    tag.className = 'text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 animate-pulse';
+                } else {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i data-lucide="database-zap" class="w-5 h-5"></i> Seed History';
+                    tag.textContent = data.last_status || 'Idle';
+                    tag.className = 'text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-slate-700 text-slate-400';
+                    
+                    // If it stopped and we are polling, we can stop if it's completed or hit limit
+                    if (!data.is_running && seedingPollInterval && data.last_status !== 'Starting batch fetch...') {
+                        // We keep it polling just in case, or stop it to save resources?
+                        // Let's keep it but at a much slower rate? No, let's just stop if it's Idle.
+                    }
+                }
+                lucide.createIcons();
+            } catch (error) {
+                console.error('Error polling seeding status:', error);
+            }
+        }
+
         // Initial load - Fetch all data once to bootstrap the UI
         fetchMetrics();
         fetchNarratives();
         fetchLaunches();
         fetchWeatherAll();
+        startSeedingPoll();
 
         // Start the master timer loop (updates UI countdowns and triggers refreshes)
         setInterval(updateTimers, 1000);
