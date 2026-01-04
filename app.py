@@ -7,6 +7,8 @@ import ast
 import re
 import redis
 import json
+import math
+import time
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
@@ -282,6 +284,224 @@ Output as a Python list assignment: launch_descriptions = [...]"""
     except Exception as e:
         raise ValueError(f"Failed to parse Grok response: {str(e)}")
 
+# --- Ported Fetch Functions from functions.py ---
+
+LL_API_KEY = os.getenv("LL_API_KEY", "9b91363961799d7f79aabe547ed0f7be914664dd")
+
+def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
+    """Helper to parse raw API launch data into the dashboard's internal format."""
+    launcher_stage = launch.get('rocket', {}).get('launcher_stage', [])
+    landing_type = None
+    landing_location = None
+    if isinstance(launcher_stage, list) and len(launcher_stage) > 0:
+        landing = launcher_stage[0].get('landing')
+        if landing:
+            landing_type = landing.get('type', {}).get('name')
+            landing_location = landing.get('landing_location', {}).get('name')
+            if not landing_location:
+                landing_location = landing.get('location', {}).get('name')
+    
+    return {
+        'id': launch.get('id'),
+        'mission': launch.get('name', 'Unknown'),
+        'date': launch.get('net').split('T')[0] if launch.get('net') else 'TBD',
+        'time': launch.get('net').split('T')[1].split('Z')[0] if launch.get('net') and 'T' in launch.get('net') else 'TBD',
+        'net': launch.get('net'),
+        'status': launch.get('status', {}).get('name', 'Unknown'),
+        'rocket': launch.get('rocket', {}).get('configuration', {}).get('name', 'Unknown'),
+        'orbit': launch.get('mission', {}).get('orbit', {}).get('name', 'Unknown') if launch.get('mission') else 'Unknown',
+        'pad': launch.get('pad', {}).get('name', 'Unknown'),
+        'video_url': launch.get('vidURLs', [{}])[0].get('url', '') if launch.get('vidURLs') else '',
+        'x_video_url': next((v['url'] for v in launch.get('vidURLs', []) if v.get('url') and ('x.com' in v['url'].lower() or 'twitter.com' in v['url'].lower())), '') if launch.get('vidURLs') else '',
+        'landing_type': landing_type,
+        'landing_location': landing_location,
+        'is_detailed': is_detailed
+    }
+
+def fetch_launch_details(launch_id: str):
+    """Fetch detailed information for a single launch."""
+    if not launch_id:
+        return None
+    url = f"https://ll.thespacedevs.com/2.3.0/launches/{launch_id}/?mode=detailed"
+    try:
+        headers = {'Authorization': f'Token {LL_API_KEY}'}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"Failed to fetch launch details for {launch_id}: {e}")
+        return None
+
+def fetch_launches():
+    """Fetch SpaceX launch data (v2.3.0)."""
+    try:
+        headers = {'Authorization': f'Token {LL_API_KEY}'}
+        
+        # Fetch previous launches
+        prev_url = 'https://ll.thespacedevs.com/2.3.0/launches/previous/?lsp__name=SpaceX&limit=15&mode=normal'
+        prev_response = requests.get(prev_url, headers=headers, timeout=10)
+        prev_response.raise_for_status()
+        prev_data = prev_response.json().get('results', [])
+        
+        # Fetch upcoming launches
+        up_url = 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/?lsp__name=SpaceX&limit=15&mode=normal'
+        up_response = requests.get(up_url, headers=headers, timeout=10)
+        up_response.raise_for_status()
+        up_data = up_response.json().get('results', [])
+        
+        return {
+            'previous': [parse_launch_data(l) for l in prev_data],
+            'upcoming': [parse_launch_data(l) for l in up_data]
+        }
+    except Exception as e:
+        print(f"Error in fetch_launches: {e}")
+        return {'previous': [], 'upcoming': []}
+
+def parse_metar(raw_metar: str):
+    """Parse METAR string to extract weather data."""
+    temperature_c = 25
+    wind_speed_kts = 0
+    wind_direction = 0
+    cloud_cover = 0
+
+    try:
+        # Extract temperature
+        temp_match = re.search(r'(\d{1,3})/', raw_metar)
+        if temp_match:
+            temperature_c = int(temp_match.group(1))
+            if temp_match.start() > 0 and raw_metar[temp_match.start()-1] == 'M':
+                temperature_c = -temperature_c
+
+        # Extract wind
+        wind_match = re.search(r'(\d{3})(\d{2,3})(?:G\d{2,3})?KT', raw_metar)
+        if wind_match:
+            wind_direction = int(wind_match.group(1))
+            wind_speed_kts = int(wind_match.group(2))
+
+        # Cloud cover estimation
+        if 'SKC' in raw_metar or 'CLR' in raw_metar:
+            cloud_cover = 0
+        elif 'FEW' in raw_metar:
+            cloud_cover = 25
+        elif 'SCT' in raw_metar:
+            cloud_cover = 50
+        elif 'BKN' in raw_metar:
+            cloud_cover = 75
+        elif 'OVC' in raw_metar:
+            cloud_cover = 100
+        else:
+            cloud_cover = 50
+    except Exception as e:
+        print(f"Error parsing METAR: {e}")
+
+    return {
+        'temperature_c': temperature_c,
+        'temperature_f': temperature_c * 9 / 5 + 32,
+        'wind_speed_ms': wind_speed_kts * 0.514444,
+        'wind_speed_kts': wind_speed_kts,
+        'wind_direction': wind_direction,
+        'cloud_cover': cloud_cover,
+        'raw': raw_metar
+    }
+
+def fetch_weather(location: str):
+    """Fetch METAR weather data for a given location."""
+    metar_stations = {
+        'Starbase': 'KBRO',
+        'Vandy': 'KVBG',
+        'Cape': 'KMLB',
+        'Hawthorne': 'KHHR'
+    }
+    station_id = metar_stations.get(location, 'KBRO')
+    url = f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=raw"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        raw_metar = response.text.strip()
+        if not raw_metar:
+            raise ValueError("Empty METAR response")
+        return parse_metar(raw_metar)
+    except Exception as e:
+        print(f"Error fetching weather for {location}: {e}")
+        return {
+            'temperature_c': 25, 'temperature_f': 77,
+            'wind_speed_ms': 5, 'wind_speed_kts': 9.7,
+            'wind_direction': 90, 'cloud_cover': 50,
+            'error': str(e)
+        }
+
+def fetch_external_narratives():
+    """Fetch narratives from the external API as specified in functions.py."""
+    url = "https://launch-narrative-api-dafccc521fb8.herokuapp.com/recent_launches_narratives"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and 'descriptions' in data:
+            return data['descriptions']
+        return data
+    except Exception as e:
+        print(f"Error fetching external narratives: {e}")
+        return []
+
+# --- New Endpoints ---
+
+@app.get("/launches")
+def get_launches():
+    increment_metric("total_requests")
+    cache_key = "launches_cache_v1"
+    if r:
+        try:
+            cached = r.get(cache_key)
+            if cached:
+                increment_metric("cache_hits")
+                return json.loads(cached)
+        except: pass
+    
+    increment_metric("cache_misses")
+    data = fetch_launches()
+    if r and (data['previous'] or data['upcoming']):
+        try:
+            r.setex(cache_key, 600, json.dumps(data))
+        except: pass
+    return data
+
+@app.get("/weather/{location}")
+def get_weather(location: str):
+    increment_metric("total_requests")
+    cache_key = f"weather_cache_{location}"
+    if r:
+        try:
+            cached = r.get(cache_key)
+            if cached:
+                increment_metric("cache_hits")
+                return json.loads(cached)
+        except: pass
+    
+    increment_metric("cache_misses")
+    data = fetch_weather(location)
+    if r:
+        try:
+            r.setex(cache_key, 900, json.dumps(data))
+        except: pass
+    return data
+
+@app.get("/weather_all")
+def get_all_weather():
+    increment_metric("total_requests")
+    locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne']
+    return {loc: fetch_weather(loc) for loc in locations}
+
+@app.get("/launch_details/{launch_id}")
+def get_launch_details(launch_id: str):
+    increment_metric("total_requests")
+    return fetch_launch_details(launch_id)
+
+@app.get("/external_narratives")
+def get_all_narratives():
+    increment_metric("total_requests")
+    return {"descriptions": fetch_external_narratives()}
+
 @app.get("/recent_launches_narratives")
 def get_narratives():
     """Serve from cache if available; generate otherwise."""
@@ -353,6 +573,8 @@ def dashboard(request: Request):
         body { font-family: 'Inter', sans-serif; }
         .ticker-item { border-left: 4px solid #3b82f6; }
         .chart-container { height: 60px; width: 100%; margin-top: 1rem; }
+        .tab-active { border-bottom: 2px solid #3b82f6; color: #3b82f6; }
+        .hidden { display: none; }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-200 min-h-screen">
@@ -433,8 +655,15 @@ def dashboard(request: Request):
             </div>
         </div>
 
+        <!-- Tabs -->
+        <div class="flex gap-8 mb-6 border-b border-slate-800">
+            <button onclick="showTab('narratives')" id="tab-narratives" class="pb-2 font-semibold transition-colors tab-active">Narratives</button>
+            <button onclick="showTab('launches')" id="tab-launches" class="pb-2 font-semibold text-slate-400 hover:text-slate-200 transition-colors">Launches</button>
+            <button onclick="showTab('weather')" id="tab-weather" class="pb-2 font-semibold text-slate-400 hover:text-slate-200 transition-colors">Weather</button>
+        </div>
+
         <!-- Narratives Section -->
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+        <div id="content-narratives" class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
             <div class="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
                 <h2 class="text-lg font-semibold flex items-center gap-2">
                     <i data-lucide="list" class="w-5 h-5 text-blue-500"></i>
@@ -454,6 +683,44 @@ def dashboard(request: Request):
                     </div>
                 </div>
             </div>
+        </div>
+
+        <!-- Launches Section -->
+        <div id="content-launches" class="hidden space-y-8">
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+                <div class="px-6 py-4 border-b border-slate-800 bg-slate-800/30">
+                    <h2 class="text-lg font-semibold flex items-center gap-2">
+                        <i data-lucide="rocket" class="w-5 h-5 text-emerald-500"></i>
+                        Upcoming Launches
+                    </h2>
+                </div>
+                <div class="p-6" id="upcoming-launches-list">
+                    <div class="animate-pulse space-y-4">
+                        <div class="h-12 bg-slate-800 rounded w-full"></div>
+                        <div class="h-12 bg-slate-800 rounded w-full"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+                <div class="px-6 py-4 border-b border-slate-800 bg-slate-800/30">
+                    <h2 class="text-lg font-semibold flex items-center gap-2">
+                        <i data-lucide="history" class="w-5 h-5 text-blue-500"></i>
+                        Previous Launches
+                    </h2>
+                </div>
+                <div class="p-6" id="previous-launches-list">
+                    <div class="animate-pulse space-y-4">
+                        <div class="h-12 bg-slate-800 rounded w-full"></div>
+                        <div class="h-12 bg-slate-800 rounded w-full"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Weather Section -->
+        <div id="content-weather" class="hidden grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- Weather cards will be loaded here -->
         </div>
     </main>
 
@@ -495,6 +762,21 @@ def dashboard(request: Request):
         charts.hits = initChart('chart-hits', '#10b981');
         charts.api = initChart('chart-api', '#a855f7');
         charts.efficiency = initChart('chart-efficiency', '#eab308');
+
+        function showTab(tab) {
+            ['narratives', 'launches', 'weather'].forEach(t => {
+                document.getElementById(`tab-${t}`).classList.remove('tab-active');
+                document.getElementById(`tab-${t}`).classList.add('text-slate-400');
+                document.getElementById(`content-${t}`).classList.add('hidden');
+            });
+            
+            document.getElementById(`tab-${tab}`).classList.add('tab-active');
+            document.getElementById(`tab-${tab}`).classList.remove('text-slate-400');
+            document.getElementById(`content-${tab}`).classList.remove('hidden');
+            
+            if (tab === 'launches') fetchLaunches();
+            if (tab === 'weather') fetchWeatherAll();
+        }
 
         async function fetchMetrics() {
             try {
@@ -575,6 +857,97 @@ def dashboard(request: Request):
             }
         }
 
+        async function fetchLaunches() {
+            const upList = document.getElementById('upcoming-launches-list');
+            const prevList = document.getElementById('previous-launches-list');
+            
+            try {
+                const response = await fetch('/launches');
+                const data = await response.json();
+                
+                const renderList = (el, launches) => {
+                    el.innerHTML = '';
+                    if (!launches || launches.length === 0) {
+                        el.innerHTML = '<p class="text-slate-500 text-center py-4">No launches found.</p>';
+                        return;
+                    }
+                    launches.forEach(l => {
+                        const div = document.createElement('div');
+                        div.className = 'flex items-center justify-between p-4 border-b border-slate-800 last:border-0 hover:bg-slate-800/30 transition-colors';
+                        div.innerHTML = `
+                            <div class="flex flex-col">
+                                <span class="font-bold text-slate-100">${l.mission}</span>
+                                <span class="text-xs text-slate-400">${l.rocket} • ${l.pad}</span>
+                            </div>
+                            <div class="flex flex-col items-end text-right">
+                                <span class="text-sm font-mono text-blue-400">${l.date} ${l.time}</span>
+                                <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 uppercase tracking-tighter ${l.status === 'Success' ? 'text-emerald-400' : 'text-yellow-400'}">${l.status}</span>
+                            </div>
+                        `;
+                        el.appendChild(div);
+                    });
+                };
+                
+                renderList(upList, data.upcoming);
+                renderList(prevList, data.previous);
+            } catch (error) {
+                upList.innerHTML = prevList.innerHTML = '<p class="text-red-400 text-center py-4">Error loading launches.</p>';
+            }
+        }
+
+        async function fetchWeatherAll() {
+            const locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne'];
+            const container = document.getElementById('content-weather');
+            container.innerHTML = '';
+            
+            for (const loc of locations) {
+                const card = document.createElement('div');
+                card.className = 'bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col gap-4';
+                card.innerHTML = `<div class="animate-pulse h-32 bg-slate-800 rounded"></div>`;
+                container.appendChild(card);
+                
+                fetchWeather(loc, card);
+            }
+        }
+
+        async function fetchWeather(loc, card) {
+            try {
+                const response = await fetch(`/weather/${loc}`);
+                const data = await response.json();
+                
+                card.innerHTML = `
+                    <div class="flex items-center justify-between mb-2">
+                        <h3 class="text-xl font-bold">${loc}</h3>
+                        <i data-lucide="cloud-sun" class="text-blue-400 w-6 h-6"></i>
+                    </div>
+                    <div class="grid grid-cols-2 gap-y-4 gap-x-6">
+                        <div>
+                            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Temperature</p>
+                            <p class="text-2xl font-semibold">${Math.round(data.temperature_f)}°F <span class="text-sm text-slate-400 font-normal">/ ${Math.round(data.temperature_c)}°C</span></p>
+                        </div>
+                        <div>
+                            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind Speed</p>
+                            <p class="text-2xl font-semibold">${Math.round(data.wind_speed_kts)} <span class="text-sm text-slate-400 font-normal">kts</span></p>
+                        </div>
+                        <div>
+                            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Cloud Cover</p>
+                            <p class="text-2xl font-semibold">${data.cloud_cover}%</p>
+                        </div>
+                        <div>
+                            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind Direction</p>
+                            <p class="text-2xl font-semibold">${data.wind_direction}°</p>
+                        </div>
+                    </div>
+                    <div class="mt-2 pt-3 border-t border-slate-800">
+                        <p class="text-[9px] font-mono text-slate-600 truncate uppercase" title="${data.raw || ''}">${data.raw || 'No raw METAR data'}</p>
+                    </div>
+                `;
+                lucide.createIcons();
+            } catch (error) {
+                card.innerHTML = `<p class="text-red-400">Error loading weather for ${loc}</p>`;
+            }
+        }
+
         async function refreshData() {
             const icon = document.getElementById('refresh-icon');
             icon.classList.add('animate-spin');
@@ -582,6 +955,10 @@ def dashboard(request: Request):
             try {
                 await fetch('/refresh', { method: 'POST' });
                 await Promise.all([fetchMetrics(), fetchNarratives()]);
+                // Also refresh current tab if it's not narratives
+                const activeTab = document.querySelector('.tab-active').id.replace('tab-', '');
+                if (activeTab === 'launches') fetchLaunches();
+                if (activeTab === 'weather') fetchWeatherAll();
             } catch (error) {
                 console.error('Error refreshing data:', error);
             } finally {
