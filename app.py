@@ -9,6 +9,7 @@ import redis
 import json
 import math
 import time
+import threading
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
@@ -63,6 +64,7 @@ CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 3600  # 1 hour TTL in seconds
+HISTORY_LIMIT = 10080 # 7 days at 1 minute intervals
 _last_snapshot_time = 0
 
 def increment_metric(field):
@@ -82,7 +84,7 @@ def record_snapshot():
     """Record a snapshot of current metrics for historical tracking."""
     global _last_snapshot_time
     now = datetime.now(timezone.utc).timestamp()
-    if now - _last_snapshot_time < 25: # Throttle to ~30s
+    if now - _last_snapshot_time < 55: # Throttle to ~1m
         return
     _last_snapshot_time = now
     
@@ -95,15 +97,15 @@ def record_snapshot():
     if r:
         try:
             r.lpush(METRICS_HISTORY_KEY, json.dumps(snapshot))
-            r.ltrim(METRICS_HISTORY_KEY, 0, 29) # Keep last 30 snapshots
+            r.ltrim(METRICS_HISTORY_KEY, 0, HISTORY_LIMIT - 1)
         except Exception as e:
             print(f"Redis error in record_snapshot: {e}")
     
     _local_metrics_history.append(snapshot)
-    if len(_local_metrics_history) > 30:
+    if len(_local_metrics_history) > HISTORY_LIMIT:
         _local_metrics_history.pop(0)
 
-def get_metrics(include_history=True):
+def get_metrics(include_history=True, range_type="1h"):
     """Retrieve metrics from Redis or memory."""
     current = {
         "total_requests": 0,
@@ -134,9 +136,43 @@ def get_metrics(include_history=True):
         except Exception as e:
             print(f"Redis error fetching history: {e}")
     else:
-        history = _local_metrics_history
+        history = _local_metrics_history.copy()
         
-    return {"current": current, "history": history}
+    # Filter by range
+    now = datetime.now(timezone.utc)
+    if range_type == "1h":
+        start_time = now - timedelta(hours=1)
+        history = [h for h in history if datetime.fromisoformat(h['timestamp'].replace('Z', '+00:00')) > start_time]
+    elif range_type == "24h":
+        start_time = now - timedelta(hours=24)
+        history = [h for h in history if datetime.fromisoformat(h['timestamp'].replace('Z', '+00:00')) > start_time]
+        if len(history) > 100:
+            history = history[::15] # ~15m intervals
+    elif range_type == "7d":
+        start_time = now - timedelta(days=7)
+        history = [h for h in history if datetime.fromisoformat(h['timestamp'].replace('Z', '+00:00')) > start_time]
+        if len(history) > 200:
+            history = history[::60] # ~1h intervals
+
+    # Calculate live hits/day (last 24h or available range)
+    hits_per_day = 0
+    if len(history) > 1:
+        first = history[0]
+        last = history[-1]
+        try:
+            t1 = datetime.fromisoformat(first['timestamp'].replace('Z', '+00:00'))
+            t2 = datetime.fromisoformat(last['timestamp'].replace('Z', '+00:00'))
+            duration_hours = (t2 - t1).total_seconds() / 3600
+            if duration_hours > 0.1: # At least 6 mins of data
+                hits_diff = last['data']['total_requests'] - first['data']['total_requests']
+                hits_per_day = (hits_diff / duration_hours) * 24
+        except: pass
+
+    return {
+        "current": current, 
+        "history": history, 
+        "hits_per_day": round(hits_per_day, 1)
+    }
 
 def generate_narratives(existing_narratives=None):
     """Fetch launches and generate narratives using Grok, appending new ones only."""
@@ -301,6 +337,8 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
             if not landing_location:
                 landing_location = landing.get('location', {}).get('name')
     
+    mission_data = launch.get('mission') or {}
+    
     return {
         'id': launch.get('id'),
         'mission': launch.get('name', 'Unknown'),
@@ -309,13 +347,23 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'net': launch.get('net'),
         'status': launch.get('status', {}).get('name', 'Unknown'),
         'rocket': launch.get('rocket', {}).get('configuration', {}).get('name', 'Unknown'),
-        'orbit': launch.get('mission', {}).get('orbit', {}).get('name', 'Unknown') if launch.get('mission') else 'Unknown',
+        'orbit': mission_data.get('orbit', {}).get('name', 'Unknown'),
         'pad': launch.get('pad', {}).get('name', 'Unknown'),
         'video_url': launch.get('vidURLs', [{}])[0].get('url', '') if launch.get('vidURLs') else '',
         'x_video_url': next((v['url'] for v in launch.get('vidURLs', []) if v.get('url') and ('x.com' in v['url'].lower() or 'twitter.com' in v['url'].lower())), '') if launch.get('vidURLs') else '',
         'landing_type': landing_type,
         'landing_location': landing_location,
-        'is_detailed': is_detailed
+        'is_detailed': is_detailed,
+        # New enriched fields for "ALL data" view
+        'description': mission_data.get('description', ''),
+        'image': launch.get('image', ''),
+        'window_start': launch.get('window_start'),
+        'window_end': launch.get('window_end'),
+        'probability': launch.get('probability'),
+        'holdreason': launch.get('holdreason'),
+        'failreason': launch.get('failreason'),
+        # Ensure every field returned by the API is cached and available
+        'all_data': launch
     }
 
 def fetch_launch_details(launch_id: str):
@@ -325,7 +373,7 @@ def fetch_launch_details(launch_id: str):
     url = f"https://ll.thespacedevs.com/2.3.0/launches/{launch_id}/?mode=detailed"
     try:
         headers = {'Authorization': f'Token {LL_API_KEY}'}
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -333,25 +381,25 @@ def fetch_launch_details(launch_id: str):
         return None
 
 def fetch_launches():
-    """Fetch SpaceX launch data (v2.3.0)."""
+    """Fetch SpaceX launch data (v2.3.0) using detailed mode to get all fields."""
     try:
         headers = {'Authorization': f'Token {LL_API_KEY}'}
         
-        # Fetch previous launches
-        prev_url = 'https://ll.thespacedevs.com/2.3.0/launches/previous/?lsp__name=SpaceX&limit=15&mode=normal'
-        prev_response = requests.get(prev_url, headers=headers, timeout=10)
+        # Fetch previous launches with mode=detailed to get ALL data fields
+        prev_url = 'https://ll.thespacedevs.com/2.3.0/launches/previous/?lsp__name=SpaceX&limit=15&mode=detailed'
+        prev_response = requests.get(prev_url, headers=headers, timeout=15)
         prev_response.raise_for_status()
         prev_data = prev_response.json().get('results', [])
         
-        # Fetch upcoming launches
-        up_url = 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/?lsp__name=SpaceX&limit=15&mode=normal'
-        up_response = requests.get(up_url, headers=headers, timeout=10)
+        # Fetch upcoming launches with mode=detailed to get ALL data fields
+        up_url = 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/?lsp__name=SpaceX&limit=15&mode=detailed'
+        up_response = requests.get(up_url, headers=headers, timeout=15)
         up_response.raise_for_status()
         up_data = up_response.json().get('results', [])
         
         return {
-            'previous': [parse_launch_data(l) for l in prev_data],
-            'upcoming': [parse_launch_data(l) for l in up_data]
+            'previous': [parse_launch_data(l, is_detailed=True) for l in prev_data],
+            'upcoming': [parse_launch_data(l, is_detailed=True) for l in up_data]
         }
     except Exception as e:
         print(f"Error in fetch_launches: {e}")
@@ -447,10 +495,10 @@ def fetch_external_narratives():
 # --- New Endpoints ---
 
 @app.get("/launches")
-def get_launches():
+def get_launches(force: bool = False):
     increment_metric("total_requests")
     cache_key = "launches_cache_v1"
-    if r:
+    if r and not force:
         try:
             cached = r.get(cache_key)
             if cached:
@@ -467,10 +515,10 @@ def get_launches():
     return data
 
 @app.get("/weather/{location}")
-def get_weather(location: str):
+def get_weather(location: str, force: bool = False):
     increment_metric("total_requests")
     cache_key = f"weather_cache_{location}"
-    if r:
+    if r and not force:
         try:
             cached = r.get(cache_key)
             if cached:
@@ -487,7 +535,7 @@ def get_weather(location: str):
     return data
 
 @app.get("/weather_all")
-def get_all_weather():
+def get_all_weather(force: bool = False):
     increment_metric("total_requests")
     locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne']
     return {loc: fetch_weather(loc) for loc in locations}
@@ -503,7 +551,7 @@ def get_all_narratives():
     return {"descriptions": fetch_external_narratives()}
 
 @app.get("/recent_launches_narratives")
-def get_narratives():
+def get_narratives(force: bool = False):
     """Serve from cache if available; generate otherwise."""
     increment_metric("total_requests")
     
@@ -527,7 +575,7 @@ def get_narratives():
         last_updated = _local_cache["last_updated"]
 
     # Check if cache is valid (not None and within TTL)
-    if cached_narratives and last_updated:
+    if not force and cached_narratives and last_updated:
         elapsed = (current_time - last_updated).total_seconds()
         if elapsed < CACHE_TTL:
             increment_metric("cache_hits")
@@ -550,10 +598,25 @@ def get_narratives():
     return {"descriptions": descriptions}
 
 @app.get("/metrics")
-def get_app_metrics():
+def get_app_metrics(range: str = "1h"):
     """Endpoint to fetch application metrics."""
     record_snapshot()
-    return get_metrics()
+    return get_metrics(range_type=range)
+
+def start_metrics_background_thread():
+    def run():
+        # Wait a bit for the app to start
+        time.sleep(10)
+        while True:
+            try:
+                record_snapshot()
+            except Exception as e:
+                print(f"Background metrics error: {e}")
+            time.sleep(30) # Check every 30s, record_snapshot will throttle to 1m
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+start_metrics_background_thread()
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
@@ -574,7 +637,11 @@ def dashboard(request: Request):
         .ticker-item { border-left: 4px solid #3b82f6; }
         .chart-container { height: 60px; width: 100%; margin-top: 1rem; }
         .tab-active { border-bottom: 2px solid #3b82f6; color: #3b82f6; }
+        .range-active { background-color: #2563eb !important; color: white !important; }
         .hidden { display: none; }
+        .launch-card:hover { transform: translateY(-1px); }
+        pre::-webkit-scrollbar { width: 6px; height: 6px; }
+        pre::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-200 min-h-screen">
@@ -586,16 +653,57 @@ def dashboard(request: Request):
                     <span class="text-xl font-bold tracking-tight">SpaceX Narratives</span>
                 </div>
                 <div class="flex items-center gap-4">
-                    <button onclick="refreshData()" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 transition-colors rounded-lg font-semibold text-sm">
-                        <i data-lucide="refresh-cw" class="w-4 h-4" id="refresh-icon"></i>
-                        Force Refresh
-                    </button>
+                    <!-- Global refresh removed, now per-tab -->
                 </div>
             </div>
         </div>
     </nav>
 
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <!-- Metrics Header & Time Range -->
+        <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
+            <div>
+                <h2 class="text-2xl font-bold tracking-tight">System Metrics</h2>
+                <p class="text-slate-400 text-sm">Real-time performance and API usage tracking.</p>
+            </div>
+            <div class="flex bg-slate-900 border border-slate-800 p-1 rounded-xl">
+                <button onclick="changeRange('1h')" id="range-1h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all range-active">1h</button>
+                <button onclick="changeRange('24h')" id="range-24h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">24h</button>
+                <button onclick="changeRange('7d')" id="range-7d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">7d</button>
+            </div>
+        </div>
+
+        <!-- Key Stats Row -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+             <div class="bg-slate-900/50 border border-slate-800 p-4 rounded-2xl flex items-center gap-4">
+                <div class="p-3 bg-blue-500/10 rounded-xl">
+                    <i data-lucide="trending-up" class="text-blue-500 w-6 h-6"></i>
+                </div>
+                <div>
+                    <p class="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Live Hits / Day</p>
+                    <p class="text-xl font-bold" id="stat-hits-day">0</p>
+                </div>
+             </div>
+             <div class="bg-slate-900/50 border border-slate-800 p-4 rounded-2xl flex items-center gap-4">
+                <div class="p-3 bg-emerald-500/10 rounded-xl">
+                    <i data-lucide="clock" class="text-emerald-500 w-6 h-6"></i>
+                </div>
+                <div>
+                    <p class="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Uptime</p>
+                    <p class="text-xl font-bold" id="stat-uptime">Nominal</p>
+                </div>
+             </div>
+             <div class="bg-slate-900/50 border border-slate-800 p-4 rounded-2xl flex items-center gap-4">
+                <div class="p-3 bg-purple-500/10 rounded-xl">
+                    <i data-lucide="server" class="text-purple-500 w-6 h-6"></i>
+                </div>
+                <div>
+                    <p class="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Storage</p>
+                    <p class="text-xl font-bold">Redis Cloud</p>
+                </div>
+             </div>
+        </div>
+
         <!-- Metrics Grid -->
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
             <!-- Total Requests Card -->
@@ -669,7 +777,12 @@ def dashboard(request: Request):
                     <i data-lucide="list" class="w-5 h-5 text-blue-500"></i>
                     Current Narratives
                 </h2>
-                <span class="text-xs text-slate-500 uppercase tracking-widest font-bold" id="last-updated">Updating...</span>
+                <div class="flex items-center gap-4">
+                    <span class="text-xs text-slate-500 uppercase tracking-widest font-bold" id="last-updated">Updating...</span>
+                    <button onclick="refreshTab('narratives')" class="p-1.5 hover:bg-slate-700/50 rounded-lg transition-colors text-slate-400 hover:text-blue-400" title="Force Refresh Narratives">
+                        <i data-lucide="refresh-cw" class="w-4 h-4" id="refresh-icon-narratives"></i>
+                    </button>
+                </div>
             </div>
             <div class="p-6">
                 <div id="narratives-list" class="space-y-4">
@@ -688,11 +801,14 @@ def dashboard(request: Request):
         <!-- Launches Section -->
         <div id="content-launches" class="hidden space-y-8">
             <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
-                <div class="px-6 py-4 border-b border-slate-800 bg-slate-800/30">
+                <div class="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
                     <h2 class="text-lg font-semibold flex items-center gap-2">
                         <i data-lucide="rocket" class="w-5 h-5 text-emerald-500"></i>
                         Upcoming Launches
                     </h2>
+                    <button onclick="refreshTab('launches')" class="p-1.5 hover:bg-slate-700/50 rounded-lg transition-colors text-slate-400 hover:text-emerald-400" title="Force Refresh Launches">
+                        <i data-lucide="refresh-cw" class="w-4 h-4" id="refresh-icon-launches"></i>
+                    </button>
                 </div>
                 <div class="p-6" id="upcoming-launches-list">
                     <div class="animate-pulse space-y-4">
@@ -719,8 +835,17 @@ def dashboard(request: Request):
         </div>
 
         <!-- Weather Section -->
-        <div id="content-weather" class="hidden grid grid-cols-1 md:grid-cols-2 gap-6">
-            <!-- Weather cards will be loaded here -->
+        <div id="content-weather" class="hidden space-y-6">
+            <div class="flex items-center justify-between">
+                <h2 class="text-2xl font-bold tracking-tight">Weather Conditions</h2>
+                <button onclick="refreshTab('weather')" class="flex items-center gap-2 px-3 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 transition-colors rounded-lg font-semibold text-xs text-slate-300">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5" id="refresh-icon-weather"></i>
+                    Refresh Weather
+                </button>
+            </div>
+            <div id="weather-grid" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Weather cards will be loaded here -->
+            </div>
         </div>
     </main>
 
@@ -729,15 +854,16 @@ def dashboard(request: Request):
 
         // Chart instances
         const charts = {};
+        let currentRange = '1h';
 
         function initChart(id, color) {
             const ctx = document.getElementById(id).getContext('2d');
             return new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: Array(30).fill(''),
+                    labels: [],
                     datasets: [{
-                        data: Array(30).fill(null),
+                        data: [],
                         borderColor: color,
                         borderWidth: 2,
                         pointRadius: 0,
@@ -763,6 +889,22 @@ def dashboard(request: Request):
         charts.api = initChart('chart-api', '#a855f7');
         charts.efficiency = initChart('chart-efficiency', '#eab308');
 
+        function changeRange(range) {
+            currentRange = range;
+            ['1h', '24h', '7d'].forEach(r => {
+                const btn = document.getElementById(`range-${r}`);
+                if (r === range) {
+                    btn.classList.add('range-active');
+                    btn.classList.remove('text-slate-400', 'hover:text-slate-200');
+                    btn.classList.add('text-white');
+                } else {
+                    btn.classList.remove('range-active', 'text-white');
+                    btn.classList.add('text-slate-400', 'hover:text-slate-200');
+                }
+            });
+            fetchMetrics();
+        }
+
         function showTab(tab) {
             ['narratives', 'launches', 'weather'].forEach(t => {
                 document.getElementById(`tab-${t}`).classList.remove('tab-active');
@@ -780,7 +922,7 @@ def dashboard(request: Request):
 
         async function fetchMetrics() {
             try {
-                const response = await fetch('/metrics');
+                const response = await fetch(`/metrics?range=${currentRange}`);
                 const data = await response.json();
                 
                 const current = data.current || {};
@@ -797,6 +939,8 @@ def dashboard(request: Request):
                 const efficiency = total > 0 ? Math.round((hits / total) * 100) : 0;
                 document.getElementById('metric-efficiency').textContent = efficiency + '%';
 
+                document.getElementById('stat-hits-day').textContent = (data.hits_per_day || 0).toLocaleString();
+
                 // Update charts
                 if (history.length > 0) {
                     const updateChart = (chart, key, isEfficiency = false) => {
@@ -808,9 +952,8 @@ def dashboard(request: Request):
                             return h.data[key] || 0;
                         });
                         
-                        // Pad with nulls if history is short
-                        const padded = [...Array(30 - values.length).fill(null), ...values];
-                        chart.data.datasets[0].data = padded;
+                        chart.data.labels = history.map(h => '');
+                        chart.data.datasets[0].data = values;
                         chart.update('none');
                     };
 
@@ -824,9 +967,10 @@ def dashboard(request: Request):
             }
         }
 
-        async function fetchNarratives() {
+        async function fetchNarratives(force = false) {
             try {
-                const response = await fetch('/recent_launches_narratives');
+                const url = force ? '/recent_launches_narratives?force=true' : '/recent_launches_narratives';
+                const response = await fetch(url);
                 const data = await response.json();
                 const list = document.getElementById('narratives-list');
                 list.innerHTML = '';
@@ -857,12 +1001,13 @@ def dashboard(request: Request):
             }
         }
 
-        async function fetchLaunches() {
+        async function fetchLaunches(force = false) {
             const upList = document.getElementById('upcoming-launches-list');
             const prevList = document.getElementById('previous-launches-list');
             
             try {
-                const response = await fetch('/launches');
+                const url = force ? '/launches?force=true' : '/launches';
+                const response = await fetch(url);
                 const data = await response.json();
                 
                 const renderList = (el, launches) => {
@@ -873,19 +1018,85 @@ def dashboard(request: Request):
                     }
                     launches.forEach(l => {
                         const div = document.createElement('div');
-                        div.className = 'flex items-center justify-between p-4 border-b border-slate-800 last:border-0 hover:bg-slate-800/30 transition-colors';
+                        div.className = 'launch-card border-b border-slate-800 last:border-0 hover:bg-slate-800/10 transition-all';
+                        
+                        const id = 'details-' + l.id;
+                        const rawId = 'raw-' + l.id;
+                        
                         div.innerHTML = `
-                            <div class="flex flex-col">
-                                <span class="font-bold text-slate-100">${l.mission}</span>
-                                <span class="text-xs text-slate-400">${l.rocket} • ${l.pad}</span>
+                            <div class="p-4 cursor-pointer" onclick="document.getElementById('${id}').classList.toggle('hidden'); lucide.createIcons();">
+                                <div class="flex items-center justify-between">
+                                    <div class="flex flex-col">
+                                        <span class="font-bold text-slate-100">${l.mission}</span>
+                                        <span class="text-xs text-slate-400">${l.rocket} • ${l.pad}</span>
+                                    </div>
+                                    <div class="flex flex-col items-end text-right">
+                                        <div class="flex items-center gap-2 mb-1">
+                                            <span class="text-sm font-mono text-blue-400">${l.date} ${l.time}</span>
+                                            <i data-lucide="chevron-down" class="w-4 h-4 text-slate-500"></i>
+                                        </div>
+                                        <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 uppercase tracking-tighter ${l.status === 'Success' ? 'text-emerald-400' : 'text-yellow-400'}">${l.status}</span>
+                                    </div>
+                                </div>
                             </div>
-                            <div class="flex flex-col items-end text-right">
-                                <span class="text-sm font-mono text-blue-400">${l.date} ${l.time}</span>
-                                <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 uppercase tracking-tighter ${l.status === 'Success' ? 'text-emerald-400' : 'text-yellow-400'}">${l.status}</span>
+                            
+                            <div id="${id}" class="hidden px-4 pb-6 space-y-4 border-t border-slate-800/50 pt-4 bg-slate-900/30">
+                                ${l.image ? `<img src="${l.image}" class="w-full h-48 object-cover rounded-xl border border-slate-700 shadow-lg" onerror="this.style.display='none'">` : ''}
+                                
+                                ${l.description ? `<p class="text-sm text-slate-300 leading-relaxed bg-slate-950/50 p-4 rounded-xl border border-slate-800">${l.description}</p>` : ''}
+                                
+                                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                    <div class="bg-slate-950/30 p-3 rounded-lg border border-slate-800/50">
+                                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Orbit</p>
+                                        <p class="text-sm font-medium text-slate-200">${l.orbit}</p>
+                                    </div>
+                                    <div class="bg-slate-950/30 p-3 rounded-lg border border-slate-800/50">
+                                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Landing</p>
+                                        <p class="text-sm font-medium text-slate-200">${l.landing_type || 'None'} ${l.landing_location ? `(${l.landing_location})` : ''}</p>
+                                    </div>
+                                    <div class="bg-slate-950/30 p-3 rounded-lg border border-slate-800/50">
+                                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Probability</p>
+                                        <p class="text-sm font-medium text-slate-200">${l.probability !== null ? l.probability + '%' : 'N/A'}</p>
+                                    </div>
+                                    <div class="bg-slate-950/30 p-3 rounded-lg border border-slate-800/50">
+                                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Launch Window</p>
+                                        <p class="text-sm font-medium text-slate-200">${l.window_start ? new Date(l.window_start).toLocaleTimeString() : 'TBD'}</p>
+                                    </div>
+                                </div>
+
+                                ${(l.holdreason || l.failreason) ? `
+                                <div class="p-3 rounded-lg border ${l.failreason ? 'bg-red-500/5 border-red-500/20' : 'bg-amber-500/5 border-amber-500/20'}">
+                                    <p class="text-[10px] uppercase font-bold tracking-wider mb-1 ${l.failreason ? 'text-red-400' : 'text-amber-400'}">${l.failreason ? 'Failure' : 'Hold'} Reason</p>
+                                    <p class="text-sm text-slate-200">${l.failreason || l.holdreason}</p>
+                                </div>
+                                ` : ''}
+
+                                <div class="flex flex-wrap gap-3">
+                                    ${l.video_url ? `
+                                    <a href="${l.video_url}" target="_blank" class="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors border border-red-500/20 text-xs font-semibold">
+                                        <i data-lucide="play-circle" class="w-4 h-4"></i> Webcast
+                                    </a>` : ''}
+                                    ${l.x_video_url ? `
+                                    <a href="${l.x_video_url}" target="_blank" class="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors border border-slate-700 text-xs font-semibold">
+                                        <i data-lucide="twitter" class="w-4 h-4"></i> X Update
+                                    </a>` : ''}
+                                    <button onclick="document.getElementById('${rawId}').classList.toggle('hidden')" class="flex items-center gap-2 px-3 py-1.5 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 rounded-lg transition-colors border border-blue-500/20 text-xs font-semibold ml-auto">
+                                        <i data-lucide="code" class="w-4 h-4"></i> View Raw Data
+                                    </button>
+                                </div>
+
+                                <div id="${rawId}" class="hidden mt-4">
+                                    <div class="flex items-center justify-between mb-2">
+                                        <span class="text-[10px] text-slate-500 uppercase font-bold">API Response Object</span>
+                                        <button onclick="navigator.clipboard.writeText(this.parentElement.nextElementSibling.textContent)" class="text-[10px] text-blue-400 hover:text-blue-300 uppercase font-bold">Copy JSON</button>
+                                    </div>
+                                    <pre class="bg-slate-950 p-4 rounded-xl border border-slate-800 text-[10px] text-slate-400 overflow-x-auto font-mono max-h-60">${JSON.stringify(l.all_data, null, 2)}</pre>
+                                </div>
                             </div>
                         `;
                         el.appendChild(div);
                     });
+                    lucide.createIcons();
                 };
                 
                 renderList(upList, data.upcoming);
@@ -895,9 +1106,9 @@ def dashboard(request: Request):
             }
         }
 
-        async function fetchWeatherAll() {
+        async function fetchWeatherAll(force = false) {
             const locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne'];
-            const container = document.getElementById('content-weather');
+            const container = document.getElementById('weather-grid');
             container.innerHTML = '';
             
             for (const loc of locations) {
@@ -906,13 +1117,14 @@ def dashboard(request: Request):
                 card.innerHTML = `<div class="animate-pulse h-32 bg-slate-800 rounded"></div>`;
                 container.appendChild(card);
                 
-                fetchWeather(loc, card);
+                fetchWeather(loc, card, force);
             }
         }
 
-        async function fetchWeather(loc, card) {
+        async function fetchWeather(loc, card, force = false) {
             try {
-                const response = await fetch(`/weather/${loc}`);
+                const url = force ? `/weather/${loc}?force=true` : `/weather/${loc}`;
+                const response = await fetch(url);
                 const data = await response.json();
                 
                 card.innerHTML = `
@@ -948,21 +1160,23 @@ def dashboard(request: Request):
             }
         }
 
-        async function refreshData() {
-            const icon = document.getElementById('refresh-icon');
-            icon.classList.add('animate-spin');
+        async function refreshTab(tab) {
+            const icon = document.getElementById(`refresh-icon-${tab}`);
+            if (icon) icon.classList.add('animate-spin');
             
             try {
-                await fetch('/refresh', { method: 'POST' });
-                await Promise.all([fetchMetrics(), fetchNarratives()]);
-                // Also refresh current tab if it's not narratives
-                const activeTab = document.querySelector('.tab-active').id.replace('tab-', '');
-                if (activeTab === 'launches') fetchLaunches();
-                if (activeTab === 'weather') fetchWeatherAll();
+                if (tab === 'narratives') await fetchNarratives(true);
+                if (tab === 'launches') await fetchLaunches(true);
+                if (tab === 'weather') await fetchWeatherAll(true);
+                
+                // Also update metrics as a force refresh counts as API calls
+                fetchMetrics();
             } catch (error) {
-                console.error('Error refreshing data:', error);
+                console.error(`Error refreshing ${tab}:`, error);
             } finally {
-                setTimeout(() => icon.classList.remove('animate-spin'), 500);
+                if (icon) {
+                    setTimeout(() => icon.classList.remove('animate-spin'), 500);
+                }
             }
         }
 
