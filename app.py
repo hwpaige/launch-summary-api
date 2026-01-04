@@ -674,7 +674,7 @@ def dashboard(request: Request):
         </div>
 
         <!-- Key Stats Row -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
              <div class="bg-slate-900/50 border border-slate-800 p-4 rounded-2xl flex items-center gap-4">
                 <div class="p-3 bg-blue-500/10 rounded-xl">
                     <i data-lucide="trending-up" class="text-blue-500 w-6 h-6"></i>
@@ -701,6 +701,31 @@ def dashboard(request: Request):
                     <p class="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Storage</p>
                     <p class="text-xl font-bold">Redis Cloud</p>
                 </div>
+             </div>
+        </div>
+
+        <!-- Refresh Schedule Row -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+             <div class="bg-slate-900/30 border border-slate-800/50 p-3 rounded-xl flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="list" class="text-blue-500 w-4 h-4"></i>
+                    <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Narrative Refresh</span>
+                </div>
+                <span id="timer-narratives" class="text-sm font-mono font-bold text-blue-400">00:00</span>
+             </div>
+             <div class="bg-slate-900/30 border border-slate-800/50 p-3 rounded-xl flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="rocket" class="text-emerald-500 w-4 h-4"></i>
+                    <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Launch Refresh</span>
+                </div>
+                <span id="timer-launches" class="text-sm font-mono font-bold text-emerald-400">00:00</span>
+             </div>
+             <div class="bg-slate-900/30 border border-slate-800/50 p-3 rounded-xl flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="cloud-sun" class="text-blue-400 w-4 h-4"></i>
+                    <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Weather Refresh</span>
+                </div>
+                <span id="timer-weather" class="text-sm font-mono font-bold text-blue-400">00:00</span>
              </div>
         </div>
 
@@ -889,6 +914,61 @@ def dashboard(request: Request):
         charts.api = initChart('chart-api', '#a855f7');
         charts.efficiency = initChart('chart-efficiency', '#eab308');
 
+        // Timer management
+        const refreshIntervals = {
+            metrics: 30,
+            narratives: 900, // 15m
+            launches: 600,   // 10m
+            weather: 300     // 5m
+        };
+
+        // Initialize next refresh targets
+        const nextRefresh = {
+            metrics: Date.now() + refreshIntervals.metrics * 1000,
+            narratives: Date.now() + refreshIntervals.narratives * 1000,
+            launches: Date.now() + refreshIntervals.launches * 1000,
+            weather: Date.now() + refreshIntervals.weather * 1000
+        };
+
+        function updateTimers() {
+            const now = Date.now();
+            
+            const formatTime = (ms) => {
+                const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+                const minutes = Math.floor(totalSeconds / 60);
+                const seconds = totalSeconds % 60;
+                return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            };
+
+            if (document.getElementById('timer-narratives')) {
+                document.getElementById('timer-narratives').textContent = formatTime(nextRefresh.narratives - now);
+            }
+            if (document.getElementById('timer-launches')) {
+                document.getElementById('timer-launches').textContent = formatTime(nextRefresh.launches - now);
+            }
+            if (document.getElementById('timer-weather')) {
+                document.getElementById('timer-weather').textContent = formatTime(nextRefresh.weather - now);
+            }
+
+            // Check if any timer expired
+            if (now >= nextRefresh.metrics) {
+                fetchMetrics();
+                nextRefresh.metrics = now + refreshIntervals.metrics * 1000;
+            }
+            if (now >= nextRefresh.narratives) {
+                fetchNarratives();
+                nextRefresh.narratives = now + refreshIntervals.narratives * 1000;
+            }
+            if (now >= nextRefresh.launches) {
+                fetchLaunches();
+                nextRefresh.launches = now + refreshIntervals.launches * 1000;
+            }
+            if (now >= nextRefresh.weather) {
+                fetchWeatherAll();
+                nextRefresh.weather = now + refreshIntervals.weather * 1000;
+            }
+        }
+
         function changeRange(range) {
             currentRange = range;
             ['1h', '24h', '7d'].forEach(r => {
@@ -903,6 +983,8 @@ def dashboard(request: Request):
                 }
             });
             fetchMetrics();
+            // Reset metrics timer
+            nextRefresh.metrics = Date.now() + refreshIntervals.metrics * 1000;
         }
 
         function showTab(tab) {
@@ -916,8 +998,8 @@ def dashboard(request: Request):
             document.getElementById(`tab-${tab}`).classList.remove('text-slate-400');
             document.getElementById(`content-${tab}`).classList.remove('hidden');
             
-            if (tab === 'launches') fetchLaunches();
-            if (tab === 'weather') fetchWeatherAll();
+            // Note: Automatic fetches removed from here to make it strictly timer-based
+            // and prevent unnecessary API calls/loading states when switching tabs.
         }
 
         async function fetchMetrics() {
@@ -1169,8 +1251,12 @@ def dashboard(request: Request):
                 if (tab === 'launches') await fetchLaunches(true);
                 if (tab === 'weather') await fetchWeatherAll(true);
                 
+                // Reset timer for this specific tab after manual refresh
+                nextRefresh[tab] = Date.now() + refreshIntervals[tab] * 1000;
+                
                 // Also update metrics as a force refresh counts as API calls
                 fetchMetrics();
+                nextRefresh.metrics = Date.now() + refreshIntervals.metrics * 1000;
             } catch (error) {
                 console.error(`Error refreshing ${tab}:`, error);
             } finally {
@@ -1180,12 +1266,14 @@ def dashboard(request: Request):
             }
         }
 
-        // Initial load
+        // Initial load - Fetch all data once to bootstrap the UI
         fetchMetrics();
         fetchNarratives();
+        fetchLaunches();
+        fetchWeatherAll();
 
-        // Auto refresh metrics every 30s
-        setInterval(fetchMetrics, 30000);
+        // Start the master timer loop (updates UI countdowns and triggers refreshes)
+        setInterval(updateTimers, 1000);
     </script>
 </body>
 </html>
