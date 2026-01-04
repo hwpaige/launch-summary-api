@@ -956,10 +956,6 @@ def start_background_worker():
             refresh_launches_internal()
             refresh_weather_internal()
             
-            # Start seeding historical launches in a separate thread to avoid blocking bootstrap
-            print("Triggering historical launch seeding...")
-            seeding_thread = threading.Thread(target=seed_historical_launches, daemon=True)
-            seeding_thread.start()
         except Exception as e:
             print(f"Bootstrap error: {e}")
 
