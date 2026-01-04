@@ -402,18 +402,20 @@ def fetch_launch_details(launch_id: str):
         print(f"Failed to fetch launch details for {launch_id}: {e}")
         return None
 
-def fetch_launches(existing_previous=None):
+def fetch_launches(existing_previous=None, existing_upcoming=None):
     """Fetch SpaceX launch data (v2.3.0) using detailed mode to get all fields."""
+    headers = {'Authorization': f'Token {LL_API_KEY}'}
+    
+    combined_prev = existing_previous or []
+    combined_up = existing_upcoming or []
+    
+    # 1. Fetch Previous (Incremental)
     try:
-        headers = {'Authorization': f'Token {LL_API_KEY}'}
-        
-        # Fetch previous launches with mode=detailed to get ALL data fields
         increment_metric("api_calls")
         prev_url = 'https://ll.thespacedevs.com/2.3.0/launches/previous/?lsp__name=SpaceX&limit=15&mode=detailed'
         prev_response = requests.get(prev_url, headers=headers, timeout=15)
         prev_response.raise_for_status()
         prev_data = prev_response.json().get('results', [])
-        
         parsed_prev = [parse_launch_data(l, is_detailed=True) for l in prev_data]
         
         if existing_previous:
@@ -426,22 +428,25 @@ def fetch_launches(existing_previous=None):
             combined_prev = combined_prev[:2000]
         else:
             combined_prev = parsed_prev
-        
-        # Fetch upcoming launches with mode=detailed to get ALL data fields
+    except Exception as e:
+        print(f"Error fetching previous launches: {e}")
+
+    # 2. Fetch Upcoming (Full Refresh)
+    try:
         # Upcoming is always fully refreshed as statuses and dates shift frequently
         increment_metric("api_calls")
         up_url = 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/?lsp__name=SpaceX&limit=15&mode=detailed'
         up_response = requests.get(up_url, headers=headers, timeout=15)
         up_response.raise_for_status()
         up_data = up_response.json().get('results', [])
-        
-        return {
-            'previous': combined_prev,
-            'upcoming': [parse_launch_data(l, is_detailed=True) for l in up_data]
-        }
+        combined_up = [parse_launch_data(l, is_detailed=True) for l in up_data]
     except Exception as e:
-        print(f"Error in fetch_launches: {e}")
-        return {'previous': existing_previous or [], 'upcoming': []}
+        print(f"Error fetching upcoming launches: {e}")
+        
+    return {
+        'previous': combined_prev,
+        'upcoming': combined_up
+    }
 
 def seed_historical_launches():
     """Seed the historical launch cache by pulling increasingly older launches in batches of 5 until we hit the api limit."""
@@ -733,15 +738,18 @@ def refresh_launches_internal():
     print("Refreshing launches cache...")
     cache_key = "launches_cache_v2"
     existing_previous = None
+    existing_upcoming = None
     if r:
         try:
             cached = r.get(cache_key)
             if cached:
-                existing_previous = json.loads(cached).get('previous')
+                cache_data = json.loads(cached)
+                existing_previous = cache_data.get('previous')
+                existing_upcoming = cache_data.get('upcoming')
         except: pass
 
     try:
-        data = fetch_launches(existing_previous=existing_previous)
+        data = fetch_launches(existing_previous=existing_previous, existing_upcoming=existing_upcoming)
         last_updated = datetime.now(timezone.utc).isoformat()
         result = {
             "upcoming": data.get("upcoming", []),
