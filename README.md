@@ -19,6 +19,17 @@ Returns a chronological list (newest first) of witty descriptions for recent Spa
 *   **Response Format:** JSON
 *   **Fields:**
     *   `descriptions`: (array) List of witty strings in "month/day HHMM: description" format.
+    *   `last_updated`: (string) ISO8601 timestamp of when the narratives were last generated.
+*   **Sample Response:**
+```json
+{
+  "descriptions": [
+    "01/04 1200: Falcon 9 launches Starlink 12-1 from SLC-40; booster B1080 nails the landing on A Shortfall of Gravitas, mission nominal.",
+    "12/30 1530: Falcon 9 lofted O3b mPOWER 7 & 8 from SLC-40; B1078 completes 12th flight, orbital insertion confirmed."
+  ],
+  "last_updated": "2026-01-04T15:00:00.000000+00:00"
+}
+```
 *   **Caching:** Results are cached for 1 hour. The API uses incremental generation to append new launches without changing existing witty descriptions.
 
 ### 2. Get Detailed Launch Data
@@ -27,6 +38,10 @@ Returns structured data for both upcoming and previous SpaceX launches. Uses `mo
 *   **Endpoint:** `GET /launches`
 *   **Parameters:** `force=true` (optional)
 *   **Response Format:** JSON
+*   **Fields:**
+    *   `upcoming`: (array) List of upcoming launch objects.
+    *   `previous`: (array) List of historical launch objects.
+    *   `last_updated`: (string) ISO8601 timestamp of when the launch data was last fetched.
 *   **Fields (Launch Object):**
     *   `id`: (string) Unique identifier for the launch.
     *   `mission`: (string) Name of the mission.
@@ -48,7 +63,41 @@ Returns structured data for both upcoming and previous SpaceX launches. Uses `mo
     *   `probability`: (int) Launch probability percentage.
     *   `holdreason`: (string) Reason for a hold, if any.
     *   `failreason`: (string) Reason for a failure, if any.
+    *   `is_detailed`: (boolean) Flag indicating if detailed data was successfully retrieved.
     *   `all_data`: (object) Complete, unparsed raw response from the source API.
+*   **Sample Response:**
+```json
+{
+  "upcoming": [
+    {
+      "id": "abc-123",
+      "mission": "Starlink Group 12-2",
+      "date": "2026-01-10",
+      "time": "18:00:00",
+      "net": "2026-01-10T18:00:00Z",
+      "status": "Go",
+      "rocket": "Falcon 9 Block 5",
+      "orbit": "Low Earth Orbit",
+      "pad": "Space Launch Complex 40",
+      "video_url": "https://www.youtube.com/watch?v=...",
+      "x_video_url": "https://x.com/SpaceX/...",
+      "landing_type": "ASDS",
+      "landing_location": "A Shortfall of Gravitas",
+      "is_detailed": true,
+      "description": "A batch of Starlink satellites...",
+      "image": "https://...",
+      "window_start": "2026-01-10T18:00:00Z",
+      "window_end": "2026-01-10T22:00:00Z",
+      "probability": 90,
+      "holdreason": null,
+      "failreason": null,
+      "all_data": { "id": "abc-123", "name": "Starlink Group 12-2" }
+    }
+  ],
+  "previous": [],
+  "last_updated": "2026-01-04T14:50:00Z"
+}
+```
 *   **Caching:** 10 minutes.
 
 ### 3. Get Weather Data
@@ -59,7 +108,7 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
 *   **Response Format:** JSON
 *   **Fields:**
     *   For `/weather/{location}`: A single weather object (see below).
-    *   For `/weather_all`: A dictionary mapping location names to weather objects.
+    *   For `/weather_all`: A dictionary mapping location names to weather objects, plus a global `last_updated` field.
     *   **Weather Object Fields:**
         *   `temperature_c`: (int) Temperature in Celsius.
         *   `temperature_f`: (float) Temperature in Fahrenheit.
@@ -68,7 +117,29 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
         *   `wind_direction`: (int) Wind direction in degrees.
         *   `cloud_cover`: (int) Percentage of cloud cover estimation.
         *   `raw`: (string) Raw METAR string from the weather service.
-*   **Caching:** 15 minutes.
+        *   `last_updated`: (string) ISO8601 timestamp of the weather fetch.
+*   **Sample Response (`/weather_all`):**
+```json
+{
+  "weather": {
+    "Starbase": {
+      "temperature_c": 18,
+      "temperature_f": 64.4,
+      "wind_speed_ms": 4.11,
+      "wind_speed_kts": 8,
+      "wind_direction": 160,
+      "cloud_cover": 25,
+      "raw": "KBRO 041453Z 16008KT 10SM FEW025 18/14 A3012 RMK AO2 SLP198 T01830139",
+      "last_updated": "2026-01-04T14:55:00Z"
+    },
+    "Vandy": { "temperature_c": 12, "last_updated": "2026-01-04T14:55:00Z" },
+    "Cape": { "temperature_c": 22, "last_updated": "2026-01-04T14:55:00Z" },
+    "Hawthorne": { "temperature_c": 19, "last_updated": "2026-01-04T14:55:00Z" }
+  },
+  "last_updated": "2026-01-04T14:55:00Z"
+}
+```
+*   **Caching:** 5 minutes.
 
 ### 4. Get API Metrics
 Provides real-time and historical performance data, including request counts, cache efficiency, and interactive history.
@@ -77,9 +148,36 @@ Provides real-time and historical performance data, including request counts, ca
 *   **Parameters:** `range=1h` (default), `24h`, or `7d`
 *   **Response Format:** JSON
 *   **Fields:**
-    *   `current`: (object) Current counters for `total_requests`, `cache_hits`, `cache_misses`, and `api_calls`.
+    *   `current`: (object) Current counters for:
+        *   `total_requests`: Total HTTP requests received.
+        *   `cache_hits`: Number of requests served from cache.
+        *   `cache_misses`: Number of requests that required a backend fetch.
+        *   `api_calls`: Number of calls made to external APIs (Grok, LL).
     *   `history`: (array) List of snapshots containing `timestamp` and `data` (current metrics at that time).
-    *   `hits_per_day`: (float) Rolling average of requests projected to a 24-hour period.
+    *   `hits_per_day`: (float) Rolling average of requests projected to a 24-hour period based on the selected range.
+*   **Sample Response:**
+```json
+{
+  "current": {
+    "total_requests": 1520,
+    "cache_hits": 1450,
+    "cache_misses": 70,
+    "api_calls": 45
+  },
+  "history": [
+    {
+      "timestamp": "2026-01-04T14:59:00Z",
+      "data": {
+        "total_requests": 1518,
+        "cache_hits": 1448,
+        "cache_misses": 70,
+        "api_calls": 45
+      }
+    }
+  ],
+  "hits_per_day": 36480.0
+}
+```
 
 ### 5. Force Cache Refresh
 Manually triggers the API to poll for new launches and generate new narratives using Grok.
@@ -88,13 +186,35 @@ Manually triggers the API to poll for new launches and generate new narratives u
 *   **Response Format:** JSON
 *   **Fields:**
     *   `status`: (string) Confirmation message.
-    *   `count`: (int) Total number of narratives in the cache.
+    *   `count`: (int) Total number of narratives currently in the cache.
     *   `timestamp`: (string) ISO8601 update time.
+*   **Sample Response:**
+```json
+{
+  "status": "Cache refreshed",
+  "count": 42,
+  "timestamp": "2026-01-04T15:00:00Z"
+}
+```
 *   **Behavior:** Incremental. It only generates narratives for launches not already in the cache.
 
 ### 6. Utility Endpoints
-*   **Get Single Launch Details:** `GET /launch_details/{launch_id}` (Returns full raw API response for a specific launch).
-*   **Get External Narratives:** `GET /external_narratives` (Returns `{"descriptions": [...]}` proxying secondary source).
+*   **Get Single Launch Details:** `GET /launch_details/{launch_id}`
+    *   Returns full raw API response for a specific launch from the LL API.
+    *   **Sample Response:** (Large JSON object containing technical mission/rocket/pad details)
+*   **Get External Narratives:** `GET /external_narratives`
+    *   Returns witty descriptions from a secondary narrative source.
+    *   **Fields:**
+        *   `descriptions`: (array) List of narrative strings.
+    *   **Sample Response:**
+```json
+{
+  "descriptions": [
+    "01/01 0000: Sample external narrative entry.",
+    "12/31 2359: Another external sample entry."
+  ]
+}
+```
 
 ---
 
