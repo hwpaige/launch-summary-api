@@ -33,7 +33,7 @@ Returns a chronological list (newest first) of witty descriptions for recent Spa
 *   **Caching:** Results are cached for 1 hour. The API uses incremental generation to append new launches without changing existing witty descriptions.
 
 ### 2. Get Detailed Launch Data
-Returns structured data for both upcoming and previous SpaceX launches. Uses `mode=detailed` (LL API v2.3.0) to ensure every field (mission descriptions, images, technical metrics) is included.
+Returns exhaustive structured data for both upcoming and previous SpaceX launches. This endpoint merges dashboard-optimized convenience fields with the full, raw response from the Launch Library v2.3.0 API in `mode=detailed`.
 
 *   **Endpoint:** `GET /launches`
 *   **Parameters:** `force=true` (optional)
@@ -42,56 +42,78 @@ Returns structured data for both upcoming and previous SpaceX launches. Uses `mo
     *   `upcoming`: (array) List of upcoming launch objects.
     *   `previous`: (array) List of historical launch objects.
     *   `last_updated`: (string) ISO8601 timestamp of when the launch data was last fetched.
-*   **Fields (Launch Object):**
-    *   `id`: (string) Unique identifier for the launch.
-    *   `mission`: (string) Name of the mission.
-    *   `date`: (string) NET date in YYYY-MM-DD.
-    *   `time`: (string) NET time in HH:MM:SS.
-    *   `net`: (string) Full ISO8601 timestamp.
-    *   `status`: (string) Current status (e.g., Success, TBD).
-    *   `rocket`: (string) Rocket configuration name.
-    *   `orbit`: (string) Target orbit name.
-    *   `pad`: (string) Launch pad name.
-    *   `video_url`: (string) Primary webcast URL.
+*   **Fields (Launch Object - Top Level):**
+    *   `id`: (string) Unique UUID for the launch.
+    *   `name`: (string) Full name of the mission (e.g. "Falcon 9 Block 5 | Starlink Group 12-2").
+    *   `date`: (string) Launch date in `YYYY-MM-DD`.
+    *   `time`: (string) Launch time in `HH:MM:SS`.
+    *   `net`: (string) Full ISO8601 "No Earlier Than" timestamp.
+    *   `status`: (object) Detailed status object containing `id`, `name`, `abbrev`, and `description`.
+    *   `rocket`: (object) Full rocket data including `id` and `configuration` details.
+    *   `mission`: (object) Comprehensive mission details including `description`, `type`, `orbit`, and `agencies`.
+    *   `pad`: (object) Launch site data including `id`, `url`, `name`, `map_url`, and `location` details.
+    *   `image`: (string) Primary high-resolution mission image URL.
+    *   `video_url`: (string) Primary YouTube/Webcast URL.
     *   `x_video_url`: (string) X (Twitter) update/webcast URL.
-    *   `landing_type`: (string) Type of landing (e.g., ASDS, RTLS).
-    *   `landing_location`: (string) Specific landing site name.
-    *   `description`: (string) Full mission description.
-    *   `image`: (string) Primary mission image URL.
-    *   `window_start`: (string) ISO8601 timestamp for window open.
-    *   `window_end`: (string) ISO8601 timestamp for window close.
-    *   `probability`: (int) Launch probability percentage.
-    *   `holdreason`: (string) Reason for a hold, if any.
-    *   `failreason`: (string) Reason for a failure, if any.
-    *   `is_detailed`: (boolean) Flag indicating if detailed data was successfully retrieved.
-    *   `all_data`: (object) Complete, unparsed raw response from the source API.
+    *   `landing_type`: (string) Simplified landing method (e.g. ASDS, RTLS).
+    *   `landing_location`: (string) Specific landing site (e.g. "A Shortfall of Gravitas").
+    *   `window_start`: (string) ISO8601 timestamp for launch window opening.
+    *   `window_end`: (string) ISO8601 timestamp for launch window closing.
+    *   `probability`: (int) Launch probability percentage (0-100).
+    *   `holdreason`: (string) Reason for a hold, if applicable.
+    *   `failreason`: (string) Reason for a failure, if applicable.
+    *   `is_detailed`: (boolean) Confirms if detailed mode was successful.
+    *   `all_data`: (object) Complete recursive map of ALL fields returned by the source API (SpaceX Launch Library v2.3.0).
 *   **Sample Response:**
 ```json
 {
   "upcoming": [
     {
-      "id": "abc-123",
-      "mission": "Starlink Group 12-2",
+      "id": "abc-123-def",
+      "name": "Falcon 9 Block 5 | Starlink Group 12-2",
       "date": "2026-01-10",
       "time": "18:00:00",
       "net": "2026-01-10T18:00:00Z",
-      "status": "Go",
-      "rocket": "Falcon 9 Block 5",
-      "orbit": "Low Earth Orbit",
-      "pad": "Space Launch Complex 40",
+      "status": {
+        "id": 1,
+        "name": "Go",
+        "abbrev": "Go",
+        "description": "The launch is a go."
+      },
+      "rocket": {
+        "id": 1,
+        "configuration": {
+          "id": 164,
+          "name": "Falcon 9 Block 5",
+          "family": "Falcon",
+          "full_name": "Falcon 9 Block 5",
+          "variant": "Block 5"
+        }
+      },
+      "mission": {
+        "id": 123,
+        "name": "Starlink Group 12-2",
+        "description": "A batch of Starlink satellites...",
+        "type": "Communications",
+        "orbit": { "id": 8, "name": "Low Earth Orbit", "abbrev": "LEO" }
+      },
+      "pad": {
+        "id": 80,
+        "name": "Space Launch Complex 40",
+        "location": { "id": 12, "name": "Cape Canaveral, FL" }
+      },
+      "image": "https://spacelaunchnow-prod-east.nyc3.cdn.digitaloceanspaces.com/...",
       "video_url": "https://www.youtube.com/watch?v=...",
-      "x_video_url": "https://x.com/SpaceX/...",
+      "x_video_url": "https://x.com/SpaceX/status/...",
       "landing_type": "ASDS",
       "landing_location": "A Shortfall of Gravitas",
-      "is_detailed": true,
-      "description": "A batch of Starlink satellites...",
-      "image": "https://...",
       "window_start": "2026-01-10T18:00:00Z",
       "window_end": "2026-01-10T22:00:00Z",
       "probability": 90,
       "holdreason": null,
       "failreason": null,
-      "all_data": { "id": "abc-123", "name": "Starlink Group 12-2" }
+      "is_detailed": true,
+      "all_data": { "...": "Full nested API response included here" }
     }
   ],
   "previous": [],
@@ -112,10 +134,16 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
     *   **Weather Object Fields:**
         *   `temperature_c`: (int) Temperature in Celsius.
         *   `temperature_f`: (float) Temperature in Fahrenheit.
-        *   `wind_speed_ms`: (float) Wind speed in meters per second.
+        *   `dewpoint_c`: (int) Dewpoint in Celsius.
+        *   `dewpoint_f`: (float) Dewpoint in Fahrenheit.
+        *   `humidity`: (int) Relative humidity percentage.
         *   `wind_speed_kts`: (int) Wind speed in knots.
+        *   `wind_gust_kts`: (int) Wind gust speed in knots (0 if none).
         *   `wind_direction`: (int) Wind direction in degrees.
+        *   `visibility_sm`: (float) Visibility in statute miles.
+        *   `altimeter_inhg`: (float) Altimeter setting in inches of mercury.
         *   `cloud_cover`: (int) Percentage of cloud cover estimation.
+        *   `flight_category`: (string) Estimated flight category (VFR, MVFR, IFR, LIFR).
         *   `raw`: (string) Raw METAR string from the weather service.
         *   `last_updated`: (string) ISO8601 timestamp of the weather fetch.
 *   **Sample Response (`/weather_all`):**
@@ -125,10 +153,16 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
     "Starbase": {
       "temperature_c": 18,
       "temperature_f": 64.4,
-      "wind_speed_ms": 4.11,
+      "dewpoint_c": 14,
+      "dewpoint_f": 57.2,
+      "humidity": 77,
       "wind_speed_kts": 8,
+      "wind_gust_kts": 0,
       "wind_direction": 160,
+      "visibility_sm": 10.0,
+      "altimeter_inhg": 30.12,
       "cloud_cover": 25,
+      "flight_category": "VFR",
       "raw": "KBRO 041453Z 16008KT 10SM FEW025 18/14 A3012 RMK AO2 SLP198 T01830139",
       "last_updated": "2026-01-04T14:55:00Z"
     },
@@ -152,7 +186,7 @@ Provides real-time and historical performance data, including request counts, ca
         *   `total_requests`: Total HTTP requests received.
         *   `cache_hits`: Number of requests served from cache.
         *   `cache_misses`: Number of requests that required a backend fetch.
-        *   `api_calls`: Number of calls made to external APIs (Grok, LL).
+        *   `api_calls`: Number of calls made to external APIs (Grok, Launch Library v2.3.0, and Aviation Weather).
     *   `history`: (array) List of snapshots containing `timestamp` and `data` (current metrics at that time).
     *   `hits_per_day`: (float) Rolling average of requests projected to a 24-hour period based on the selected range.
 *   **Sample Response:**
@@ -162,7 +196,7 @@ Provides real-time and historical performance data, including request counts, ca
     "total_requests": 1520,
     "cache_hits": 1450,
     "cache_misses": 70,
-    "api_calls": 45
+    "api_calls": 125
   },
   "history": [
     {
@@ -171,7 +205,7 @@ Provides real-time and historical performance data, including request counts, ca
         "total_requests": 1518,
         "cache_hits": 1448,
         "cache_misses": 70,
-        "api_calls": 45
+        "api_calls": 124
       }
     }
   ],

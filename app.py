@@ -370,6 +370,7 @@ def fetch_launch_details(launch_id: str):
     """Fetch detailed information for a single launch."""
     if not launch_id:
         return None
+    increment_metric("api_calls")
     url = f"https://ll.thespacedevs.com/2.3.0/launches/{launch_id}/?mode=detailed"
     try:
         headers = {'Authorization': f'Token {LL_API_KEY}'}
@@ -386,6 +387,7 @@ def fetch_launches(existing_previous=None):
         headers = {'Authorization': f'Token {LL_API_KEY}'}
         
         # Fetch previous launches with mode=detailed to get ALL data fields
+        increment_metric("api_calls")
         prev_url = 'https://ll.thespacedevs.com/2.3.0/launches/previous/?lsp__name=SpaceX&limit=15&mode=detailed'
         prev_response = requests.get(prev_url, headers=headers, timeout=15)
         prev_response.raise_for_status()
@@ -406,6 +408,7 @@ def fetch_launches(existing_previous=None):
         
         # Fetch upcoming launches with mode=detailed to get ALL data fields
         # Upcoming is always fully refreshed as statuses and dates shift frequently
+        increment_metric("api_calls")
         up_url = 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/?lsp__name=SpaceX&limit=15&mode=detailed'
         up_response = requests.get(up_url, headers=headers, timeout=15)
         up_response.raise_for_status()
@@ -422,26 +425,57 @@ def fetch_launches(existing_previous=None):
 def parse_metar(raw_metar: str):
     """Parse METAR string to extract weather data."""
     temperature_c = 25
+    dewpoint_c = 15
     wind_speed_kts = 0
+    wind_gust_kts = 0
     wind_direction = 0
     cloud_cover = 0
-
+    visibility_sm = 10
+    altimeter_inhg = 29.92
+    
     try:
-        # Extract temperature
-        temp_match = re.search(r'(\d{1,3})/', raw_metar)
-        if temp_match:
-            temperature_c = int(temp_match.group(1))
-            if temp_match.start() > 0 and raw_metar[temp_match.start()-1] == 'M':
-                temperature_c = -temperature_c
+        # Extract temperature and dewpoint
+        # Format: 18/14 or M01/M05
+        temp_dew_match = re.search(r'(M?\d{2})/(M?\d{2})', raw_metar)
+        if temp_dew_match:
+            t_str = temp_dew_match.group(1)
+            d_str = temp_dew_match.group(2)
+            
+            temperature_c = int(t_str.replace('M', '-'))
+            dewpoint_c = int(d_str.replace('M', '-'))
 
         # Extract wind
-        wind_match = re.search(r'(\d{3})(\d{2,3})(?:G\d{2,3})?KT', raw_metar)
+        # Format: 16008KT or 16008G15KT or VRB05KT
+        wind_match = re.search(r'(\d{3}|VRB)(\d{2,3})(?:G(\d{2,3}))?KT', raw_metar)
         if wind_match:
-            wind_direction = int(wind_match.group(1))
+            dir_str = wind_match.group(1)
+            wind_direction = int(dir_str) if dir_str != 'VRB' else 0
             wind_speed_kts = int(wind_match.group(2))
+            if wind_match.group(3):
+                wind_gust_kts = int(wind_match.group(3))
 
-        # Cloud cover estimation
-        if 'SKC' in raw_metar or 'CLR' in raw_metar:
+        # Extract visibility
+        # Format: 10SM or 1/2SM
+        vis_match = re.search(r'(\d+(?:\s\d/\d)?SM)', raw_metar)
+        if vis_match:
+            vis_str = vis_match.group(1).replace('SM', '')
+            if ' ' in vis_str:
+                parts = vis_str.split(' ')
+                visibility_sm = float(parts[0]) + (eval(parts[1]) if '/' in parts[1] else 0)
+            elif '/' in vis_str:
+                visibility_sm = eval(vis_str)
+            else:
+                visibility_sm = float(vis_str)
+
+        # Extract altimeter
+        # Format: A3012
+        alt_match = re.search(r'A(\d{4})', raw_metar)
+        if alt_match:
+            altimeter_inhg = int(alt_match.group(1)) / 100.0
+
+        # Cloud cover estimation and ceiling
+        ceiling_ft = 10000
+        if 'SKC' in raw_metar or 'CLR' in raw_metar or 'NCD' in raw_metar:
             cloud_cover = 0
         elif 'FEW' in raw_metar:
             cloud_cover = 25
@@ -453,21 +487,52 @@ def parse_metar(raw_metar: str):
             cloud_cover = 100
         else:
             cloud_cover = 50
+
+        # Extract ceiling (lowest BKN or OVC layer)
+        ceiling_match = re.search(r'(BKN|OVC)(\d{3})', raw_metar)
+        if ceiling_match:
+            ceiling_ft = int(ceiling_match.group(2)) * 100
+
+        # Humidity calculation (August-Roche-Magnus)
+        import math
+        es = 6.112 * math.exp((17.67 * temperature_c) / (temperature_c + 243.5))
+        e = 6.112 * math.exp((17.67 * dewpoint_c) / (dewpoint_c + 243.5))
+        humidity = min(100, max(0, int(100 * (e / es))))
+
+        # Flight category
+        if visibility_sm > 5 and ceiling_ft > 3000:
+            flight_category = "VFR"
+        elif visibility_sm >= 3 and ceiling_ft >= 1000:
+            flight_category = "MVFR"
+        elif visibility_sm >= 1 and ceiling_ft >= 500:
+            flight_category = "IFR"
+        else:
+            flight_category = "LIFR"
+
     except Exception as e:
         print(f"Error parsing METAR: {e}")
+        humidity = 50
+        flight_category = "VFR"
 
     return {
         'temperature_c': temperature_c,
-        'temperature_f': temperature_c * 9 / 5 + 32,
-        'wind_speed_ms': wind_speed_kts * 0.514444,
+        'temperature_f': round(temperature_c * 9 / 5 + 32, 1),
+        'dewpoint_c': dewpoint_c,
+        'dewpoint_f': round(dewpoint_c * 9 / 5 + 32, 1),
+        'humidity': humidity,
         'wind_speed_kts': wind_speed_kts,
+        'wind_gust_kts': wind_gust_kts,
         'wind_direction': wind_direction,
+        'visibility_sm': visibility_sm,
+        'altimeter_inhg': altimeter_inhg,
         'cloud_cover': cloud_cover,
+        'flight_category': flight_category,
         'raw': raw_metar
     }
 
 def fetch_weather(location: str):
     """Fetch METAR weather data for a given location."""
+    increment_metric("api_calls")
     metar_stations = {
         'Starbase': 'KBRO',
         'Vandy': 'KVBG',
@@ -487,9 +552,12 @@ def fetch_weather(location: str):
         print(f"Error fetching weather for {location}: {e}")
         return {
             'temperature_c': 25, 'temperature_f': 77,
-            'wind_speed_ms': 5, 'wind_speed_kts': 9.7,
-            'wind_direction': 90, 'cloud_cover': 50,
-            'error': str(e)
+            'dewpoint_c': 15, 'dewpoint_f': 59,
+            'humidity': 50,
+            'wind_speed_kts': 0, 'wind_gust_kts': 0,
+            'wind_direction': 0, 'visibility_sm': 10,
+            'altimeter_inhg': 29.92, 'cloud_cover': 0,
+            'flight_category': 'VFR', 'error': str(e)
         }
 
 def fetch_external_narratives():
@@ -633,7 +701,12 @@ def _get_weather_cached(location: str, force: bool = False):
         return data, False
 
     # Return default empty if not in cache (timer will populate)
-    return {"temperature_c": 25, "last_updated": None}, False
+    return {
+        "temperature_c": 25, "temperature_f": 77, 
+        "dewpoint_c": 15, "dewpoint_f": 59,
+        "humidity": 50, "wind_speed_kts": 0, 
+        "flight_category": "VFR", "last_updated": None
+    }, False
 
 @app.get("/weather/{location}")
 def get_weather(location: str, force: bool = False):
@@ -1462,30 +1535,59 @@ def dashboard(request: Request):
         }
 
         function renderWeatherCard(card, loc, data) {
+            const getFlightCategoryColor = (cat) => {
+                switch(cat) {
+                    case 'VFR': return 'text-emerald-400';
+                    case 'MVFR': return 'text-blue-400';
+                    case 'IFR': return 'text-yellow-400';
+                    case 'LIFR': return 'text-red-400';
+                    default: return 'text-slate-400';
+                }
+            };
+
             card.innerHTML = `
-                <div class="flex items-center justify-between mb-2">
-                    <h3 class="text-xl font-bold">${loc}</h3>
+                <div class="flex items-center justify-between mb-4">
+                    <div class="flex flex-col">
+                        <h3 class="text-xl font-bold">${loc}</h3>
+                        <span class="text-[10px] font-bold uppercase tracking-widest ${getFlightCategoryColor(data.flight_category)}">${data.flight_category || 'Unknown'}</span>
+                    </div>
                     <i data-lucide="cloud-sun" class="text-blue-400 w-6 h-6"></i>
                 </div>
-                <div class="grid grid-cols-2 gap-y-4 gap-x-6">
+                <div class="grid grid-cols-3 gap-y-4 gap-x-4">
                     <div>
-                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Temperature</p>
-                        <p class="text-2xl font-semibold">${Math.round(data.temperature_f)}°F <span class="text-sm text-slate-400 font-normal">/ ${Math.round(data.temperature_c)}°C</span></p>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Temp</p>
+                        <p class="text-lg font-semibold">${Math.round(data.temperature_f)}°F <span class="text-[10px] text-slate-400 font-normal">/ ${Math.round(data.temperature_c)}°C</span></p>
                     </div>
                     <div>
-                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind Speed</p>
-                        <p class="text-2xl font-semibold">${Math.round(data.wind_speed_kts)} <span class="text-sm text-slate-400 font-normal">kts</span></p>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Dewpoint</p>
+                        <p class="text-lg font-semibold">${Math.round(data.dewpoint_f)}°F <span class="text-[10px] text-slate-400 font-normal">/ ${Math.round(data.dewpoint_c)}°C</span></p>
                     </div>
                     <div>
-                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Cloud Cover</p>
-                        <p class="text-2xl font-semibold">${data.cloud_cover}%</p>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Humidity</p>
+                        <p class="text-lg font-semibold">${data.humidity}%</p>
                     </div>
                     <div>
-                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind Direction</p>
-                        <p class="text-2xl font-semibold">${data.wind_direction}°</p>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind</p>
+                        <p class="text-lg font-semibold">${Math.round(data.wind_speed_kts)}${data.wind_gust_kts ? `<span class="text-red-400 text-sm ml-1">G${data.wind_gust_kts}</span>` : ''} <span class="text-[10px] text-slate-400 font-normal">kts</span></p>
+                    </div>
+                    <div>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Direction</p>
+                        <p class="text-lg font-semibold">${data.wind_direction}°</p>
+                    </div>
+                    <div>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Visibility</p>
+                        <p class="text-lg font-semibold">${data.visibility_sm} <span class="text-[10px] text-slate-400 font-normal">sm</span></p>
+                    </div>
+                    <div>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Pressure</p>
+                        <p class="text-lg font-semibold">${data.altimeter_inhg ? data.altimeter_inhg.toFixed(2) : '29.92'} <span class="text-[10px] text-slate-400 font-normal">inHg</span></p>
+                    </div>
+                    <div>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Clouds</p>
+                        <p class="text-lg font-semibold">${data.cloud_cover}%</p>
                     </div>
                 </div>
-                <div class="mt-2 pt-3 border-t border-slate-800">
+                <div class="mt-4 pt-3 border-t border-slate-800">
                     <p class="text-[9px] font-mono text-slate-600 truncate uppercase" title="${data.raw || ''}">${data.raw || 'No raw METAR data'}</p>
                 </div>
             `;
