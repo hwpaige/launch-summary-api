@@ -1049,6 +1049,83 @@ def dashboard(request: Request):
             }
         }
 
+        function formatValue(val) {
+            if (val === null || val === undefined) return '<span class="text-slate-600 italic text-[10px]">null</span>';
+            if (val === '') return '<span class="text-slate-600 italic text-[10px]">empty</span>';
+            if (typeof val === 'boolean') return `<span class="${val ? 'text-emerald-400' : 'text-red-400'} font-bold text-[10px]">${val}</span>`;
+            if (typeof val === 'string' && (val.startsWith('http://') || val.startsWith('https://'))) {
+                return `<a href="${val}" target="_blank" class="text-blue-400 hover:underline truncate block max-w-full text-[10px]">${val}</a>`;
+            }
+            return `<span class="text-slate-300 break-words text-[10px]">${val}</span>`;
+        }
+
+        function renderSubData(val, depth = 0) {
+            if (val === null || val === undefined || val === '') return formatValue(val);
+            if (depth > 3) {
+                const str = JSON.stringify(val);
+                return `<span class="text-[9px] text-slate-500 italic font-mono" title='${str.replace(/'/g, "&apos;")}'>${str.length > 40 ? str.substring(0, 40) + '...' : str}</span>`;
+            }
+            
+            if (Array.isArray(val)) {
+                if (val.length === 0) return formatValue('');
+                return val.map(v => `
+                    <div class="pl-2 border-l border-slate-800/30 my-1">
+                        ${(typeof v === 'object' && v !== null) ? renderSubData(v, depth + 1) : formatValue(v)}
+                    </div>
+                `).join('');
+            }
+            
+            if (typeof val === 'object') {
+                return Object.entries(val).map(([k, v]) => {
+                    return `
+                        <div class="flex flex-col mt-1">
+                            <p class="text-[9px] text-slate-600 uppercase font-medium tracking-tight">${k.replace(/_/g, ' ')}</p>
+                            ${(typeof v === 'object' && v !== null) ? renderSubData(v, depth + 1) : formatValue(v)}
+                        </div>
+                    `;
+                }).join('');
+            }
+            
+            return formatValue(val);
+        }
+
+        function renderDataCards(data) {
+            if (!data || typeof data !== 'object') return '';
+            
+            let html = '<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">';
+            
+            // Prioritize these fields to appear first
+            const priority = ['status', 'net', 'window_start', 'window_end', 'probability', 'holdreason', 'failreason', 'rocket', 'mission', 'pad'];
+            
+            const keys = Object.keys(data).sort((a, b) => {
+                const aPrio = priority.indexOf(a);
+                const bPrio = priority.indexOf(b);
+                if (aPrio !== -1 && bPrio !== -1) return aPrio - bPrio;
+                if (aPrio !== -1) return -1;
+                if (bPrio !== -1) return 1;
+                
+                const aIsObj = typeof data[a] === 'object' && data[a] !== null;
+                const bIsObj = typeof data[b] === 'object' && data[b] !== null;
+                return aIsObj - bIsObj;
+            });
+
+            for (const key of keys) {
+                const value = data[key];
+
+                html += `
+                    <div class="bg-slate-950/40 p-3 rounded-xl border border-slate-800/50 space-y-1.5 flex flex-col">
+                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider border-b border-slate-800/50 pb-1">${key.replace(/_/g, ' ')}</p>
+                        <div class="flex-1">
+                            ${(typeof value === 'object' && value !== null) ? renderSubData(value) : formatValue(value)}
+                        </div>
+                    </div>
+                `;
+            }
+            
+            html += '</div>';
+            return html;
+        }
+
         async function fetchNarratives(force = false) {
             try {
                 const url = force ? '/recent_launches_narratives?force=true' : '/recent_launches_narratives';
@@ -1127,31 +1204,10 @@ def dashboard(request: Request):
                                 
                                 ${l.description ? `<p class="text-sm text-slate-300 leading-relaxed bg-slate-950/50 p-4 rounded-xl border border-slate-800">${l.description}</p>` : ''}
                                 
-                                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                                    <div class="bg-slate-950/30 p-3 rounded-lg border border-slate-800/50">
-                                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Orbit</p>
-                                        <p class="text-sm font-medium text-slate-200">${l.orbit}</p>
-                                    </div>
-                                    <div class="bg-slate-950/30 p-3 rounded-lg border border-slate-800/50">
-                                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Landing</p>
-                                        <p class="text-sm font-medium text-slate-200">${l.landing_type || 'None'} ${l.landing_location ? `(${l.landing_location})` : ''}</p>
-                                    </div>
-                                    <div class="bg-slate-950/30 p-3 rounded-lg border border-slate-800/50">
-                                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Probability</p>
-                                        <p class="text-sm font-medium text-slate-200">${l.probability !== null ? l.probability + '%' : 'N/A'}</p>
-                                    </div>
-                                    <div class="bg-slate-950/30 p-3 rounded-lg border border-slate-800/50">
-                                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Launch Window</p>
-                                        <p class="text-sm font-medium text-slate-200">${l.window_start ? new Date(l.window_start).toLocaleTimeString() : 'TBD'}</p>
-                                    </div>
+                                <div class="space-y-4">
+                                    <h3 class="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2 border-b border-slate-800 pb-1">Detailed Mission Data</h3>
+                                    ${renderDataCards(l.all_data)}
                                 </div>
-
-                                ${(l.holdreason || l.failreason) ? `
-                                <div class="p-3 rounded-lg border ${l.failreason ? 'bg-red-500/5 border-red-500/20' : 'bg-amber-500/5 border-amber-500/20'}">
-                                    <p class="text-[10px] uppercase font-bold tracking-wider mb-1 ${l.failreason ? 'text-red-400' : 'text-amber-400'}">${l.failreason ? 'Failure' : 'Hold'} Reason</p>
-                                    <p class="text-sm text-slate-200">${l.failreason || l.holdreason}</p>
-                                </div>
-                                ` : ''}
 
                                 <div class="flex flex-wrap gap-3">
                                     ${l.video_url ? `
