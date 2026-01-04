@@ -63,7 +63,7 @@ CACHE_KEY = "launch_narratives_v2"
 CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
-CACHE_TTL = 3600  # 1 hour TTL in seconds
+CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
 HISTORY_LIMIT = 10080 # 7 days at 1 minute intervals
 _last_snapshot_time = 0
 
@@ -380,7 +380,7 @@ def fetch_launch_details(launch_id: str):
         print(f"Failed to fetch launch details for {launch_id}: {e}")
         return None
 
-def fetch_launches():
+def fetch_launches(existing_previous=None):
     """Fetch SpaceX launch data (v2.3.0) using detailed mode to get all fields."""
     try:
         headers = {'Authorization': f'Token {LL_API_KEY}'}
@@ -391,19 +391,33 @@ def fetch_launches():
         prev_response.raise_for_status()
         prev_data = prev_response.json().get('results', [])
         
+        parsed_prev = [parse_launch_data(l, is_detailed=True) for l in prev_data]
+        
+        if existing_previous:
+            # Incremental update: Append new ones to existing list
+            existing_ids = {l['id'] for l in existing_previous if 'id' in l}
+            new_launches = [l for l in parsed_prev if l.get('id') not in existing_ids]
+            # Prepend new ones to maintain newest-first order
+            combined_prev = new_launches + existing_previous
+            # Limit history to 50 items for efficiency
+            combined_prev = combined_prev[:50]
+        else:
+            combined_prev = parsed_prev
+        
         # Fetch upcoming launches with mode=detailed to get ALL data fields
+        # Upcoming is always fully refreshed as statuses and dates shift frequently
         up_url = 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/?lsp__name=SpaceX&limit=15&mode=detailed'
         up_response = requests.get(up_url, headers=headers, timeout=15)
         up_response.raise_for_status()
         up_data = up_response.json().get('results', [])
         
         return {
-            'previous': [parse_launch_data(l, is_detailed=True) for l in prev_data],
+            'previous': combined_prev,
             'upcoming': [parse_launch_data(l, is_detailed=True) for l in up_data]
         }
     except Exception as e:
         print(f"Error in fetch_launches: {e}")
-        return {'previous': [], 'upcoming': []}
+        return {'previous': existing_previous or [], 'upcoming': []}
 
 def parse_metar(raw_metar: str):
     """Parse METAR string to extract weather data."""
@@ -492,13 +506,101 @@ def fetch_external_narratives():
         print(f"Error fetching external narratives: {e}")
         return []
 
+# --- Background Refresh Helpers ---
+
+def refresh_narratives_internal():
+    """Internal helper to refresh narratives cache."""
+    print("Refreshing narratives cache...")
+    cached_narratives = None
+    if r:
+        try:
+            data = r.get(CACHE_KEY)
+            if data:
+                cached_narratives = json.loads(data)
+        except: pass
+    else:
+        cached_narratives = _local_cache["launch_narratives"]
+
+    try:
+        descriptions = generate_narratives(existing_narratives=cached_narratives)
+        current_time = datetime.now(timezone.utc)
+        if r:
+            try:
+                r.set(CACHE_KEY, json.dumps(descriptions))
+                r.set(CACHE_TIME_KEY, current_time.isoformat())
+            except: pass
+        _local_cache["launch_narratives"] = descriptions
+        _local_cache["last_updated"] = current_time
+        return descriptions
+    except Exception as e:
+        print(f"Error in refresh_narratives_internal: {e}")
+        return cached_narratives
+
+def refresh_launches_internal():
+    """Internal helper to refresh launches cache."""
+    print("Refreshing launches cache...")
+    cache_key = "launches_cache_v2"
+    existing_previous = None
+    if r:
+        try:
+            cached = r.get(cache_key)
+            if cached:
+                existing_previous = json.loads(cached).get('previous')
+        except: pass
+
+    try:
+        data = fetch_launches(existing_previous=existing_previous)
+        last_updated = datetime.now(timezone.utc).isoformat()
+        result = {
+            "upcoming": data.get("upcoming", []),
+            "previous": data.get("previous", []),
+            "last_updated": last_updated
+        }
+        if r:
+            try:
+                r.setex(cache_key, 600, json.dumps(result))
+            except: pass
+        return result
+    except Exception as e:
+        print(f"Error in refresh_launches_internal: {e}")
+        return None
+
+def refresh_weather_internal():
+    """Internal helper to refresh all weather cache."""
+    print("Refreshing weather cache...")
+    locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne']
+    weather_results = {}
+    timestamps = []
+    
+    for loc in locations:
+        data = fetch_weather(loc)
+        last_updated = datetime.now(timezone.utc).isoformat()
+        data['last_updated'] = last_updated
+        weather_results[loc] = data
+        timestamps.append(last_updated)
+        
+        # Update individual cache
+        if r:
+            try:
+                r.setex(f"weather_cache_v2_{loc}", 300, json.dumps(data))
+            except: pass
+            
+    return {
+        "weather": weather_results,
+        "last_updated": min(timestamps) if timestamps else datetime.now(timezone.utc).isoformat()
+    }
+
 # --- New Endpoints ---
 
 @app.get("/launches")
 def get_launches(force: bool = False):
     increment_metric("total_requests")
-    cache_key = "launches_cache_v1"
-    if r and not force:
+    cache_key = "launches_cache_v2"
+    if force:
+        increment_metric("cache_misses")
+        return refresh_launches_internal()
+
+    if r:
         try:
             cached = r.get(cache_key)
             if cached:
@@ -507,38 +609,71 @@ def get_launches(force: bool = False):
         except: pass
     
     increment_metric("cache_misses")
-    data = fetch_launches()
-    if r and (data['previous'] or data['upcoming']):
+    # Return empty if not in cache and not forcing (timer will populate it)
+    return {"upcoming": [], "previous": [], "last_updated": None}
+
+def _get_weather_cached(location: str, force: bool = False):
+    """Internal helper to fetch weather with v2 caching metadata."""
+    cache_key = f"weather_cache_v2_{location}"
+    if r and not force:
         try:
-            r.setex(cache_key, 600, json.dumps(data))
+            cached = r.get(cache_key)
+            if cached:
+                return json.loads(cached), True
         except: pass
-    return data
+    
+    if force:
+        data = fetch_weather(location)
+        last_updated = datetime.now(timezone.utc).isoformat()
+        data['last_updated'] = last_updated
+        if r:
+            try:
+                r.setex(cache_key, 300, json.dumps(data))
+            except: pass
+        return data, False
+
+    # Return default empty if not in cache (timer will populate)
+    return {"temperature_c": 25, "last_updated": None}, False
 
 @app.get("/weather/{location}")
 def get_weather(location: str, force: bool = False):
     increment_metric("total_requests")
-    cache_key = f"weather_cache_{location}"
-    if r and not force:
-        try:
-            cached = r.get(cache_key)
-            if cached:
-                increment_metric("cache_hits")
-                return json.loads(cached)
-        except: pass
-    
-    increment_metric("cache_misses")
-    data = fetch_weather(location)
-    if r:
-        try:
-            r.setex(cache_key, 900, json.dumps(data))
-        except: pass
-    return data
+    res, is_hit = _get_weather_cached(location, force)
+    if is_hit:
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return res
 
 @app.get("/weather_all")
 def get_all_weather(force: bool = False):
     increment_metric("total_requests")
+    if force:
+        increment_metric("cache_misses")
+        return refresh_weather_internal()
+
     locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne']
-    return {loc: fetch_weather(loc) for loc in locations}
+    weather_results = {}
+    timestamps = []
+    
+    hit_count = 0
+    for loc in locations:
+        res, is_hit = _get_weather_cached(loc, force)
+        weather_results[loc] = res
+        if res.get('last_updated'):
+            timestamps.append(res.get('last_updated'))
+        if is_hit:
+            hit_count += 1
+            
+    if hit_count == len(locations):
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+        
+    return {
+        "weather": weather_results, 
+        "last_updated": min(timestamps) if timestamps else None
+    }
 
 @app.get("/launch_details/{launch_id}")
 def get_launch_details(launch_id: str):
@@ -552,12 +687,13 @@ def get_all_narratives():
 
 @app.get("/recent_launches_narratives")
 def get_narratives(force: bool = False):
-    """Serve from cache if available; generate otherwise."""
+    """Serve from cache only (timer-based refresh)."""
     increment_metric("total_requests")
     
-    current_time = datetime.now(timezone.utc)
-    cached_narratives = None
-    last_updated = None
+    if force:
+        increment_metric("cache_misses")
+        descriptions = refresh_narratives_internal()
+        return {"descriptions": descriptions, "last_updated": datetime.now(timezone.utc).isoformat()}
 
     # Try to get from Redis
     if r:
@@ -565,37 +701,21 @@ def get_narratives(force: bool = False):
             data = r.get(CACHE_KEY)
             time_str = r.get(CACHE_TIME_KEY)
             if data and time_str:
-                cached_narratives = json.loads(data)
-                last_updated = datetime.fromisoformat(time_str)
+                increment_metric("cache_hits")
+                return {"descriptions": json.loads(data), "last_updated": time_str}
         except Exception as e:
             print(f"Redis error in get_narratives: {e}")
-    else:
-        # Fallback to in-memory
-        cached_narratives = _local_cache["launch_narratives"]
-        last_updated = _local_cache["last_updated"]
+    
+    # Fallback to in-memory
+    cached_narratives = _local_cache["launch_narratives"]
+    last_updated = _local_cache["last_updated"]
 
-    # Check if cache is valid (not None and within TTL)
-    if not force and cached_narratives and last_updated:
-        elapsed = (current_time - last_updated).total_seconds()
-        if elapsed < CACHE_TTL:
-            increment_metric("cache_hits")
-            return {"descriptions": cached_narratives}
+    if cached_narratives and last_updated:
+        increment_metric("cache_hits")
+        return {"descriptions": cached_narratives, "last_updated": last_updated.isoformat()}
     
     increment_metric("cache_misses")
-    descriptions = generate_narratives(existing_narratives=cached_narratives)
-    
-    # Update cache (Redis and/or in-memory)
-    if r:
-        try:
-            r.set(CACHE_KEY, json.dumps(descriptions))
-            r.set(CACHE_TIME_KEY, current_time.isoformat())
-        except Exception as e:
-            print(f"Redis error updating cache: {e}")
-    
-    _local_cache["launch_narratives"] = descriptions
-    _local_cache["last_updated"] = current_time
-        
-    return {"descriptions": descriptions}
+    return {"descriptions": [], "last_updated": None}
 
 @app.get("/metrics")
 def get_app_metrics(range: str = "1h"):
@@ -603,20 +723,57 @@ def get_app_metrics(range: str = "1h"):
     record_snapshot()
     return get_metrics(range_type=range)
 
-def start_metrics_background_thread():
+def start_background_worker():
     def run():
         # Wait a bit for the app to start
-        time.sleep(10)
+        time.sleep(5)
+        
+        # Initial bootstrap (populate empty caches)
+        print("Starting background worker bootstrap...")
+        try:
+            refresh_narratives_internal()
+            refresh_launches_internal()
+            refresh_weather_internal()
+        except Exception as e:
+            print(f"Bootstrap error: {e}")
+
+        last_run = {
+            "narratives": time.time(),
+            "launches": time.time(),
+            "weather": time.time()
+        }
+        
         while True:
             try:
+                now = time.time()
+                
+                # Metrics (every 30s)
                 record_snapshot()
+                
+                # Narratives (every 15m)
+                if now - last_run["narratives"] >= 900:
+                    refresh_narratives_internal()
+                    last_run["narratives"] = now
+                
+                # Launches (every 10m)
+                if now - last_run["launches"] >= 600:
+                    refresh_launches_internal()
+                    last_run["launches"] = now
+                    
+                # Weather (every 5m)
+                if now - last_run["weather"] >= 300:
+                    refresh_weather_internal()
+                    last_run["weather"] = now
+                    
             except Exception as e:
-                print(f"Background metrics error: {e}")
-            time.sleep(30) # Check every 30s, record_snapshot will throttle to 1m
+                print(f"Background worker error: {e}")
+            
+            time.sleep(30) # Loop interval
+            
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
-start_metrics_background_thread()
+start_background_worker()
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
@@ -653,7 +810,10 @@ def dashboard(request: Request):
                     <span class="text-xl font-bold tracking-tight">SpaceX Narratives</span>
                 </div>
                 <div class="flex items-center gap-4">
-                    <!-- Global refresh removed, now per-tab -->
+                    <div class="flex items-center gap-2 px-3 py-1 bg-slate-950 border border-slate-800 rounded-lg">
+                        <i data-lucide="globe" class="text-slate-500 w-4 h-4"></i>
+                        <span id="utc-clock" class="text-xs font-mono font-bold text-slate-400">00:00:00 UTC</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -707,23 +867,32 @@ def dashboard(request: Request):
         <!-- Refresh Schedule Row -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
              <div class="bg-slate-900/30 border border-slate-800/50 p-3 rounded-xl flex items-center justify-between">
-                <div class="flex items-center gap-2">
-                    <i data-lucide="list" class="text-blue-500 w-4 h-4"></i>
-                    <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Narrative Refresh</span>
+                <div class="flex flex-col">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="list" class="text-blue-500 w-4 h-4"></i>
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Narrative Refresh</span>
+                    </div>
+                    <span class="text-[9px] text-slate-600 mt-1 font-medium">Last: <span id="last-ref-narratives" class="text-slate-400">--:--:--</span></span>
                 </div>
                 <span id="timer-narratives" class="text-sm font-mono font-bold text-blue-400">00:00</span>
              </div>
              <div class="bg-slate-900/30 border border-slate-800/50 p-3 rounded-xl flex items-center justify-between">
-                <div class="flex items-center gap-2">
-                    <i data-lucide="rocket" class="text-emerald-500 w-4 h-4"></i>
-                    <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Launch Refresh</span>
+                <div class="flex flex-col">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="rocket" class="text-emerald-500 w-4 h-4"></i>
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Launch Refresh</span>
+                    </div>
+                    <span class="text-[9px] text-slate-600 mt-1 font-medium">Last: <span id="last-ref-launches" class="text-slate-400">--:--:--</span></span>
                 </div>
                 <span id="timer-launches" class="text-sm font-mono font-bold text-emerald-400">00:00</span>
              </div>
              <div class="bg-slate-900/30 border border-slate-800/50 p-3 rounded-xl flex items-center justify-between">
-                <div class="flex items-center gap-2">
-                    <i data-lucide="cloud-sun" class="text-blue-400 w-4 h-4"></i>
-                    <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Weather Refresh</span>
+                <div class="flex flex-col">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="cloud-sun" class="text-blue-400 w-4 h-4"></i>
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Weather Refresh</span>
+                    </div>
+                    <span class="text-[9px] text-slate-600 mt-1 font-medium">Last: <span id="last-ref-weather" class="text-slate-400">--:--:--</span></span>
                 </div>
                 <span id="timer-weather" class="text-sm font-mono font-bold text-blue-400">00:00</span>
              </div>
@@ -930,9 +1099,37 @@ def dashboard(request: Request):
             weather: Date.now() + refreshIntervals.weather * 1000
         };
 
+        function syncTimer(category, lastUpdatedIso) {
+            if (!lastUpdatedIso) return;
+            const lastUpdatedDate = new Date(lastUpdatedIso);
+            const lastUpdated = lastUpdatedDate.getTime();
+            const interval = refreshIntervals[category] * 1000;
+            // Update the next refresh target based on when the backend last updated
+            nextRefresh[category] = lastUpdated + interval;
+
+            // Update the "Last Refreshed" display in the timer cards (in UTC to match clock)
+            const lastRefEl = document.getElementById(`last-ref-${category}`);
+            if (lastRefEl) {
+                const utcStr = lastUpdatedDate.getUTCHours().toString().padStart(2, '0') + ':' + 
+                               lastUpdatedDate.getUTCMinutes().toString().padStart(2, '0') + ':' + 
+                               lastUpdatedDate.getUTCSeconds().toString().padStart(2, '0');
+                lastRefEl.textContent = utcStr + ' UTC';
+            }
+        }
+
         function updateTimers() {
             const now = Date.now();
             
+            // Update UTC Clock
+            const nowDate = new Date();
+            const utcString = nowDate.getUTCHours().toString().padStart(2, '0') + ':' + 
+                             nowDate.getUTCMinutes().toString().padStart(2, '0') + ':' + 
+                             nowDate.getUTCSeconds().toString().padStart(2, '0');
+            const utcClockEl = document.getElementById('utc-clock');
+            if (utcClockEl) {
+                utcClockEl.textContent = utcString + ' UTC';
+            }
+
             const formatTime = (ms) => {
                 const totalSeconds = Math.max(0, Math.floor(ms / 1000));
                 const minutes = Math.floor(totalSeconds / 60);
@@ -1054,6 +1251,15 @@ def dashboard(request: Request):
             if (val === '') return '<span class="text-slate-600 italic text-[10px]">empty</span>';
             if (typeof val === 'boolean') return `<span class="${val ? 'text-emerald-400' : 'text-red-400'} font-bold text-[10px]">${val}</span>`;
             if (typeof val === 'string' && (val.startsWith('http://') || val.startsWith('https://'))) {
+                const isImage = /\.(jpg|jpeg|png|gif|webp|bmp|svg)($|\?)/i.test(val);
+                if (isImage) {
+                    return `
+                        <div class="flex flex-col gap-2">
+                            <a href="${val}" target="_blank" class="text-blue-400 hover:underline truncate block max-w-full text-[10px]">${val}</a>
+                            <img src="${val}" class="max-w-full h-auto rounded-lg border border-slate-800 shadow-sm mt-1" onerror="this.style.display='none'">
+                        </div>
+                    `;
+                }
                 return `<a href="${val}" target="_blank" class="text-blue-400 hover:underline truncate block max-w-full text-[10px]">${val}</a>`;
             }
             return `<span class="text-slate-300 break-words text-[10px]">${val}</span>`;
@@ -1154,7 +1360,14 @@ def dashboard(request: Request):
                     list.innerHTML = '<p class="text-slate-500 text-center py-8">No narratives available.</p>';
                 }
                 
-                document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+                if (data.last_updated) {
+                    syncTimer('narratives', data.last_updated);
+                    const luDate = new Date(data.last_updated);
+                    const luUtc = luDate.getUTCHours().toString().padStart(2, '0') + ':' + 
+                                 luDate.getUTCMinutes().toString().padStart(2, '0') + ':' + 
+                                 luDate.getUTCSeconds().toString().padStart(2, '0') + ' UTC';
+                    document.getElementById('last-updated').textContent = 'Last updated: ' + luUtc;
+                }
             } catch (error) {
                 console.error('Error fetching narratives:', error);
             }
@@ -1239,62 +1452,78 @@ def dashboard(request: Request):
                 
                 renderList(upList, data.upcoming);
                 renderList(prevList, data.previous);
+                
+                if (data.last_updated) {
+                    syncTimer('launches', data.last_updated);
+                }
             } catch (error) {
                 upList.innerHTML = prevList.innerHTML = '<p class="text-red-400 text-center py-4">Error loading launches.</p>';
             }
         }
 
+        function renderWeatherCard(card, loc, data) {
+            card.innerHTML = `
+                <div class="flex items-center justify-between mb-2">
+                    <h3 class="text-xl font-bold">${loc}</h3>
+                    <i data-lucide="cloud-sun" class="text-blue-400 w-6 h-6"></i>
+                </div>
+                <div class="grid grid-cols-2 gap-y-4 gap-x-6">
+                    <div>
+                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Temperature</p>
+                        <p class="text-2xl font-semibold">${Math.round(data.temperature_f)}°F <span class="text-sm text-slate-400 font-normal">/ ${Math.round(data.temperature_c)}°C</span></p>
+                    </div>
+                    <div>
+                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind Speed</p>
+                        <p class="text-2xl font-semibold">${Math.round(data.wind_speed_kts)} <span class="text-sm text-slate-400 font-normal">kts</span></p>
+                    </div>
+                    <div>
+                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Cloud Cover</p>
+                        <p class="text-2xl font-semibold">${data.cloud_cover}%</p>
+                    </div>
+                    <div>
+                        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind Direction</p>
+                        <p class="text-2xl font-semibold">${data.wind_direction}°</p>
+                    </div>
+                </div>
+                <div class="mt-2 pt-3 border-t border-slate-800">
+                    <p class="text-[9px] font-mono text-slate-600 truncate uppercase" title="${data.raw || ''}">${data.raw || 'No raw METAR data'}</p>
+                </div>
+            `;
+        }
+
         async function fetchWeatherAll(force = false) {
-            const locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne'];
             const container = document.getElementById('weather-grid');
-            container.innerHTML = '';
             
-            for (const loc of locations) {
+            // Show loaders
+            container.innerHTML = '';
+            ['Starbase', 'Vandy', 'Cape', 'Hawthorne'].forEach(loc => {
                 const card = document.createElement('div');
                 card.className = 'bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col gap-4';
                 card.innerHTML = `<div class="animate-pulse h-32 bg-slate-800 rounded"></div>`;
                 container.appendChild(card);
-                
-                fetchWeather(loc, card, force);
-            }
-        }
-
-        async function fetchWeather(loc, card, force = false) {
+            });
+            
             try {
-                const url = force ? `/weather/${loc}?force=true` : `/weather/${loc}`;
+                const url = force ? `/weather_all?force=true` : `/weather_all`;
                 const response = await fetch(url);
                 const data = await response.json();
                 
-                card.innerHTML = `
-                    <div class="flex items-center justify-between mb-2">
-                        <h3 class="text-xl font-bold">${loc}</h3>
-                        <i data-lucide="cloud-sun" class="text-blue-400 w-6 h-6"></i>
-                    </div>
-                    <div class="grid grid-cols-2 gap-y-4 gap-x-6">
-                        <div>
-                            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Temperature</p>
-                            <p class="text-2xl font-semibold">${Math.round(data.temperature_f)}°F <span class="text-sm text-slate-400 font-normal">/ ${Math.round(data.temperature_c)}°C</span></p>
-                        </div>
-                        <div>
-                            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind Speed</p>
-                            <p class="text-2xl font-semibold">${Math.round(data.wind_speed_kts)} <span class="text-sm text-slate-400 font-normal">kts</span></p>
-                        </div>
-                        <div>
-                            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Cloud Cover</p>
-                            <p class="text-2xl font-semibold">${data.cloud_cover}%</p>
-                        </div>
-                        <div>
-                            <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind Direction</p>
-                            <p class="text-2xl font-semibold">${data.wind_direction}°</p>
-                        </div>
-                    </div>
-                    <div class="mt-2 pt-3 border-t border-slate-800">
-                        <p class="text-[9px] font-mono text-slate-600 truncate uppercase" title="${data.raw || ''}">${data.raw || 'No raw METAR data'}</p>
-                    </div>
-                `;
-                lucide.createIcons();
+                container.innerHTML = '';
+                if (data.weather) {
+                    Object.entries(data.weather).forEach(([loc, weatherData]) => {
+                        const card = document.createElement('div');
+                        card.className = 'bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col gap-4';
+                        renderWeatherCard(card, loc, weatherData);
+                        container.appendChild(card);
+                    });
+                    lucide.createIcons();
+                }
+                
+                if (data.last_updated) {
+                    syncTimer('weather', data.last_updated);
+                }
             } catch (error) {
-                card.innerHTML = `<p class="text-red-400">Error loading weather for ${loc}</p>`;
+                container.innerHTML = '<p class="text-red-400 text-center py-4">Error loading weather.</p>';
             }
         }
 
@@ -1338,42 +1567,13 @@ def dashboard(request: Request):
 @app.post("/refresh")
 def refresh_cache():
     """Force refresh the cache (call this via scheduler)."""
-    print("Manual cache refresh triggered.")
-    
-    # Try to get the current cache to pass it for incremental update
-    cached_narratives = None
-    if r:
-        try:
-            data = r.get(CACHE_KEY)
-            if data:
-                cached_narratives = json.loads(data)
-        except:
-            pass
-    
-    if not cached_narratives:
-        cached_narratives = _local_cache["launch_narratives"]
-
-    descriptions = generate_narratives(existing_narratives=cached_narratives)
-    current_time = datetime.now(timezone.utc)
-    
-    # Update Redis
-    if r:
-        try:
-            r.set(CACHE_KEY, json.dumps(descriptions))
-            r.set(CACHE_TIME_KEY, current_time.isoformat())
-        except Exception as e:
-            print(f"Redis error in refresh_cache: {e}")
-            
-    # Update in-memory fallback
-    _local_cache["launch_narratives"] = descriptions
-    _local_cache["last_updated"] = current_time
-    
-    count = len(descriptions)
-    print(f"Cache successfully refreshed with {count} narratives.")
+    print("Manual cache refresh triggered via POST /refresh.")
+    descriptions = refresh_narratives_internal()
+    count = len(descriptions) if descriptions else 0
     return {
         "status": "Cache refreshed",
         "count": count,
-        "timestamp": current_time.isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 if __name__ == "__main__":
