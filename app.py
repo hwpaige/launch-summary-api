@@ -419,11 +419,11 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
         parsed_prev = [parse_launch_data(l, is_detailed=True) for l in prev_data]
         
         if existing_previous:
-            # Incremental update: Append new ones to existing list
-            existing_ids = {l['id'] for l in existing_previous if 'id' in l}
-            new_launches = [l for l in parsed_prev if l.get('id') not in existing_ids]
-            # Prepend new ones to maintain newest-first order
-            combined_prev = new_launches + existing_previous
+            # Incremental update: Replace existing ones with fresh data if present in latest fetch
+            new_ids = {l['id'] for l in parsed_prev if 'id' in l}
+            filtered_old = [l for l in existing_previous if l.get('id') not in new_ids]
+            # Prepend fresh data to maintain newest-first order
+            combined_prev = parsed_prev + filtered_old
             # Limit history to 2000 items for efficiency and to allow seeding
             combined_prev = combined_prev[:2000]
         else:
@@ -468,7 +468,7 @@ def seed_historical_launches():
 
     # We use a loop to keep fetching until we hit a limit or run out of data
     while True:
-        # Get current state from cache to determine offset
+        # Get current state from cache to determine where we are
         existing_previous = []
         upcoming = []
         if r:
@@ -480,19 +480,33 @@ def seed_historical_launches():
                     upcoming = data.get('upcoming', [])
             except: pass
         
-        offset = len(existing_previous)
-        total_so_far = offset
+        total_so_far = len(existing_previous)
         oldest_so_far = existing_previous[-1].get('net') if existing_previous else None
+
+        if total_so_far >= 2000:
+            print(f"Seeding: Already at history limit ({total_so_far}). Stopping.")
+            update_seeding_status(False, f"Complete. Hit history limit ({total_so_far}).", total_so_far, oldest_so_far)
+            break
         
-        update_seeding_status(True, f"Fetching at offset {offset}...", total_so_far, oldest_so_far)
-        print(f"Seeding: Fetching 5 older launches at offset {offset}...")
+        # Use date-based pagination for robustness against cache shifts
+        status_msg = f"Fetching launches older than {oldest_so_far.split('T')[0] if oldest_so_far else 'now'}..."
+        update_seeding_status(True, status_msg, total_so_far, oldest_so_far)
+        print(f"Seeding: {status_msg}")
         
         try:
             headers = {'Authorization': f'Token {LL_API_KEY}'}
+            params = {
+                'lsp__name': 'SpaceX',
+                'limit': 5,
+                'mode': 'detailed'
+            }
+            if oldest_so_far:
+                params['net__lt'] = oldest_so_far
+
             # Pull increasingly older launches in batches of 5
             increment_metric("api_calls")
-            url = f'https://ll.thespacedevs.com/2.3.0/launches/previous/?lsp__name=SpaceX&limit=5&offset={offset}&mode=detailed'
-            response = requests.get(url, headers=headers, timeout=15)
+            url = 'https://ll.thespacedevs.com/2.3.0/launches/previous/'
+            response = requests.get(url, headers=headers, params=params, timeout=15)
             
             if response.status_code == 429:
                 print("Hit API rate limit (429) during seeding. Stopping for now.")
@@ -510,8 +524,17 @@ def seed_historical_launches():
                 
             parsed_new = [parse_launch_data(l, is_detailed=True) for l in results]
             
+            # Filter out duplicates (possible if multiple launches have exact same timestamp)
+            existing_ids = {l['id'] for l in existing_previous if 'id' in l}
+            unique_new = [l for l in parsed_new if l.get('id') not in existing_ids]
+            
+            if not unique_new and results:
+                print("Seeding: All fetched results are duplicates. Stopping.")
+                update_seeding_status(False, "Stopped to avoid duplicate loop.", total_so_far, oldest_so_far)
+                break
+
             # Append older launches to the end of our history
-            combined_prev = existing_previous + parsed_new
+            combined_prev = existing_previous + unique_new
             
             # Limit history to 2000 items for efficiency
             combined_prev = combined_prev[:2000]
@@ -529,8 +552,8 @@ def seed_historical_launches():
             
             total_so_far = len(combined_prev)
             oldest_so_far = combined_prev[-1].get('net')
-            print(f"Added {len(parsed_new)} historical launches. Total: {total_so_far}")
-            update_seeding_status(True, f"Added {len(parsed_new)} launches.", total_so_far, oldest_so_far)
+            print(f"Added {len(unique_new)} historical launches. Total: {total_so_far}")
+            update_seeding_status(True, f"Added {len(unique_new)} launches.", total_so_far, oldest_so_far)
             
             # Brief sleep between batches
             time.sleep(1)
@@ -758,7 +781,7 @@ def refresh_launches_internal():
         }
         if r:
             try:
-                r.setex(cache_key, 600, json.dumps(result))
+                r.set(cache_key, json.dumps(result))
             except: pass
         return result
     except Exception as e:
