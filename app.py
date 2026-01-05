@@ -200,9 +200,9 @@ def generate_narratives(existing_narratives=None):
     increment_metric("api_calls")
     current_time = datetime.now(timezone.utc)
     three_months_ago = current_time - timedelta(days=90)
-    # Note: Using LL 2.0.0 as requested in the snippet
+    # Use v2.3.0
     url = (
-        f"https://ll.thespacedevs.com/2.0.0/launch/previous/"
+        f"https://ll.thespacedevs.com/2.3.0/launches/previous/"
         f"?lsp__name=SpaceX"
         f"&net__gte={three_months_ago.strftime('%Y-%m-%d')}"
         f"&net__lte={current_time.strftime('%Y-%m-%d')}"
@@ -360,6 +360,9 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
     
     mission_data = launch.get('mission') or {}
     
+    # API v2.3.0 uses vid_urls, while v2.0.0 uses vidURLs
+    vid_urls = launch.get('vid_urls') or launch.get('vidURLs') or []
+    
     return {
         'id': launch.get('id'),
         'mission': launch.get('name', 'Unknown'),
@@ -370,8 +373,8 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'rocket': launch.get('rocket', {}).get('configuration', {}).get('name', 'Unknown'),
         'orbit': mission_data.get('orbit', {}).get('name', 'Unknown'),
         'pad': launch.get('pad', {}).get('name', 'Unknown'),
-        'video_url': launch.get('vidURLs', [{}])[0].get('url', '') if launch.get('vidURLs') else '',
-        'x_video_url': next((v['url'] for v in launch.get('vidURLs', []) if v.get('url') and ('x.com' in v['url'].lower() or 'twitter.com' in v['url'].lower())), '') if launch.get('vidURLs') else '',
+        'video_url': vid_urls[0].get('url', '') if vid_urls else '',
+        'x_video_url': next((v['url'] for v in vid_urls if v.get('url') and ('x.com' in v['url'].lower() or 'twitter.com' in v['url'].lower())), '') if vid_urls else '',
         'landing_type': landing_type,
         'landing_location': landing_location,
         'is_detailed': is_detailed,
@@ -388,14 +391,19 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
     }
 
 def fetch_launch_details(launch_id: str):
-    """Fetch detailed information for a single launch."""
+    """Fetch detailed information for a single launch to get vidURLs."""
     if not launch_id:
         return None
     increment_metric("api_calls")
-    url = f"https://ll.thespacedevs.com/2.3.0/launches/{launch_id}/?mode=detailed"
+    # Use v2.3.0 for detailed fetch
+    url = f"https://ll.thespacedevs.com/2.3.0/launches/{launch_id}/"
+    print(f"Fetching details for launch {launch_id}")
     try:
-        headers = {'Authorization': f'Token {LL_API_KEY}'}
-        response = requests.get(url, headers=headers, timeout=15)
+        try:
+            response = requests.get(url, timeout=10, verify=True)
+        except Exception:
+            # Fallback for SSL issues
+            response = requests.get(url, timeout=10, verify=False)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -439,6 +447,7 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
         up_response = requests.get(up_url, headers=headers, timeout=15)
         up_response.raise_for_status()
         up_data = up_response.json().get('results', [])
+        
         combined_up = [parse_launch_data(l, is_detailed=True) for l in up_data]
     except Exception as e:
         print(f"Error fetching upcoming launches: {e}")
@@ -1031,7 +1040,7 @@ start_background_worker()
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     """Serve the dashboard UI."""
-    return """
+    return r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
