@@ -361,7 +361,8 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
     mission_data = launch.get('mission') or {}
     
     # API v2.3.0 uses vid_urls, while v2.0.0 uses vidURLs
-    vid_urls = launch.get('vid_urls') or launch.get('vidURLs') or []
+    raw_vid_urls = launch.get('vid_urls') or launch.get('vidURLs') or []
+    vid_urls = raw_vid_urls if isinstance(raw_vid_urls, list) else []
     
     return {
         'id': launch.get('id'),
@@ -370,6 +371,7 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'time': launch.get('net').split('T')[1].split('Z')[0] if launch.get('net') and 'T' in launch.get('net') else 'TBD',
         'net': launch.get('net'),
         'status': launch.get('status', {}).get('name', 'Unknown'),
+        'status_id': launch.get('status', {}).get('id'),
         'rocket': launch.get('rocket', {}).get('configuration', {}).get('name', 'Unknown'),
         'orbit': mission_data.get('orbit', {}).get('name', 'Unknown'),
         'pad': launch.get('pad', {}).get('name', 'Unknown'),
@@ -380,7 +382,7 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'is_detailed': is_detailed,
         # New enriched fields for "ALL data" view
         'description': mission_data.get('description', ''),
-        'image': launch.get('image', ''),
+        'image': launch.get('image', '') if isinstance(launch.get('image'), str) else (launch.get('image', {}).get('url', '') if isinstance(launch.get('image'), dict) else ''),
         'window_start': launch.get('window_start'),
         'window_end': launch.get('window_end'),
         'probability': launch.get('probability'),
@@ -430,12 +432,12 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
             # Incremental update: Replace existing ones with fresh data if present in latest fetch
             new_ids = {l['id'] for l in parsed_prev if 'id' in l}
             filtered_old = [l for l in existing_previous if l.get('id') not in new_ids]
-            # Prepend fresh data to maintain newest-first order
-            combined_prev = parsed_prev + filtered_old
+            # Maintain newest-first order by sorting after merge
+            combined_prev = sorted(parsed_prev + filtered_old, key=lambda x: x.get('net') or '', reverse=True)
             # Limit history to 2000 items for efficiency and to allow seeding
             combined_prev = combined_prev[:2000]
         else:
-            combined_prev = parsed_prev
+            combined_prev = sorted(parsed_prev, key=lambda x: x.get('net') or '', reverse=True)
     except Exception as e:
         print(f"Error fetching previous launches: {e}")
 
@@ -448,7 +450,11 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
         up_response.raise_for_status()
         up_data = up_response.json().get('results', [])
         
-        combined_up = [parse_launch_data(l, is_detailed=True) for l in up_data]
+        parsed_up = [parse_launch_data(l, is_detailed=True) for l in up_data]
+        # Filter out finished launches from upcoming list to satisfy user request
+        # Status IDs: 3=Success, 4=Failure, 7=Partial Failure
+        # This keeps "active" launches like "In Flight" (ID 6) and "Go" (ID 1)
+        combined_up = [l for l in parsed_up if l.get('status_id') not in [3, 4, 7]]
     except Exception as e:
         print(f"Error fetching upcoming launches: {e}")
         
@@ -471,15 +477,21 @@ def seed_historical_launches():
                 existing_previous = json.loads(cached).get('previous', [])
         except: pass
     
+    # Sort to find the actual oldest launch
+    if existing_previous:
+        existing_previous.sort(key=lambda x: x.get('net') or '', reverse=True)
+        oldest_so_far = existing_previous[-1].get('net')
+    else:
+        oldest_so_far = None
+        
     total_so_far = len(existing_previous)
-    oldest_so_far = existing_previous[-1].get('net') if existing_previous else None
     update_seeding_status(True, "Starting batch fetch...", total_so_far, oldest_so_far)
 
     # We use a loop to keep fetching until we hit a limit or run out of data
+    upcoming = []
     while True:
         # Get current state from cache to determine where we are
-        existing_previous = []
-        upcoming = []
+        # This allows us to pick up any new launches added by the regular refresh
         if r:
             try:
                 cached = r.get(cache_key)
@@ -487,10 +499,17 @@ def seed_historical_launches():
                     data = json.loads(cached)
                     existing_previous = data.get('previous', [])
                     upcoming = data.get('upcoming', [])
-            except: pass
+            except: 
+                print("Seeding: Error reading cache, using last known state.")
+        
+        if existing_previous:
+            # Crucial: Always sort to ensure the last item is truly the oldest
+            existing_previous.sort(key=lambda x: x.get('net') or '', reverse=True)
+            oldest_so_far = existing_previous[-1].get('net')
+        else:
+            oldest_so_far = None
         
         total_so_far = len(existing_previous)
-        oldest_so_far = existing_previous[-1].get('net') if existing_previous else None
 
         if total_so_far >= 2000:
             print(f"Seeding: Already at history limit ({total_so_far}). Stopping.")
@@ -506,13 +525,14 @@ def seed_historical_launches():
             headers = {'Authorization': f'Token {LL_API_KEY}'}
             params = {
                 'lsp__name': 'SpaceX',
-                'limit': 5,
-                'mode': 'detailed'
+                'limit': 20,
+                'mode': 'detailed',
+                'ordering': '-net'
             }
             if oldest_so_far:
                 params['net__lt'] = oldest_so_far
 
-            # Pull increasingly older launches in batches of 5
+            # Pull increasingly older launches in batches
             increment_metric("api_calls")
             url = 'https://ll.thespacedevs.com/2.3.0/launches/previous/'
             response = requests.get(url, headers=headers, params=params, timeout=15)
@@ -542,8 +562,8 @@ def seed_historical_launches():
                 update_seeding_status(False, "Stopped to avoid duplicate loop.", total_so_far, oldest_so_far)
                 break
 
-            # Append older launches to the end of our history
-            combined_prev = existing_previous + unique_new
+            # Append older launches and maintain sorted order
+            combined_prev = sorted(existing_previous + unique_new, key=lambda x: x.get('net') or '', reverse=True)
             
             # Limit history to 2000 items for efficiency
             combined_prev = combined_prev[:2000]
@@ -1399,8 +1419,18 @@ def dashboard(request: Request):
             const lastUpdatedDate = new Date(lastUpdatedIso);
             const lastUpdated = lastUpdatedDate.getTime();
             const interval = refreshIntervals[category] * 1000;
+            
             // Update the next refresh target based on when the backend last updated
-            nextRefresh[category] = lastUpdated + interval;
+            // Robustness: Ensure we don't set a target in the past, which causes infinite refresh loops
+            const target = lastUpdated + interval;
+            const now = Date.now();
+            
+            if (target <= now + 5000) { // If expired or expiring in next 5s
+                // Backend is lagging. Set next refresh to 30s from now to avoid spamming
+                nextRefresh[category] = now + 30000;
+            } else {
+                nextRefresh[category] = target;
+            }
 
             // Update the "Last Refreshed" display in the timer cards (in UTC to match clock)
             const lastRefEl = document.getElementById(`last-ref-${category}`);
@@ -1708,7 +1738,7 @@ def dashboard(request: Request):
                             </div>
                             
                             <div id="${id}" class="hidden px-4 pb-6 space-y-4 border-t border-slate-800/50 pt-4 bg-slate-900/30">
-                                ${l.image ? `<img src="${l.image}" class="w-full h-48 object-cover rounded-xl border border-slate-700 shadow-lg" onerror="this.style.display='none'">` : ''}
+                                ${(l.image && typeof l.image === 'string') ? `<img src="${l.image}" class="w-full h-48 object-cover rounded-xl border border-slate-700 shadow-lg" onerror="this.style.display='none'">` : ''}
                                 
                                 ${l.description ? `<p class="text-sm text-slate-300 leading-relaxed bg-slate-950/50 p-4 rounded-xl border border-slate-800">${l.description}</p>` : ''}
                                 
@@ -1718,11 +1748,11 @@ def dashboard(request: Request):
                                 </div>
 
                                 <div class="flex flex-wrap gap-3">
-                                    ${l.video_url ? `
+                                    ${(l.video_url && typeof l.video_url === 'string') ? `
                                     <a href="${l.video_url}" target="_blank" class="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors border border-red-500/20 text-xs font-semibold">
                                         <i data-lucide="play-circle" class="w-4 h-4"></i> Webcast
                                     </a>` : ''}
-                                    ${l.x_video_url ? `
+                                    ${(l.x_video_url && typeof l.x_video_url === 'string') ? `
                                     <a href="${l.x_video_url}" target="_blank" class="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors border border-slate-700 text-xs font-semibold">
                                         <i data-lucide="twitter" class="w-4 h-4"></i> X Update
                                     </a>` : ''}
