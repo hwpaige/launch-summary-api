@@ -33,7 +33,9 @@ Returns a chronological list (newest first) of witty descriptions for recent Spa
 *   **Caching:** Results are cached for 1 hour. The API uses incremental generation to append new launches without changing existing witty descriptions.
 
 ### 2. Get Detailed Launch Data
-Returns exhaustive structured data for both upcoming and previous SpaceX launches. This endpoint merges dashboard-optimized convenience fields with the full, raw response from the Launch Library v2.3.0 API in `mode=detailed`.
+Returns exhaustive structured data for both upcoming and previous SpaceX launches. This endpoint includes the full, raw response from the Launch Library v2.3.0 API in the `all_data` field for every launch.
+
+**NOTE:** This endpoint can return payloads exceeding 85MB. For performance-critical applications or web dashboards, use `GET /launches_slim` instead.
 
 *   **Endpoint:** `GET /launches`
 *   **Parameters:** `force=true` (optional)
@@ -44,85 +46,28 @@ Returns exhaustive structured data for both upcoming and previous SpaceX launche
     *   `last_updated`: (string) ISO8601 timestamp of when the launch data was last fetched.
 *   **Fields (Launch Object - Top Level):**
     *   `id`: (string) Unique UUID for the launch.
-    *   `name`: (string) Full name of the mission (e.g. "Falcon 9 Block 5 | Starlink Group 12-2").
-    *   `date`: (string) Launch date in `YYYY-MM-DD`.
-    *   `time`: (string) Launch time in `HH:MM:SS`.
-    *   `net`: (string) Full ISO8601 "No Earlier Than" timestamp.
-    *   `status`: (object) Detailed status object containing `id`, `name`, `abbrev`, and `description`.
-    *   `rocket`: (object) Full rocket data including `id` and `configuration` details.
-    *   `mission`: (object) Comprehensive mission details including `description`, `type`, `orbit`, and `agencies`.
-    *   `pad`: (object) Launch site data including `id`, `url`, `name`, `map_url`, and `location` details.
-    *   `image`: (string) Primary high-resolution mission image URL.
-    *   `video_url`: (string) Primary YouTube/Webcast URL.
-    *   `x_video_url`: (string) X (Twitter) update/webcast URL.
-    *   `landing_type`: (string) Simplified landing method (e.g. ASDS, RTLS).
-    *   `landing_location`: (string) Specific landing site (e.g. "A Shortfall of Gravitas").
-    *   `window_start`: (string) ISO8601 timestamp for launch window opening.
-    *   `window_end`: (string) ISO8601 timestamp for launch window closing.
-    *   `probability`: (int) Launch probability percentage (0-100).
-    *   `holdreason`: (string) Reason for a hold, if applicable.
-    *   `failreason`: (string) Reason for a failure, if applicable.
-    *   `is_detailed`: (boolean) Confirms if detailed mode was successful.
-    *   `all_data`: (object) Complete recursive map of ALL fields returned by the source API (SpaceX Launch Library v2.3.0).
-*   **Sample Response:**
-```json
-{
-  "upcoming": [
-    {
-      "id": "abc-123-def",
-      "name": "Falcon 9 Block 5 | Starlink Group 12-2",
-      "date": "2026-01-10",
-      "time": "18:00:00",
-      "net": "2026-01-10T18:00:00Z",
-      "status": {
-        "id": 1,
-        "name": "Go",
-        "abbrev": "Go",
-        "description": "The launch is a go."
-      },
-      "rocket": {
-        "id": 1,
-        "configuration": {
-          "id": 164,
-          "name": "Falcon 9 Block 5",
-          "family": "Falcon",
-          "full_name": "Falcon 9 Block 5",
-          "variant": "Block 5"
-        }
-      },
-      "mission": {
-        "id": 123,
-        "name": "Starlink Group 12-2",
-        "description": "A batch of Starlink satellites...",
-        "type": "Communications",
-        "orbit": { "id": 8, "name": "Low Earth Orbit", "abbrev": "LEO" }
-      },
-      "pad": {
-        "id": 80,
-        "name": "Space Launch Complex 40",
-        "location": { "id": 12, "name": "Cape Canaveral, FL" }
-      },
-      "image": "https://spacelaunchnow-prod-east.nyc3.cdn.digitaloceanspaces.com/...",
-      "video_url": "https://www.youtube.com/watch?v=...",
-      "x_video_url": "https://x.com/SpaceX/status/...",
-      "landing_type": "ASDS",
-      "landing_location": "A Shortfall of Gravitas",
-      "window_start": "2026-01-10T18:00:00Z",
-      "window_end": "2026-01-10T22:00:00Z",
-      "probability": 90,
-      "holdreason": null,
-      "failreason": null,
-      "is_detailed": true,
-      "all_data": { "...": "Full nested API response included here" }
-    }
-  ],
-  "previous": [],
-  "last_updated": "2026-01-04T14:50:00Z"
-}
-```
+    *   `name`: (string) Full name of the mission.
+    *   `all_data`: (object) Complete recursive map of ALL fields returned by the source API.
+    *   *(See /launches_slim for other convenience fields)*
 *   **Caching:** 10 minutes.
 
-### 3. Get Weather Data
+### 3. Get Optimized Launch Data (Recommended for Dashboards)
+A performance-optimized version of the launches endpoint that strips the heavy `all_data` field. This reduces the transfer size from ~85MB to less than 1MB.
+
+*   **Endpoint:** `GET /launches_slim`
+*   **Parameters:** `force=true` (optional)
+*   **Response Format:** JSON
+*   **Fields:** Same as `/launches`, but each launch object excludes `all_data`.
+*   **Caching:** 10 minutes.
+
+### 4. Get Raw Launch Details
+Returns the full, unpruned raw API response for a specific launch from the cache. Use this to get deep details for a single launch on-demand.
+
+*   **Endpoint:** `GET /launch_raw/{launch_id}`
+*   **Response Format:** JSON
+*   **Sample Response:** (Large nested JSON object)
+
+### 5. Get Weather Data
 Returns parsed METAR weather data for SpaceX launch and development sites (Starbase, Vandy, Cape, Hawthorne).
 
 *   **Endpoint:** `GET /weather/{location}` or `GET /weather_all`

@@ -931,6 +931,54 @@ def get_launches(force: bool = False):
     # Return empty if not in cache and not forcing (timer will populate it)
     return {"upcoming": [], "previous": [], "last_updated": None}
 
+@app.get("/launches_slim")
+def get_launches_slim(force: bool = False):
+    """Dashboard-optimized endpoint that strips 'all_data'."""
+    increment_metric("total_requests")
+    cache_key = "launches_cache_v2"
+    
+    data = None
+    if force:
+        increment_metric("cache_misses")
+        data = refresh_launches_internal()
+    else:
+        cached = get_cached_data(cache_key)
+        if cached:
+            increment_metric("cache_hits")
+            data = cached
+        else:
+            increment_metric("cache_misses")
+            return {"upcoming": [], "previous": [], "last_updated": None}
+    
+    if data:
+        def strip_bloat(l):
+            return {k: v for k, v in l.items() if k != 'all_data'}
+            
+        return {
+            "upcoming": [strip_bloat(l) for l in data.get("upcoming", [])],
+            "previous": [strip_bloat(l) for l in data.get("previous", [])],
+            "last_updated": data.get("last_updated")
+        }
+    return {"upcoming": [], "previous": [], "last_updated": None}
+
+@app.get("/launch_raw/{launch_id}")
+def get_launch_raw(launch_id: str):
+    """Fetch the raw 'all_data' for a specific launch from the cache."""
+    increment_metric("total_requests")
+    cache_key = "launches_cache_v2"
+    cached = get_cached_data(cache_key)
+    if not cached:
+        return {"error": "Cache empty"}
+    
+    # Search in both upcoming and previous
+    for l in cached.get('upcoming', []) + cached.get('previous', []):
+        if l.get('id') == launch_id:
+            increment_metric("cache_hits")
+            return l.get('all_data', {})
+            
+    increment_metric("cache_misses")
+    return {"error": "Launch not found"}
+
 def _get_weather_cached(location: str, force: bool = False):
     """Internal helper to fetch weather with v2 caching metadata."""
     cache_key = f"weather_cache_v2_{location}"
@@ -1456,6 +1504,53 @@ def dashboard(request: Request):
         const charts = {};
         let currentRange = '1h';
 
+        // Launch data management for lazy loading and pagination
+        let allPreviousLaunches = [];
+        let displayedPreviousCount = 20;
+
+        async function toggleLaunch(id) {
+            const detailsEl = document.getElementById('details-' + id);
+            if (!detailsEl) return;
+            
+            const isExpanding = detailsEl.classList.contains('hidden');
+            
+            // Toggle visibility
+            detailsEl.classList.toggle('hidden');
+            
+            if (isExpanding) {
+                const contentEl = document.getElementById('details-content-' + id);
+                if (contentEl && contentEl.getAttribute('data-loaded') !== 'true') {
+                    await fetchLaunchDetailsOnDemand(id);
+                }
+                lucide.createIcons();
+            }
+        }
+
+        async function fetchLaunchDetailsOnDemand(id) {
+            const contentEl = document.getElementById('details-content-' + id);
+            const rawEl = document.getElementById('raw-content-' + id);
+            
+            if (!contentEl) return;
+            
+            try {
+                const response = await fetch('/launch_raw/' + id);
+                const rawData = await response.json();
+                
+                if (rawData.error) throw new Error(rawData.error);
+                
+                contentEl.innerHTML = renderDataCards(rawData);
+                contentEl.setAttribute('data-loaded', 'true');
+                if (rawEl) rawEl.textContent = JSON.stringify(rawData, null, 2);
+            } catch (error) {
+                console.error('Error fetching launch raw data:', error);
+                contentEl.innerHTML = `<div class="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-xs flex items-center gap-2">
+                    <i data-lucide="alert-circle" class="w-4 h-4"></i>
+                    Failed to load detailed mission data: ${error.message}
+                </div>`;
+                lucide.createIcons();
+            }
+        }
+
         function initChart(id, color) {
             const ctx = document.getElementById(id).getContext('2d');
             return new Chart(ctx, {
@@ -1798,89 +1893,129 @@ def dashboard(request: Request):
 
         async function fetchLaunches(force = false) {
             const upList = document.getElementById('upcoming-launches-list');
-            const prevList = document.getElementById('previous-launches-list');
             
             try {
-                const url = force ? '/launches?force=true' : '/launches';
+                const url = force ? '/launches_slim?force=true' : '/launches_slim';
                 const response = await fetch(url);
                 const data = await response.json();
                 
-                const renderList = (el, launches) => {
-                    el.innerHTML = '';
-                    if (!launches || launches.length === 0) {
-                        el.innerHTML = '<p class="text-slate-500 text-center py-4">No launches found.</p>';
-                        return;
-                    }
-                    launches.forEach(l => {
-                        const div = document.createElement('div');
-                        div.className = 'launch-card border-b border-slate-800 last:border-0 hover:bg-slate-800/10 transition-all';
-                        
-                        const id = 'details-' + l.id;
-                        const rawId = 'raw-' + l.id;
-                        
-                        div.innerHTML = `
-                            <div class="p-4 cursor-pointer" onclick="document.getElementById('${id}').classList.toggle('hidden'); lucide.createIcons();">
-                                <div class="flex items-center justify-between">
-                                    <div class="flex flex-col">
-                                        <span class="font-bold text-slate-100">${l.mission}</span>
-                                        <span class="text-xs text-slate-400">${l.rocket} • ${l.pad}</span>
-                                    </div>
-                                    <div class="flex flex-col items-end text-right">
-                                        <div class="flex items-center gap-2 mb-1">
-                                            <span class="text-sm font-mono text-blue-400">${l.date} ${l.time}</span>
-                                            <i data-lucide="chevron-down" class="w-4 h-4 text-slate-500"></i>
-                                        </div>
-                                        <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 uppercase tracking-tighter ${l.status === 'Success' ? 'text-emerald-400' : 'text-yellow-400'}">${l.status}</span>
-                                    </div>
-                                </div>
-                            </div>
-                            
-                            <div id="${id}" class="hidden px-4 pb-6 space-y-4 border-t border-slate-800/50 pt-4 bg-slate-900/30">
-                                ${(l.image && typeof l.image === 'string') ? `<img src="${l.image}" class="w-full h-48 object-cover rounded-xl border border-slate-700 shadow-lg" onerror="this.style.display='none'">` : ''}
-                                
-                                ${l.description ? `<p class="text-sm text-slate-300 leading-relaxed bg-slate-950/50 p-4 rounded-xl border border-slate-800">${l.description}</p>` : ''}
-                                
-                                <div class="space-y-4">
-                                    <h3 class="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2 border-b border-slate-800 pb-1">Detailed Mission Data</h3>
-                                    ${renderDataCards(l.all_data)}
-                                </div>
-
-                                <div class="flex flex-wrap gap-3">
-                                    ${(l.video_url && typeof l.video_url === 'string') ? `
-                                    <a href="${l.video_url}" target="_blank" class="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors border border-red-500/20 text-xs font-semibold">
-                                        <i data-lucide="play-circle" class="w-4 h-4"></i> Webcast
-                                    </a>` : ''}
-                                    ${(l.x_video_url && typeof l.x_video_url === 'string') ? `
-                                    <a href="${l.x_video_url}" target="_blank" class="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors border border-slate-700 text-xs font-semibold">
-                                        <i data-lucide="twitter" class="w-4 h-4"></i> X Update
-                                    </a>` : ''}
-                                    <button onclick="document.getElementById('${rawId}').classList.toggle('hidden')" class="flex items-center gap-2 px-3 py-1.5 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 rounded-lg transition-colors border border-blue-500/20 text-xs font-semibold ml-auto">
-                                        <i data-lucide="code" class="w-4 h-4"></i> View Raw Data
-                                    </button>
-                                </div>
-
-                                <div id="${rawId}" class="hidden mt-4">
-                                    <div class="flex items-center justify-between mb-2">
-                                        <span class="text-[10px] text-slate-500 uppercase font-bold">API Response Object</span>
-                                        <button onclick="navigator.clipboard.writeText(this.parentElement.nextElementSibling.textContent)" class="text-[10px] text-blue-400 hover:text-blue-300 uppercase font-bold">Copy JSON</button>
-                                    </div>
-                                    <pre class="bg-slate-950 p-4 rounded-xl border border-slate-800 text-[10px] text-slate-400 overflow-x-auto font-mono max-h-60">${JSON.stringify(l.all_data, null, 2)}</pre>
-                                </div>
-                            </div>
-                        `;
-                        el.appendChild(div);
-                    });
-                    lucide.createIcons();
-                };
+                allPreviousLaunches = data.previous || [];
                 
                 renderList(upList, data.upcoming);
-                renderList(prevList, data.previous);
+                renderPreviousList(false);
                 
                 if (data.last_updated) {
                     syncTimer('launches', data.last_updated);
                 }
             } catch (error) {
-                upList.innerHTML = prevList.innerHTML = '<p class="text-red-400 text-center py-4">Error loading launches.</p>';
+                console.error('Error fetching launches:', error);
+                const upList = document.getElementById('upcoming-launches-list');
+                const prevList = document.getElementById('previous-launches-list');
+                if (upList) upList.innerHTML = '<p class="text-red-400 text-center py-4">Error loading upcoming launches.</p>';
+                if (prevList) prevList.innerHTML = '<p class="text-red-400 text-center py-4">Error loading previous launches.</p>';
+            }
+        }
+
+        function renderList(el, launches, isHistorical = false) {
+            if (!isHistorical) el.innerHTML = '';
+            if (!launches || launches.length === 0) {
+                if (!isHistorical) el.innerHTML = '<p class="text-slate-500 text-center py-4">No launches found.</p>';
+                return;
+            }
+            launches.forEach(l => {
+                const div = document.createElement('div');
+                div.className = 'launch-card border-b border-slate-800 last:border-0 hover:bg-slate-800/10 transition-all';
+                
+                const id = 'details-' + l.id;
+                const rawId = 'raw-' + l.id;
+                
+                div.innerHTML = `
+                    <div class="p-4 cursor-pointer" onclick="toggleLaunch('${l.id}')">
+                        <div class="flex items-center justify-between">
+                            <div class="flex flex-col">
+                                <span class="font-bold text-slate-100">${l.mission}</span>
+                                <span class="text-xs text-slate-400">${l.rocket} • ${l.pad}</span>
+                            </div>
+                            <div class="flex flex-col items-end text-right">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <span class="text-sm font-mono text-blue-400">${l.date} ${l.time}</span>
+                                    <i data-lucide="chevron-down" class="w-4 h-4 text-slate-500"></i>
+                                </div>
+                                <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 uppercase tracking-tighter ${l.status === 'Success' ? 'text-emerald-400' : 'text-yellow-400'}">${l.status}</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div id="${id}" class="hidden px-4 pb-6 space-y-4 border-t border-slate-800/50 pt-4 bg-slate-900/30">
+                        ${(l.image && typeof l.image === 'string') ? `<img src="${l.image}" class="w-full h-48 object-cover rounded-xl border border-slate-700 shadow-lg" onerror="this.style.display='none'">` : ''}
+                        
+                        ${l.description ? `<p class="text-sm text-slate-300 leading-relaxed bg-slate-950/50 p-4 rounded-xl border border-slate-800">${l.description}</p>` : ''}
+                        
+                        <div class="space-y-4">
+                            <h3 class="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2 border-b border-slate-800 pb-1">Detailed Mission Data</h3>
+                            <div id="details-content-${l.id}" class="min-h-[50px] flex flex-col justify-center">
+                                <div class="animate-pulse flex space-x-2">
+                                    <div class="h-4 bg-slate-800 rounded w-full"></div>
+                                </div>
+                                <span class="text-[10px] text-slate-600 italic mt-2 text-center">Loading detailed mission data...</span>
+                            </div>
+                        </div>
+
+                        <div class="flex flex-wrap gap-3">
+                            ${(l.video_url && typeof l.video_url === 'string') ? `
+                            <a href="${l.video_url}" target="_blank" class="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors border border-red-500/20 text-xs font-semibold">
+                                <i data-lucide="play-circle" class="w-4 h-4"></i> Webcast
+                            </a>` : ''}
+                            ${(l.x_video_url && typeof l.x_video_url === 'string') ? `
+                            <a href="${l.x_video_url}" target="_blank" class="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors border border-slate-700 text-xs font-semibold">
+                                <i data-lucide="twitter" class="w-4 h-4"></i> X Update
+                            </a>` : ''}
+                            <button onclick="document.getElementById('${rawId}').classList.toggle('hidden')" class="flex items-center gap-2 px-3 py-1.5 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 rounded-lg transition-colors border border-blue-500/20 text-xs font-semibold ml-auto">
+                                <i data-lucide="code" class="w-4 h-4"></i> View Raw Data
+                            </button>
+                        </div>
+
+                        <div id="${rawId}" class="hidden mt-4">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-[10px] text-slate-500 uppercase font-bold">API Response Object</span>
+                                <button onclick="navigator.clipboard.writeText(this.parentElement.nextElementSibling.textContent)" class="text-[10px] text-blue-400 hover:text-blue-300 uppercase font-bold">Copy JSON</button>
+                            </div>
+                            <pre id="raw-content-${l.id}" class="bg-slate-950 p-4 rounded-xl border border-slate-800 text-[10px] text-slate-400 overflow-x-auto font-mono max-h-60">Loading JSON...</pre>
+                        </div>
+                    </div>
+                `;
+                el.appendChild(div);
+            });
+            lucide.createIcons();
+        }
+
+        function renderPreviousList(append = false) {
+            const el = document.getElementById('previous-launches-list');
+            if (!append) {
+                el.innerHTML = '';
+                displayedPreviousCount = 0;
+            }
+            
+            const existingBtn = document.getElementById('btn-load-more');
+            if (existingBtn) existingBtn.remove();
+
+            const start = displayedPreviousCount;
+            const end = Math.min(start + (append ? 50 : 20), allPreviousLaunches.length);
+            const launches = allPreviousLaunches.slice(start, end);
+            
+            renderList(el, launches, true);
+            displayedPreviousCount = end;
+            
+            if (displayedPreviousCount < allPreviousLaunches.length) {
+                const btn = document.createElement('button');
+                btn.id = 'btn-load-more';
+                btn.className = 'w-full py-8 text-slate-400 hover:text-white font-bold transition-all border-t border-slate-800 bg-slate-900/10 hover:bg-slate-900/30 flex items-center justify-center gap-2';
+                btn.innerHTML = `<i data-lucide="plus-circle" class="w-5 h-5"></i> Load More (${allPreviousLaunches.length - displayedPreviousCount} remaining)`;
+                btn.onclick = () => {
+                    renderPreviousList(true);
+                };
+                el.appendChild(btn);
+                lucide.createIcons();
             }
         }
 
