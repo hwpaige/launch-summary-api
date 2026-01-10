@@ -179,7 +179,7 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
 Provides real-time and historical performance data, including request counts, cache efficiency, and interactive history.
 
 *   **Endpoint:** `GET /metrics`
-*   **Parameters:** `range=1h` (default), `24h`, or `7d`
+*   **Parameters:** `range=1h` (default), `24h`, `7d`, or `30d`
 *   **Response Format:** JSON
 *   **Fields:**
     *   `current`: (object) Current counters for:

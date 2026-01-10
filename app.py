@@ -108,11 +108,13 @@ CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
-HISTORY_LIMIT = 10080 # 7 days at 1 minute intervals
+HISTORY_LIMIT = 43200 # 30 days at 1 minute intervals
 SEEDING_STATUS_KEY = "seeding_status_v2"
+SEEDING_STOP_SIGNAL_KEY = "seeding_stop_signal_v2"
 _last_snapshot_time = 0
 
 _local_seeding_status = {"is_running": False, "last_status": "Idle", "total_pulled": 0, "oldest_launch": None}
+_stop_seeding_requested = False
 
 def update_seeding_status(is_running, last_status, total_pulled=0, oldest_launch=None):
     """Update the seeding status in Redis and memory."""
@@ -131,6 +133,19 @@ def update_seeding_status(is_running, last_status, total_pulled=0, oldest_launch
         except Exception as e:
             print(f"Redis error in update_seeding_status: {e}")
     return status
+
+def reset_stuck_seeding():
+    """Reset seeding status if it's marked as running but the app just started."""
+    if r:
+        try:
+            data = r.get(SEEDING_STATUS_KEY)
+            if data:
+                status = json.loads(data)
+                if status.get("is_running"):
+                    print("Detected stuck seeding status at startup. Resetting.")
+                    update_seeding_status(False, "Interrupted (App Restart)", status.get("total_pulled", 0), status.get("oldest_launch"))
+        except Exception as e:
+            print(f"Error resetting stuck seeding: {e}")
 
 def increment_metric(field):
     """Increment a metric in Redis or memory."""
@@ -211,27 +226,45 @@ def get_metrics(include_history=True, range_type="1h"):
     elif range_type == "24h":
         start_time = now - timedelta(hours=24)
         history = [h for h in history if datetime.fromisoformat(h['timestamp'].replace('Z', '+00:00')) > start_time]
-        if len(history) > 100:
-            history = history[::15] # ~15m intervals
     elif range_type == "7d":
         start_time = now - timedelta(days=7)
         history = [h for h in history if datetime.fromisoformat(h['timestamp'].replace('Z', '+00:00')) > start_time]
-        if len(history) > 200:
-            history = history[::60] # ~1h intervals
+    elif range_type == "30d":
+        start_time = now - timedelta(days=30)
+        history = [h for h in history if datetime.fromisoformat(h['timestamp'].replace('Z', '+00:00')) > start_time]
 
-    # Calculate live hits/day (last 24h or available range)
+    # Calculate range-relative current stats if we have history
+    if history:
+        first = history[0]['data']
+        last = history[-1]['data']
+        current = {
+            "total_requests": last.get('total_requests', 0) - first.get('total_requests', 0),
+            "cache_hits": last.get('cache_hits', 0) - first.get('cache_hits', 0),
+            "cache_misses": last.get('cache_misses', 0) - first.get('cache_misses', 0),
+            "api_calls": last.get('api_calls', 0) - first.get('api_calls', 0)
+        }
+
+    # Calculate live hits/day BEFORE downsampling for better accuracy
     hits_per_day = 0
     if len(history) > 1:
-        first = history[0]
-        last = history[-1]
+        first_h = history[0]
+        last_h = history[-1]
         try:
-            t1 = datetime.fromisoformat(first['timestamp'].replace('Z', '+00:00'))
-            t2 = datetime.fromisoformat(last['timestamp'].replace('Z', '+00:00'))
+            t1 = datetime.fromisoformat(first_h['timestamp'].replace('Z', '+00:00'))
+            t2 = datetime.fromisoformat(last_h['timestamp'].replace('Z', '+00:00'))
             duration_hours = (t2 - t1).total_seconds() / 3600
             if duration_hours > 0.1: # At least 6 mins of data
-                hits_diff = last['data']['total_requests'] - first['data']['total_requests']
+                hits_diff = last_h['data']['total_requests'] - first_h['data']['total_requests']
                 hits_per_day = (hits_diff / duration_hours) * 24
         except: pass
+
+    # Downsample history for charting
+    if range_type == "24h" and len(history) > 100:
+        history = history[::15] # ~15m intervals
+    elif range_type == "7d" and len(history) > 200:
+        history = history[::60] # ~1h intervals
+    elif range_type == "30d" and len(history) > 300:
+        history = history[::240] # ~4h intervals
 
     return {
         "current": current, 
@@ -531,6 +564,24 @@ def seed_historical_launches():
     # We use a loop to keep fetching until we hit a limit or run out of data
     upcoming = []
     while True:
+        # Check for stop signal
+        global _stop_seeding_requested
+        stop_signal = _stop_seeding_requested
+        if r:
+            try:
+                if r.get(SEEDING_STOP_SIGNAL_KEY) == "true":
+                    stop_signal = True
+            except: pass
+            
+        if stop_signal:
+            print("Seeding: Stop signal received. Terminating.")
+            update_seeding_status(False, "Stopped by user.", total_so_far, oldest_so_far)
+            _stop_seeding_requested = False
+            if r:
+                try: r.delete(SEEDING_STOP_SIGNAL_KEY)
+                except: pass
+            break
+
         # Get current state from cache to determine where we are
         # This allows us to pick up any new launches added by the regular refresh
         cached_data = get_cached_data(cache_key)
@@ -1012,10 +1063,29 @@ def trigger_seed_history():
     if status.get("is_running"):
         return {"status": "Seeding already in progress"}
     
+    # Clear stop signal if it exists
+    global _stop_seeding_requested
+    _stop_seeding_requested = False
+    if r:
+        try:
+            r.delete(SEEDING_STOP_SIGNAL_KEY)
+        except: pass
+    
     # Start seeding in a background thread
     seeding_thread = threading.Thread(target=seed_historical_launches, daemon=True)
     seeding_thread.start()
     return {"status": "Historical seeding started"}
+
+@app.post("/stop_seeding")
+def stop_seeding():
+    """Endpoint to stop the historical launch seeding."""
+    global _stop_seeding_requested
+    _stop_seeding_requested = True
+    if r:
+        try:
+            r.set(SEEDING_STOP_SIGNAL_KEY, "true")
+        except: pass
+    return {"status": "Stop signal sent"}
 
 def start_background_worker():
     def run():
@@ -1025,6 +1095,7 @@ def start_background_worker():
         # Initial bootstrap (populate empty caches)
         print("Starting background worker bootstrap...")
         try:
+            reset_stuck_seeding()
             refresh_narratives_internal()
             refresh_launches_internal()
             refresh_weather_internal()
@@ -1125,6 +1196,7 @@ def dashboard(request: Request):
                 <button onclick="changeRange('1h')" id="range-1h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all range-active">1h</button>
                 <button onclick="changeRange('24h')" id="range-24h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">24h</button>
                 <button onclick="changeRange('7d')" id="range-7d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">7d</button>
+                <button onclick="changeRange('30d')" id="range-30d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">30d</button>
             </div>
         </div>
 
@@ -1314,10 +1386,16 @@ def dashboard(request: Request):
                                 <span class="flex justify-between gap-4">Oldest: <span id="seed-oldest" class="text-white font-bold text-xs">--</span></span>
                             </div>
                         </div>
-                        <button id="btn-seed-history" onclick="triggerSeeding()" class="w-full sm:w-auto px-6 py-3 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl font-bold transition-all shadow-lg shadow-purple-900/20 flex items-center justify-center gap-2 whitespace-nowrap">
-                            <i data-lucide="database-zap" class="w-5 h-5"></i>
-                            Seed History
-                        </button>
+                        <div class="flex flex-col sm:flex-row gap-3 w-full sm:w-auto">
+                            <button id="btn-seed-history" onclick="triggerSeeding()" class="w-full sm:w-auto px-6 py-3 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl font-bold transition-all shadow-lg shadow-purple-900/20 flex items-center justify-center gap-2 whitespace-nowrap">
+                                <i data-lucide="database-zap" class="w-5 h-5"></i>
+                                Seed History
+                            </button>
+                            <button id="btn-stop-seeding" onclick="stopSeeding()" class="hidden w-full sm:w-auto px-6 py-3 bg-red-600 hover:bg-red-500 text-white rounded-xl font-bold transition-all shadow-lg shadow-red-900/20 flex items-center justify-center gap-2 whitespace-nowrap">
+                                <i data-lucide="square" class="w-5 h-5"></i>
+                                Stop Seeding
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1506,7 +1584,7 @@ def dashboard(request: Request):
 
         function changeRange(range) {
             currentRange = range;
-            ['1h', '24h', '7d'].forEach(r => {
+            ['1h', '24h', '7d', '30d'].forEach(r => {
                 const btn = document.getElementById(`range-${r}`);
                 if (r === range) {
                     btn.classList.add('range-active');
@@ -1561,13 +1639,20 @@ def dashboard(request: Request):
                 // Update charts
                 if (history.length > 0) {
                     const updateChart = (chart, key, isEfficiency = false) => {
-                        const values = history.map(h => {
+                        const values = [];
+                        for (let i = 0; i < history.length; i++) {
                             if (isEfficiency) {
-                                const t = h.data.total_requests || 0;
-                                return t > 0 ? (h.data.cache_hits / t) * 100 : 0;
+                                const t = history[i].data.total_requests || 0;
+                                values.push(t > 0 ? (history[i].data.cache_hits / t) * 100 : 0);
+                            } else {
+                                if (i === 0) {
+                                    values.push(0);
+                                } else {
+                                    const diff = (history[i].data[key] || 0) - (history[i-1].data[key] || 0);
+                                    values.push(Math.max(0, diff));
+                                }
                             }
-                            return h.data[key] || 0;
-                        });
+                        }
                         
                         chart.data.labels = history.map(h => '');
                         chart.data.datasets[0].data = values;
@@ -1942,6 +2027,24 @@ def dashboard(request: Request):
             }
         }
 
+        async function stopSeeding() {
+            const btn = document.getElementById('btn-stop-seeding');
+            btn.disabled = true;
+            btn.innerHTML = '<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Stopping...';
+            lucide.createIcons();
+
+            try {
+                const response = await fetch('/stop_seeding', { method: 'POST' });
+                const data = await response.json();
+                console.log('Stop response:', data);
+            } catch (error) {
+                console.error('Error stopping seeding:', error);
+                btn.disabled = false;
+                btn.innerHTML = '<i data-lucide="square" class="w-5 h-5"></i> Stop Seeding';
+                lucide.createIcons();
+            }
+        }
+
         function startSeedingPoll() {
             if (seedingPollInterval) clearInterval(seedingPollInterval);
             pollSeedingStatus();
@@ -1954,6 +2057,7 @@ def dashboard(request: Request):
                 const data = await response.json();
                 
                 const btn = document.getElementById('btn-seed-history');
+                const stopBtn = document.getElementById('btn-stop-seeding');
                 const tag = document.getElementById('seed-status-tag');
                 const count = document.getElementById('seed-count');
                 const oldest = document.getElementById('seed-oldest');
@@ -1964,11 +2068,17 @@ def dashboard(request: Request):
                 if (data.is_running) {
                     btn.disabled = true;
                     btn.innerHTML = '<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Seeding...';
+                    stopBtn.classList.remove('hidden');
+                    // Only reset stop button text if not already in "Stopping..." state
+                    if (!stopBtn.disabled) {
+                        stopBtn.innerHTML = '<i data-lucide="square" class="w-5 h-5"></i> Stop Seeding';
+                    }
                     tag.textContent = 'Active';
                     tag.className = 'text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 animate-pulse';
                 } else {
                     btn.disabled = false;
                     btn.innerHTML = '<i data-lucide="database-zap" class="w-5 h-5"></i> Seed History';
+                    stopBtn.classList.add('hidden');
                     tag.textContent = data.last_status || 'Idle';
                     tag.className = 'text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-slate-700 text-slate-400';
                     
