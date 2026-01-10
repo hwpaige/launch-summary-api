@@ -10,6 +10,8 @@ import json
 import math
 import time
 import threading
+import zlib
+import base64
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
@@ -45,6 +47,48 @@ def get_redis_client():
     return None
 
 r = get_redis_client()
+
+def set_cached_data(key, data, ttl=None):
+    """Set data in Redis with compression and better error handling."""
+    if not r:
+        return False
+    try:
+        json_str = json.dumps(data)
+        # Compress and base64 encode to store as string in the current Redis client
+        compressed = zlib.compress(json_str.encode('utf-8'))
+        encoded = base64.b64encode(compressed).decode('utf-8')
+        if ttl:
+            r.setex(key, ttl, encoded)
+        else:
+            r.set(key, encoded)
+        return True
+    except Exception as e:
+        print(f"Redis write error for {key}: {e}")
+        return False
+
+def get_cached_data(key):
+    """Get data from Redis with decompression support."""
+    if not r:
+        return None
+    try:
+        data = r.get(key)
+        if not data:
+            return None
+        
+        # Try to decompress (it will be base64 encoded string)
+        try:
+            decoded = base64.b64decode(data)
+            decompressed = zlib.decompress(decoded)
+            return json.loads(decompressed)
+        except Exception:
+            # Fallback for old uncompressed data
+            try:
+                return json.loads(data)
+            except:
+                return None
+    except Exception as e:
+        print(f"Redis read error for {key}: {e}")
+        return None
 
 # In-memory storage fallback (used only if Redis is unavailable)
 _local_cache = {
@@ -388,8 +432,8 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'probability': launch.get('probability'),
         'holdreason': launch.get('holdreason'),
         'failreason': launch.get('failreason'),
-        # Ensure every field returned by the API is cached and available
-        'all_data': launch
+        # Ensure every field returned by the API is available, but prune redundant URLs to save space
+        'all_data': {k: v for k, v in launch.items() if k not in ['vidURLs', 'infoURLs', 'vid_urls', 'info_urls', 'infographic']}
     }
 
 def fetch_launch_details(launch_id: str):
@@ -470,12 +514,9 @@ def seed_historical_launches():
     
     # Get initial state
     existing_previous = []
-    if r:
-        try:
-            cached = r.get(cache_key)
-            if cached:
-                existing_previous = json.loads(cached).get('previous', [])
-        except: pass
+    cached_data = get_cached_data(cache_key)
+    if cached_data:
+        existing_previous = cached_data.get('previous', [])
     
     # Sort to find the actual oldest launch
     if existing_previous:
@@ -492,15 +533,10 @@ def seed_historical_launches():
     while True:
         # Get current state from cache to determine where we are
         # This allows us to pick up any new launches added by the regular refresh
-        if r:
-            try:
-                cached = r.get(cache_key)
-                if cached:
-                    data = json.loads(cached)
-                    existing_previous = data.get('previous', [])
-                    upcoming = data.get('upcoming', [])
-            except: 
-                print("Seeding: Error reading cache, using last known state.")
+        cached_data = get_cached_data(cache_key)
+        if cached_data:
+            existing_previous = cached_data.get('previous', [])
+            upcoming = cached_data.get('upcoming', [])
         
         if existing_previous:
             # Crucial: Always sort to ensure the last item is truly the oldest
@@ -574,10 +610,7 @@ def seed_historical_launches():
                 "previous": combined_prev,
                 "last_updated": datetime.now(timezone.utc).isoformat()
             }
-            if r:
-                try:
-                    r.set(cache_key, json.dumps(result))
-                except: pass
+            set_cached_data(cache_key, result)
             
             total_so_far = len(combined_prev)
             oldest_so_far = combined_prev[-1].get('net')
@@ -760,24 +793,16 @@ def fetch_external_narratives():
 def refresh_narratives_internal():
     """Internal helper to refresh narratives cache."""
     print("Refreshing narratives cache...")
-    cached_narratives = None
-    if r:
-        try:
-            data = r.get(CACHE_KEY)
-            if data:
-                cached_narratives = json.loads(data)
-        except: pass
-    else:
+    cached_narratives = get_cached_data(CACHE_KEY)
+    if not cached_narratives:
         cached_narratives = _local_cache["launch_narratives"]
 
     try:
         descriptions = generate_narratives(existing_narratives=cached_narratives)
         current_time = datetime.now(timezone.utc)
-        if r:
-            try:
-                r.set(CACHE_KEY, json.dumps(descriptions))
-                r.set(CACHE_TIME_KEY, current_time.isoformat())
-            except: pass
+        set_cached_data(CACHE_KEY, descriptions)
+        set_cached_data(CACHE_TIME_KEY, current_time.isoformat())
+        
         _local_cache["launch_narratives"] = descriptions
         _local_cache["last_updated"] = current_time
         return descriptions
@@ -791,14 +816,11 @@ def refresh_launches_internal():
     cache_key = "launches_cache_v2"
     existing_previous = None
     existing_upcoming = None
-    if r:
-        try:
-            cached = r.get(cache_key)
-            if cached:
-                cache_data = json.loads(cached)
-                existing_previous = cache_data.get('previous')
-                existing_upcoming = cache_data.get('upcoming')
-        except: pass
+    
+    cached_data = get_cached_data(cache_key)
+    if cached_data:
+        existing_previous = cached_data.get('previous')
+        existing_upcoming = cached_data.get('upcoming')
 
     try:
         data = fetch_launches(existing_previous=existing_previous, existing_upcoming=existing_upcoming)
@@ -808,10 +830,7 @@ def refresh_launches_internal():
             "previous": data.get("previous", []),
             "last_updated": last_updated
         }
-        if r:
-            try:
-                r.set(cache_key, json.dumps(result))
-            except: pass
+        set_cached_data(cache_key, result)
         return result
     except Exception as e:
         print(f"Error in refresh_launches_internal: {e}")
@@ -852,13 +871,10 @@ def get_launches(force: bool = False):
         increment_metric("cache_misses")
         return refresh_launches_internal()
 
-    if r:
-        try:
-            cached = r.get(cache_key)
-            if cached:
-                increment_metric("cache_hits")
-                return json.loads(cached)
-        except: pass
+    cached = get_cached_data(cache_key)
+    if cached:
+        increment_metric("cache_hits")
+        return cached
     
     increment_metric("cache_misses")
     # Return empty if not in cache and not forcing (timer will populate it)
@@ -953,15 +969,12 @@ def get_narratives(force: bool = False):
         return {"descriptions": descriptions, "last_updated": datetime.now(timezone.utc).isoformat()}
 
     # Try to get from Redis
-    if r:
-        try:
-            data = r.get(CACHE_KEY)
-            time_str = r.get(CACHE_TIME_KEY)
-            if data and time_str:
-                increment_metric("cache_hits")
-                return {"descriptions": json.loads(data), "last_updated": time_str}
-        except Exception as e:
-            print(f"Redis error in get_narratives: {e}")
+    data = get_cached_data(CACHE_KEY)
+    time_str = get_cached_data(CACHE_TIME_KEY)
+    
+    if data and time_str:
+        increment_metric("cache_hits")
+        return {"descriptions": data, "last_updated": time_str}
     
     # Fallback to in-memory
     cached_narratives = _local_cache["launch_narratives"]
