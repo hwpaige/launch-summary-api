@@ -90,6 +90,9 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
         *   `cloud_cover`: (int) Percentage of cloud cover estimation.
         *   `flight_category`: (string) Estimated flight category (VFR, MVFR, IFR, LIFR).
         *   `raw`: (string) Raw METAR string from the weather service.
+        *   `forecast`: (object) 7-day forecast data from Open-Meteo.
+            *   `daily`: (object) Daily forecast including `time`, `temperature_2m_max`, `temperature_2m_min`, and `weathercode`.
+            *   `hourly`: (object) Hourly temperature data including `time` and `temperature_2m`.
         *   `last_updated`: (string) ISO8601 timestamp of the weather fetch.
 *   **Sample Response (`/weather_all`):**
 ```json
@@ -109,6 +112,18 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
       "cloud_cover": 25,
       "flight_category": "VFR",
       "raw": "KBRO 041453Z 16008KT 10SM FEW025 18/14 A3012 RMK AO2 SLP198 T01830139",
+      "forecast": {
+        "daily": {
+          "time": ["2026-01-04", "2026-01-05", "..."],
+          "temperature_2m_max": [22.5, 23.1, "..."],
+          "temperature_2m_min": [15.2, 14.8, "..."],
+          "weathercode": [0, 1, "..."]
+        },
+        "hourly": {
+          "time": ["2026-01-04T00:00", "2026-01-04T01:00", "..."],
+          "temperature_2m": [18.5, 18.2, "..."]
+        }
+      },
       "last_updated": "2026-01-04T14:55:00Z"
     },
     "Vandy": { "temperature_c": 12, "last_updated": "2026-01-04T14:55:00Z" },

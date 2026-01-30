@@ -795,6 +795,26 @@ def parse_metar(raw_metar: str):
         'raw': raw_metar
     }
 
+def fetch_forecast(location: str):
+    """Fetch 7-day forecast (daily + hourly) from Open-Meteo."""
+    increment_metric("api_calls")
+    coords = {
+        'Starbase': (25.997, -97.156),
+        'Vandy': (34.742, -120.572),
+        'Cape': (28.483, -80.577),
+        'Hawthorne': (33.921, -118.330)
+    }
+    lat, lon = coords.get(location, (25.997, -97.156))
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m&timezone=auto"
+    
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"Error fetching forecast for {location}: {e}")
+        return None
+
 def fetch_weather(location: str):
     """Fetch METAR weather data for a given location."""
     increment_metric("api_calls")
@@ -896,6 +916,8 @@ def refresh_weather_internal():
     
     for loc in locations:
         data = fetch_weather(loc)
+        forecast = fetch_forecast(loc)
+        data['forecast'] = forecast
         last_updated = datetime.now(timezone.utc).isoformat()
         data['last_updated'] = last_updated
         weather_results[loc] = data
@@ -1213,6 +1235,7 @@ def dashboard(request: Request):
         .launch-card:hover { transform: translateY(-1px); }
         pre::-webkit-scrollbar { width: 6px; height: 6px; }
         pre::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        .forecast-day:hover { background-color: rgba(30, 41, 59, 0.5); }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-200 min-h-screen">
@@ -1496,6 +1519,24 @@ def dashboard(request: Request):
             </div>
         </div>
     </main>
+
+    <!-- Weather Hourly Modal -->
+    <div id="weather-modal" class="fixed inset-0 z-[60] hidden bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl">
+            <div class="p-6 border-b border-slate-800 flex items-center justify-between">
+                <div>
+                    <h3 id="modal-title" class="text-xl font-bold text-white">Hourly Forecast</h3>
+                    <p id="modal-subtitle" class="text-sm text-slate-400">Loading...</p>
+                </div>
+                <button onclick="closeWeatherModal()" class="p-2 hover:bg-slate-800 rounded-lg transition-colors">
+                    <i data-lucide="x" class="w-6 h-6 text-slate-400"></i>
+                </button>
+            </div>
+            <div id="modal-content" class="p-6 overflow-y-auto grid grid-cols-4 sm:grid-cols-6 gap-4">
+                <!-- Hourly data will be injected here -->
+            </div>
+        </div>
+    </div>
 
     <script>
         lucide.createIcons();
@@ -2030,6 +2071,46 @@ def dashboard(request: Request):
                 }
             };
 
+            const getWeatherIcon = (code) => {
+                // WMO Weather interpretation codes (WW)
+                if (code === 0) return 'sun';
+                if (code <= 3) return 'cloud-sun';
+                if (code <= 48) return 'cloud';
+                if (code <= 67) return 'cloud-rain';
+                if (code <= 77) return 'cloud-snow';
+                if (code <= 82) return 'cloud-rain';
+                if (code <= 86) return 'cloud-snow';
+                if (code <= 99) return 'cloud-lightning';
+                return 'cloud-sun';
+            };
+
+            let forecastHtml = '';
+            if (data.forecast && data.forecast.daily) {
+                forecastHtml = `
+                    <div class="mt-4 pt-4 border-t border-slate-800">
+                        <p class="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-3">7-Day Forecast</p>
+                        <div class="grid grid-cols-7 gap-1">
+                            ${data.forecast.daily.time.map((time, i) => {
+                                const date = new Date(time + 'T00:00:00');
+                                const dayName = date.toLocaleDateString('en-US', { weekday: 'short' });
+                                const maxTemp = Math.round(data.forecast.daily.temperature_2m_max[i]);
+                                const minTemp = Math.round(data.forecast.daily.temperature_2m_min[i]);
+                                const code = data.forecast.daily.weathercode[i];
+                                return `
+                                    <div class="flex flex-col items-center p-1.5 rounded-lg forecast-day cursor-pointer transition-colors" 
+                                         onclick="showHourly('${loc}', '${time}', ${i})">
+                                        <span class="text-[9px] text-slate-500 font-bold uppercase">${dayName}</span>
+                                        <i data-lucide="${getWeatherIcon(code)}" class="w-4 h-4 my-1 text-blue-400"></i>
+                                        <span class="text-[10px] font-bold">${maxTemp}°</span>
+                                        <span class="text-[9px] text-slate-500">${minTemp}°</span>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
             card.innerHTML = `
                 <div class="flex items-center justify-between mb-4">
                     <div class="flex flex-col">
@@ -2072,10 +2153,58 @@ def dashboard(request: Request):
                         <p class="text-lg font-semibold">${data.cloud_cover}%</p>
                     </div>
                 </div>
+                ${forecastHtml}
                 <div class="mt-4 pt-3 border-t border-slate-800">
                     <p class="text-[9px] font-mono text-slate-600 truncate uppercase" title="${data.raw || ''}">${data.raw || 'No raw METAR data'}</p>
                 </div>
             `;
+        }
+
+        let lastWeatherData = null;
+
+        function showHourly(loc, dateStr, dayIndex) {
+            if (!lastWeatherData || !lastWeatherData[loc] || !lastWeatherData[loc].forecast) return;
+            const forecast = lastWeatherData[loc].forecast;
+            const modal = document.getElementById('weather-modal');
+            const content = document.getElementById('modal-content');
+            const title = document.getElementById('modal-title');
+            const subtitle = document.getElementById('modal-subtitle');
+
+            const date = new Date(dateStr + 'T00:00:00');
+            title.textContent = `${loc} - ${date.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}`;
+            subtitle.textContent = "Hourly Temperature (°C)";
+
+            content.innerHTML = '';
+            
+            // Hourly data starts from index (dayIndex * 24)
+            const startIndex = dayIndex * 24;
+            for (let i = 0; i < 24; i++) {
+                const idx = startIndex + i;
+                if (idx >= forecast.hourly.time.length) break;
+                
+                const timeStr = forecast.hourly.time[idx];
+                const hour = new Date(timeStr).getHours();
+                const temp = Math.round(forecast.hourly.temperature_2m[idx]);
+                
+                const item = document.createElement('div');
+                item.className = 'flex flex-col items-center p-3 bg-slate-800/50 rounded-xl border border-slate-700/50';
+                item.innerHTML = `
+                    <span class="text-[10px] font-bold text-slate-400 mb-1">${hour}:00</span>
+                    <span class="text-sm font-bold text-white">${temp}°C</span>
+                    <span class="text-[9px] text-slate-500 mt-1">${Math.round(temp * 9/5 + 32)}°F</span>
+                `;
+                content.appendChild(item);
+            }
+
+            modal.classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+            lucide.createIcons();
+        }
+
+        function closeWeatherModal() {
+            const modal = document.getElementById('weather-modal');
+            modal.classList.add('hidden');
+            document.body.style.overflow = 'auto';
         }
 
         async function fetchWeatherAll(force = false) {
@@ -2094,6 +2223,7 @@ def dashboard(request: Request):
                 const url = force ? `/weather_all?force=true` : `/weather_all`;
                 const response = await fetch(url);
                 const data = await response.json();
+                lastWeatherData = data.weather;
                 
                 container.innerHTML = '';
                 if (data.weather) {
