@@ -92,7 +92,7 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
         *   `raw`: (string) Raw METAR string from the weather service.
         *   `forecast`: (object) 7-day forecast data from Open-Meteo.
             *   `daily`: (object) Daily forecast including `time`, `temperature_2m_max`, `temperature_2m_min`, and `weathercode`.
-            *   `hourly`: (object) Hourly temperature data including `time` and `temperature_2m`.
+            *   `hourly`: (object) Hourly data including `time`, `temperature_2m`, `windspeed_10m`, and `winddirection_10m`.
         *   `last_updated`: (string) ISO8601 timestamp of the weather fetch.
 *   **Sample Response (`/weather_all`):**
 ```json
@@ -121,7 +121,9 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
         },
         "hourly": {
           "time": ["2026-01-04T00:00", "2026-01-04T01:00", "..."],
-          "temperature_2m": [18.5, 18.2, "..."]
+          "temperature_2m": [18.5, 18.2, "..."],
+          "windspeed_10m": [12.5, 11.8, "..."],
+          "winddirection_10m": [160, 155, "..."]
         }
       },
       "last_updated": "2026-01-04T14:55:00Z"

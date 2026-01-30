@@ -805,7 +805,7 @@ def fetch_forecast(location: str):
         'Hawthorne': (33.921, -118.330)
     }
     lat, lon = coords.get(location, (25.997, -97.156))
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m&timezone=auto"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m,windspeed_10m,winddirection_10m&timezone=auto"
     
     try:
         response = requests.get(url, timeout=10)
@@ -2185,6 +2185,8 @@ def dashboard(request: Request):
                 const timeStr = forecast.hourly.time[idx];
                 const hour = new Date(timeStr).getHours();
                 const temp = Math.round(forecast.hourly.temperature_2m[idx]);
+                const windSpeed = Math.round(forecast.hourly.windspeed_10m[idx]);
+                const windDir = forecast.hourly.winddirection_10m[idx];
                 
                 const item = document.createElement('div');
                 item.className = 'flex flex-col items-center p-3 bg-slate-800/50 rounded-xl border border-slate-700/50';
@@ -2192,6 +2194,10 @@ def dashboard(request: Request):
                     <span class="text-[10px] font-bold text-slate-400 mb-1">${hour}:00</span>
                     <span class="text-sm font-bold text-white">${temp}°C</span>
                     <span class="text-[9px] text-slate-500 mt-1">${Math.round(temp * 9/5 + 32)}°F</span>
+                    <div class="mt-2 pt-2 border-t border-slate-700/50 w-full flex flex-col items-center">
+                         <span class="text-[10px] font-bold text-blue-400">${windSpeed} km/h</span>
+                         <span class="text-[8px] text-slate-500 uppercase">${windDir}°</span>
+                    </div>
                 `;
                 content.appendChild(item);
             }
