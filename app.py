@@ -835,14 +835,15 @@ def fetch_weather(location: str):
         nws_res = requests.get(nws_url, headers=nws_headers, timeout=5)
         if nws_res.status_code == 200:
             nws_data = nws_res.json().get('properties', {})
-            wind_speed = nws_data.get('windSpeed', {}).get('value') # m/s
-            wind_gust = nws_data.get('windGust', {}).get('value')   # m/s
+            wind_speed = nws_data.get('windSpeed', {}).get('value') # km/h
+            wind_gust = nws_data.get('windGust', {}).get('value')   # km/h
             wind_dir = nws_data.get('windDirection', {}).get('value') # degrees
             
             if wind_speed is not None:
-                live_wind['speed_kts'] = round(wind_speed * 1.94384, 1)
+                # NWS API returns speed in km/h (wmoUnit:km_h-1)
+                live_wind['speed_kts'] = round(wind_speed * 0.539957, 1)
             if wind_gust is not None:
-                live_wind['gust_kts'] = round(wind_gust * 1.94384, 1)
+                live_wind['gust_kts'] = round(wind_gust * 0.539957, 1)
             if wind_dir is not None:
                 live_wind['direction'] = int(wind_dir)
             
