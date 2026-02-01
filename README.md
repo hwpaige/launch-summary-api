@@ -68,7 +68,7 @@ Returns the full, unpruned raw API response for a specific launch from the cache
 *   **Sample Response:** (Large nested JSON object)
 
 ### 5. Get Weather Data
-Returns parsed METAR weather data for SpaceX launch and development sites (Starbase, Vandy, Cape, Hawthorne).
+Returns parsed METAR weather data for SpaceX launch and development sites (Starbase, Vandy, Cape, Hawthorne), enhanced with high-frequency live wind data from the National Weather Service (NWS) API.
 
 *   **Endpoint:** `GET /weather/{location}` or `GET /weather_all`
 *   **Parameters:** `force=true` (optional)
@@ -82,9 +82,15 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
         *   `dewpoint_c`: (int) Dewpoint in Celsius.
         *   `dewpoint_f`: (float) Dewpoint in Fahrenheit.
         *   `humidity`: (int) Relative humidity percentage.
-        *   `wind_speed_kts`: (int) Wind speed in knots.
+        *   `wind_speed_kts`: (int) Wind speed in knots (from METAR).
         *   `wind_gust_kts`: (int) Wind gust speed in knots (0 if none).
         *   `wind_direction`: (int) Wind direction in degrees.
+        *   `live_wind`: (object, optional) High-frequency data from NWS observations.
+            *   `speed_kts`: (float) Real-time wind speed.
+            *   `gust_kts`: (float) Real-time wind gust.
+            *   `direction`: (int) Real-time wind direction.
+            *   `timestamp`: (string) Observation time.
+            *   `source`: (string) "NWS Real-time".
         *   `visibility_sm`: (float) Visibility in statute miles.
         *   `altimeter_inhg`: (float) Altimeter setting in inches of mercury.
         *   `cloud_cover`: (int) Percentage of cloud cover estimation.
@@ -256,7 +262,7 @@ for launch in launches:
 
 ## Data Refresh Policy
 The API utilizes a **Timer-Based Refresh Strategy** to ensure stability and speed:
-1.  **Background Refresh:** A dedicated worker thread in the backend automatically refreshes the cache for Narratives (15m), Launches (10m), and Weather (5m).
+1.  **Background Refresh:** A dedicated worker thread in the backend automatically refreshes the cache for Narratives (15m), Launches (10m), and Weather (2m for high-frequency wind).
 2.  **Manual Force:** Users can trigger an immediate refresh via the dashboard buttons or by appending `?force=true` to API requests.
 3.  **Incremental History:** Previous launch data is never fully replaced; new launches are appended to the existing historical cache to preserve a continuous record.
 

@@ -825,6 +825,32 @@ def fetch_weather(location: str):
         'Hawthorne': 'KHHR'
     }
     station_id = metar_stations.get(location, 'KBRO')
+    
+    # Try to fetch live wind from NWS API for higher frequency (often includes SPECI or more frequent updates)
+    live_wind = {}
+    try:
+        # User-Agent is required for NWS API
+        nws_headers = {'User-Agent': '(my-launch-app, contact@example.com)'}
+        nws_url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
+        nws_res = requests.get(nws_url, headers=nws_headers, timeout=5)
+        if nws_res.status_code == 200:
+            nws_data = nws_res.json().get('properties', {})
+            wind_speed = nws_data.get('windSpeed', {}).get('value') # m/s
+            wind_gust = nws_data.get('windGust', {}).get('value')   # m/s
+            wind_dir = nws_data.get('windDirection', {}).get('value') # degrees
+            
+            if wind_speed is not None:
+                live_wind['speed_kts'] = round(wind_speed * 1.94384, 1)
+            if wind_gust is not None:
+                live_wind['gust_kts'] = round(wind_gust * 1.94384, 1)
+            if wind_dir is not None:
+                live_wind['direction'] = int(wind_dir)
+            
+            live_wind['timestamp'] = nws_data.get('timestamp')
+            live_wind['source'] = 'NWS Real-time'
+    except Exception as e:
+        print(f"Error fetching NWS live wind for {location}: {e}")
+
     url = f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=raw"
     try:
         response = requests.get(url, timeout=10)
@@ -832,7 +858,11 @@ def fetch_weather(location: str):
         raw_metar = response.text.strip()
         if not raw_metar:
             raise ValueError("Empty METAR response")
-        return parse_metar(raw_metar)
+        
+        parsed = parse_metar(raw_metar)
+        if live_wind:
+            parsed['live_wind'] = live_wind
+        return parsed
     except Exception as e:
         print(f"Error fetching weather for {location}: {e}")
         return {
@@ -1196,8 +1226,8 @@ def start_background_worker():
                     refresh_launches_internal()
                     last_run["launches"] = now
                     
-                # Weather (every 5m)
-                if now - last_run["weather"] >= 300:
+                # Weather (every 2m for higher frequency wind updates)
+                if now - last_run["weather"] >= 120:
                     refresh_weather_internal()
                     last_run["weather"] = now
                     
@@ -2134,11 +2164,12 @@ def dashboard(request: Request):
                     </div>
                     <div>
                         <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Wind</p>
-                        <p class="text-lg font-semibold">${Math.round(data.wind_speed_kts)}${data.wind_gust_kts ? `<span class="text-red-400 text-sm ml-1">G${data.wind_gust_kts}</span>` : ''} <span class="text-[10px] text-slate-400 font-normal">kts</span></p>
+                        <p class="text-lg font-semibold">${Math.round(data.live_wind && data.live_wind.speed_kts !== undefined ? data.live_wind.speed_kts : data.wind_speed_kts)}${ (data.live_wind && data.live_wind.gust_kts) ? `<span class="text-red-400 text-sm ml-1">G${Math.round(data.live_wind.gust_kts)}</span>` : (data.wind_gust_kts ? `<span class="text-red-400 text-sm ml-1">G${data.wind_gust_kts}</span>` : '')} <span class="text-[10px] text-slate-400 font-normal">kts</span></p>
+                        ${data.live_wind ? `<p class="text-[8px] text-blue-500 font-bold mt-0.5"><i data-lucide="zap" class="w-2 h-2 inline-block"></i> LIVE</p>` : ''}
                     </div>
                     <div>
                         <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Direction</p>
-                        <p class="text-lg font-semibold">${data.wind_direction}°</p>
+                        <p class="text-lg font-semibold">${data.live_wind && data.live_wind.direction !== undefined ? data.live_wind.direction : data.wind_direction}°</p>
                     </div>
                     <div>
                         <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Visibility</p>
