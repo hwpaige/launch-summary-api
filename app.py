@@ -12,6 +12,7 @@ import time
 import threading
 import zlib
 import base64
+import pytz
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
@@ -112,6 +113,459 @@ HISTORY_LIMIT = 43200 # 30 days at 1 minute intervals
 SEEDING_STATUS_KEY = "seeding_status_v2"
 SEEDING_STOP_SIGNAL_KEY = "seeding_stop_signal_v2"
 _last_snapshot_time = 0
+
+# Trajectory Helpers and Cache
+class Profiler:
+    def mark(self, msg):
+        print(f"[PROFILER] {msg}")
+
+class Logger:
+    def info(self, msg):
+        print(f"[INFO] {msg}")
+    def warning(self, msg):
+        print(f"[WARNING] {msg}")
+
+profiler = Profiler()
+logger = Logger()
+
+_TRAJECTORY_DATA_CACHE = None
+TRAJECTORY_CACHE_FILE = "trajectory_cache.json"
+
+def load_cache_from_file(filename):
+    """Load cache from Redis instead of file if possible, or fallback to file."""
+    if r:
+        data = get_cached_data("trajectory_cache_v2")
+        if data:
+            return {"data": data}
+    
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r') as f:
+                return {"data": json.load(f)}
+        except Exception as e:
+            print(f"Error loading cache file: {e}")
+    return {"data": {}}
+
+def save_cache_to_file(filename, data, updated_at=None):
+    """Save cache to Redis and local file."""
+    if r:
+        set_cached_data("trajectory_cache_v2", data)
+    
+    try:
+        with open(filename, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Error saving cache file: {e}")
+
+def compute_orbit_radius(orbit_label):
+    """Compute orbital radius based on orbit type."""
+    label = (orbit_label or '').lower()
+    EARTH_RADIUS = 1.0 # Normalized
+    if 'gto' in label:
+        return 1.15 # Geostationary Transfer
+    if 'suborbital' in label:
+        return 1.05
+    return 1.08 # Standard LEO
+
+def _ang_dist_deg(p1, p2):
+    """Calculate angular distance between two points in degrees."""
+    lat1, lon1 = math.radians(p1['lat']), math.radians(p1['lon'])
+    lat2, lon2 = math.radians(p2['lat']), math.radians(p2['lon'])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1-a)))
+    return math.degrees(c)
+
+def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
+    """
+    Get trajectory data for the next upcoming launch or a specific launch.
+    If upcoming_launches is a dict, treat it as a single launch object.
+    If upcoming_launches is a list, use the first item (existing behavior).
+    Standalone version of Backend.get_launch_trajectory.
+    """
+    profiler.mark("get_launch_trajectory_data Start")
+    logger.info("get_launch_trajectory_data called")
+    
+    # Handle single launch object (dict) vs list of launches
+    if isinstance(upcoming_launches, dict):
+        # Single launch object
+        display_launches = [upcoming_launches]
+    else:
+        # List of launches (existing behavior)
+        display_launches = upcoming_launches
+        if not display_launches:
+            logger.info("No upcoming launches, trying recent launches")
+            if previous_launches:
+                recent_launches = previous_launches[:5]
+                if recent_launches:
+                    display_launches = [{
+                        'mission': launch.get('mission', 'Unknown'),
+                        'pad': launch.get('pad', 'Cape Canaveral'),
+                        'orbit': launch.get('orbit', 'LEO'),
+                        'net': launch.get('net', ''),
+                        'landing_type': launch.get('landing_type'),
+                        'landing_location': launch.get('landing_location')
+                    } for launch in recent_launches]
+                    logger.info(f"Using {len(display_launches)} recent launches for demo")
+
+    if not display_launches:
+        logger.info("No launches available at all")
+        return None
+
+    next_launch = display_launches[0]
+    mission_name = next_launch.get('mission', 'Unknown')
+    pad = next_launch.get('pad', '')
+    orbit = next_launch.get('orbit', '')
+    logger.info(f"Next launch: {mission_name} from {pad}")
+
+    # Launch site coordinates
+    launch_sites = {
+        'LC-39A': {'lat': 28.6084, 'lon': -80.6043, 'name': 'Cape Canaveral, FL'},
+        'LC-40': {'lat': 28.5619, 'lon': -80.5773, 'name': 'Cape Canaveral, FL'},
+        'SLC-4E': {'lat': 34.6321, 'lon': -120.6107, 'name': 'Vandenberg, CA'},
+        'Starbase': {'lat': 25.9975, 'lon': -97.1566, 'name': 'Starbase, TX'},
+        'Launch Complex 39A': {'lat': 28.6084, 'lon': -80.6043, 'name': 'Cape Canaveral, FL'},
+        'Launch Complex 40': {'lat': 28.5619, 'lon': -80.5773, 'name': 'Cape Canaveral, FL'},
+        'Space Launch Complex 4E': {'lat': 34.6321, 'lon': -120.6107, 'name': 'Vandenberg, CA'}
+    }
+
+    # Find launch site coordinates
+    launch_site = None
+    matched_site_key = None
+    for site_key, site_data in launch_sites.items():
+        if site_key in pad:
+            launch_site = site_data
+            matched_site_key = site_key
+            break
+
+    if not launch_site:
+        launch_site = launch_sites['LC-39A']
+        matched_site_key = 'LC-39A'
+        logger.info(f"Using default launch site: {launch_site}")
+
+    def _normalize_orbit(orbit_label: str, site_name: str) -> str:
+        try:
+            label = (orbit_label or '').lower()
+            if 'gto' in label or 'geostationary' in label:
+                return 'GTO'
+            if 'suborbital' in label:
+                return 'Suborbital'
+            # Explicit Polar/SSO detection
+            if any(k in label for k in ['polar', 'sso', 'sun-synchronous']):
+                return 'LEO-Polar'
+            if 'leo' in label or 'low earth orbit' in label:
+                if 'Vandenberg' in site_name:
+                    return 'LEO-Polar'
+                return 'LEO-Equatorial'
+            return 'Default'
+        except Exception:
+            return 'Default'
+
+    normalized_orbit = _normalize_orbit(orbit, launch_site.get('name', ''))
+
+    # Resolve an inclination assumption
+    def _resolve_inclination_deg(norm_orbit: str, site_name: str, site_lat: float) -> float:
+        try:
+            label = (orbit or '').lower()
+            if 'iss' in label:
+                return 51.6
+            if norm_orbit == 'LEO-Polar' or 'sso' in label or 'sun-synchronous' in label:
+                return 97.5 # Better average for SSO
+            if norm_orbit == 'LEO-Equatorial':
+                base = abs(site_lat)
+                return max(20.0, min(60.0, base + 0.5))
+            if norm_orbit == 'GTO':
+                return max(20.0, min(35.0, abs(site_lat)))
+            if norm_orbit == 'Suborbital':
+                return max(10.0, min(45.0, abs(site_lat)))
+        except Exception:
+            pass
+        return 30.0
+
+    assumed_incl = _resolve_inclination_deg(
+        normalized_orbit,
+        launch_site.get('name', ''),
+        launch_site.get('lat', 0.0)
+    )
+
+    ORBIT_CACHE_VERSION = 'v230-hybrid-ro'
+    landing_type = next_launch.get('landing_type')
+    landing_loc = next_launch.get('landing_location')
+    cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl,1)}:{landing_type}:{landing_loc}"
+    
+    global _TRAJECTORY_DATA_CACHE
+    if _TRAJECTORY_DATA_CACHE is None:
+        logger.info("Loading trajectory cache from disk...")
+        cache_loaded = load_cache_from_file(TRAJECTORY_CACHE_FILE)
+        if cache_loaded and isinstance(cache_loaded.get('data'), dict):
+            _TRAJECTORY_DATA_CACHE = cache_loaded['data']
+        else:
+            # Handle direct dictionary without 'data' wrapper if it exists
+            _TRAJECTORY_DATA_CACHE = cache_loaded if isinstance(cache_loaded, dict) else {}
+
+    if cache_key in _TRAJECTORY_DATA_CACHE:
+        cached = _TRAJECTORY_DATA_CACHE[cache_key]
+        logger.info(f"Trajectory in-memory cache hit for {cache_key}")
+        return {
+            'launch_site': cached.get('launch_site', launch_site),
+            'trajectory': cached.get('trajectory', []),
+            'booster_trajectory': cached.get('booster_trajectory', []),
+            'sep_idx': cached.get('sep_idx'),
+            'orbit_path': cached.get('orbit_path', []),
+            'orbit': orbit or cached.get('orbit', normalized_orbit),
+            'mission': mission_name,
+            'pad': pad,
+            'landing_type': landing_type,
+            'landing_location': cached.get('landing_location', next_launch.get('landing_location'))
+        }
+
+    traj_cache = _TRAJECTORY_DATA_CACHE
+    logger.info(f"Trajectory cache miss for {cache_key}; generating new trajectory")
+
+    def get_radius(progress, target_radius, offset=0.0):
+        """Calculate visual radius with a smooth quadratic ease-out to avoid janky dips."""
+        TRAJ_START_RADIUS = 1.012 
+        # Use quadratic ease-out: 2t - t^2. This ensures vertical velocity is zero at the end.
+        climb_progress = 2 * progress - progress**2
+        radius = TRAJ_START_RADIUS + (target_radius - TRAJ_START_RADIUS) * climb_progress + offset
+        return radius
+
+    def generate_curved_trajectory(start_point, end_point, num_points, orbit_type='default', end_bearing_deg=None):
+        points = []
+        start_lat = start_point['lat']
+        start_lon = start_point['lon']
+        end_lat = end_point['lat']
+        end_lon = end_point['lon']
+
+        if end_bearing_deg is not None:
+            lat1 = math.radians(start_lat); lon1 = math.radians(start_lon)
+            lat2 = math.radians(end_lat);   lon2 = math.radians(end_lon)
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1-a)))
+            ang_deg = math.degrees(c)
+            # Tighter control point distance (L) to avoid "flat" segments near insertion
+            L = min(15.0, max(3.0, ang_deg / 4.0))
+            br = math.radians(end_bearing_deg)
+            cos_lat = max(1e-6, math.cos(math.radians(end_lat)))
+            dlat_deg = L * math.cos(br)
+            dlon_deg = (L * math.sin(br)) / cos_lat
+            control_lat = end_lat - dlat_deg
+            control_lon = (end_lon - dlon_deg + 180.0) % 360.0 - 180.0
+        else:
+            mid_lat = (start_lat + end_lat) / 2
+            mid_lon = (start_lon + end_lon) / 2
+            dist = _ang_dist_deg(start_point, end_point)
+            
+            # Scale control point offset based on distance
+            offset = max(5, min(30, dist * 0.4))
+            
+            if orbit_type == 'polar':
+                control_lat = max(-85.0, mid_lat - offset)
+                control_lon = mid_lon - offset/2
+            elif orbit_type == 'equatorial':
+                # Aim more towards equator
+                target_equator_lat = 0
+                control_lat = (mid_lat + target_equator_lat) / 2
+                control_lon = mid_lon + offset
+            elif orbit_type == 'gto':
+                control_lat = mid_lat + offset
+                control_lon = mid_lon + offset * 2
+            elif orbit_type == 'suborbital':
+                # Suborbital/Booster return needs a tighter arc
+                control_lat = mid_lat + offset/4
+                control_lon = mid_lon + offset/4
+            else:
+                control_lat = mid_lat + offset
+                control_lon = mid_lon + offset * 1.5
+
+        for i in range(num_points + 1):
+            t = i / num_points
+            lat = (1-t)**2 * start_lat + 2*(1-t)*t * control_lat + t**2 * end_lat
+            lon = (1-t)**2 * start_lon + 2*(1-t)*t * control_lon + t**2 * end_lon
+            lon = (lon + 180) % 360 - 180
+            points.append({'lat': lat, 'lon': lon})
+        return points
+
+    def generate_spherical_path(start_point, inclination_deg, num_points=2000, descending=False):
+        """Generate a full Great Circle path passing through start_point with given inclination."""
+        lat0 = float(start_point['lat']); lon0 = float(start_point['lon'])
+        # Handle nearly-polar or nearly-equatorial cases with small epsilon
+        eff_i_deg = max(0.1, min(179.9, abs(inclination_deg)))
+        i_rad = math.radians(eff_i_deg)
+        lat0_rad = math.radians(lat0); lon0_rad = math.radians(lon0)
+        
+        # Position vector
+        x0 = math.cos(lat0_rad) * math.cos(lon0_rad)
+        y0 = math.cos(lat0_rad) * math.sin(lon0_rad)
+        z0 = math.sin(lat0_rad)
+        
+        sin_i = math.sin(i_rad)
+        # Argument of latitude u0 at start_point
+        u0 = math.asin(max(-1.0, min(1.0, z0 / (sin_i or 1e-6))))
+        
+        # If we want to be on the descending part of the orbit (going South)
+        if descending:
+            u0 = math.pi - u0
+            
+        # Longitude of Ascending Node (Omega)
+        Omega = math.atan2(y0, x0) - math.atan2(math.sin(u0) * math.cos(i_rad), math.cos(u0))
+        
+        cosO = math.cos(Omega); sinO = math.sin(Omega)
+        cosi = math.cos(i_rad); sili = math.sin(i_rad)
+        
+        points = []
+        for k in range(num_points):
+            u = u0 + (2.0 * math.pi * k) / num_points
+            cu = math.cos(u); su = math.sin(u)
+            # Transform from orbital frame to ECEF-like lat/lon
+            x = cosO * cu - sinO * (su * cosi)
+            y = sinO * cu + cosO * (su * cosi)
+            z = su * sili
+            points.append({
+                'lat': math.degrees(math.atan2(z, max(1e-12, math.hypot(x, y)))), 
+                'lon': (math.degrees(math.atan2(y, x)) + 180) % 360 - 180
+            })
+        return points
+
+    # Main generation
+    target_r = compute_orbit_radius(orbit)
+    
+    # Heuristic for launch direction: VAFB launches are usually descending (Southward)
+    is_desc = False
+    if 'Vandenberg' in launch_site.get('name', '') or 'SLC-4E' in pad:
+        is_desc = True
+    
+    # Generate the Master Path (The Orbit)
+    # We use 2000 points for a smooth full circle
+    master_path = generate_spherical_path(launch_site, assumed_incl, num_points=2000, descending=is_desc)
+    
+    # The ascent trajectory is a segment of the SAME Master Path
+    # LEO ascent usually takes ~10% of an orbit. Let's use 12.5% for visual length.
+    traj_len = int(len(master_path) * 0.125)
+    trajectory = [p.copy() for p in master_path[:traj_len]]
+    
+    # The orbit path is the REMAINING part of the Master Path to avoid overlap and "double touching"
+    if normalized_orbit != 'Suborbital':
+        # Starts at the insertion point (traj_len-1) and goes around to the end of the master path circle.
+        # This prevents the orbit line from being drawn over the ascent segment.
+        orbit_path = [p.copy() for p in master_path[traj_len-1:]]
+    else:
+        orbit_path = []
+
+    # Set radii for the orbit path
+    for p in orbit_path:
+        p['r'] = target_r
+
+    # Add radii to main trajectory
+    for i, p in enumerate(trajectory):
+        progress = i / (len(trajectory) - 1)
+        p['r'] = get_radius(progress, target_r)
+
+    # Booster Return Trajectory (RTLS vs ASDS vs Expendable simulation)
+    booster_trajectory = []
+    sep_idx = None
+    if trajectory and len(trajectory) > 5:
+        try:
+            # Separation usually around 1/5th of the way to orbit
+            sep_idx = max(2, len(trajectory) // 5)
+            # Create booster ascent with a tiny radius offset to ensure it's visible outside main trajectory
+            ascent_part = []
+            for i, p in enumerate(trajectory[:sep_idx+1]):
+                bp = p.copy()
+                # Apply a subtle 0.001 offset (approx 6km) to keep booster visible
+                bp['r'] = (bp.get('r') or 1.012) + 0.001
+                ascent_part.append(bp)
+                
+            sep_point = ascent_part[-1]
+            sep_radius = sep_point['r']
+
+            l_type = (landing_type or '').upper()
+            l_loc = (next_launch.get('landing_location') or '').upper()
+            combined_landing_info = f"{l_type} {l_loc}"
+            
+            # Expanded detection for ASDS and RTLS
+            asds_keywords = ['ASDS', 'DRONE', 'SHIP', 'OCISLY', 'JRTI', 'ASOG', 'GRAVITAS', 'INSTRUCTIONS', 'STILL LOVE YOU']
+            rtls_keywords = ['RTLS', 'LAUNCH SITE', 'CATCH', 'TOWER', 'LZ', 'LANDING ZONE']
+            
+            if any(k in combined_landing_info for k in asds_keywords):
+                # Droneship landing: continues downrange to a point further along the trajectory
+                landing_idx = min(len(trajectory) - 1, max(sep_idx + 3, len(trajectory) // 3))
+                landing_point = trajectory[landing_idx]
+                return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
+                
+                # Add radius to return part (ballistic arc)
+                for i, p in enumerate(return_part):
+                    prog = i / (len(return_part) - 1)
+                    # Parabolic arc from sep_radius to 1.01, peaking at sep_radius + 0.02
+                    p['r'] = sep_radius + (1.012 - sep_radius) * prog + 0.02 * math.sin(prog * math.pi)
+                
+                booster_trajectory = return_part
+                sep_idx = 0
+                logger.info(f"Generated ASDS booster trajectory (info: {combined_landing_info})")
+            elif any(k in combined_landing_info for k in rtls_keywords):
+                # RTLS/Catch: returns to launch site
+                return_part = generate_curved_trajectory(sep_point, launch_site, 100, orbit_type='suborbital')
+                for i, p in enumerate(return_part):
+                    prog = i / (len(return_part) - 1)
+                    # Higher arc for RTLS boostback (~300km peak)
+                    p['r'] = sep_radius + (1.012 - sep_radius) * prog + 0.03 * math.sin(prog * math.pi)
+                
+                booster_trajectory = return_part
+                sep_idx = 0
+                logger.info(f"Generated RTLS/Catch booster trajectory (info: {combined_landing_info})")
+            elif any(k in combined_landing_info for k in ['OCEAN', 'SPLASHDOWN']):
+                landing_idx = min(len(trajectory) - 1, max(sep_idx + 2, len(trajectory) // 4))
+                landing_point = trajectory[landing_idx]
+                return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
+                for i, p in enumerate(return_part):
+                    prog = i / (len(return_part) - 1)
+                    p['r'] = sep_radius + (1.012 - sep_radius) * prog + 0.015 * math.sin(prog * math.pi)
+                booster_trajectory = return_part
+                sep_idx = 0
+                logger.info(f"Generated Ocean splashdown booster trajectory (type: {landing_type})")
+            else:
+                # Expendable/Unknown: no return trajectory to show
+                booster_trajectory = []
+                sep_idx = None
+                logger.info(f"Skipping booster trajectory for unknown/expendable type: {landing_type}")
+        except Exception as e:
+            logger.warning(f"Booster trajectory generation failed: {e}")
+
+    result = {
+        'launch_site': launch_site,
+        'trajectory': trajectory,
+        'booster_trajectory': booster_trajectory,
+        'sep_idx': sep_idx,
+        'orbit_path': orbit_path,
+        'orbit': orbit,
+        'mission': mission_name,
+        'pad': pad,
+        'landing_type': landing_type,
+        'landing_location': next_launch.get('landing_location')
+    }
+
+    # Persist to cache
+    try:
+        traj_cache[cache_key] = {
+            'launch_site': launch_site,
+            'trajectory': trajectory,
+            'booster_trajectory': booster_trajectory,
+            'sep_idx': sep_idx,
+            'orbit_path': orbit_path,
+            'orbit': normalized_orbit,
+            'inclination_deg': assumed_incl,
+            'landing_type': landing_type,
+            'landing_location': next_launch.get('landing_location'),
+            'model': 'v11-non-overlapping-orbit'
+        }
+        save_cache_to_file(TRAJECTORY_CACHE_FILE, traj_cache, datetime.now(pytz.utc))
+    except Exception as e:
+        logger.warning(f"Failed to save trajectory cache: {e}")
+
+    return result
 
 _local_seeding_status = {"is_running": False, "last_status": "Idle", "total_pulled": 0, "oldest_launch": None}
 _stop_seeding_requested = False
@@ -926,10 +1380,24 @@ def refresh_launches_internal():
 
     try:
         data = fetch_launches(existing_previous=existing_previous, existing_upcoming=existing_upcoming)
+        
+        # Add trajectory data to the first upcoming launch
+        upcoming = data.get("upcoming", [])
+        previous = data.get("previous", [])
+        if upcoming:
+            traj = get_launch_trajectory_data(upcoming[0], previous)
+            if traj:
+                upcoming[0]['trajectory_data'] = traj
+        elif previous:
+            # Fallback to most recent previous launch if no upcoming
+            traj = get_launch_trajectory_data(previous[0], previous)
+            if traj:
+                previous[0]['trajectory_data'] = traj
+
         last_updated = datetime.now(timezone.utc).isoformat()
         result = {
-            "upcoming": data.get("upcoming", []),
-            "previous": data.get("previous", []),
+            "upcoming": upcoming,
+            "previous": previous,
             "last_updated": last_updated
         }
         set_cached_data(cache_key, result)

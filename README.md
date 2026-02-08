@@ -47,6 +47,10 @@ Returns exhaustive structured data for both upcoming and previous SpaceX launche
 *   **Fields (Launch Object - Top Level):**
     *   `id`: (string) Unique UUID for the launch.
     *   `name`: (string) Full name of the mission.
+    *   `trajectory_data`: (object, optional) Orbital trajectory data (usually present for the next upcoming launch).
+        *   `trajectory`: (array) List of `{lat, lon, r}` points for ascent.
+        *   `orbit_path`: (array) List of `{lat, lon, r}` points for the full orbit.
+        *   `booster_trajectory`: (array) Points for the booster return path.
     *   `all_data`: (object) Complete recursive map of ALL fields returned by the source API.
     *   *(See /launches_slim for other convenience fields)*
 *   **Caching:** 10 minutes.
