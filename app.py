@@ -1249,6 +1249,47 @@ def parse_metar(raw_metar: str):
         'raw': raw_metar
     }
 
+def fetch_open_meteo_wind(location: str):
+    """Fetch current wind data from Open-Meteo API for Vandy and Cape."""
+    increment_metric("api_calls")
+    coords = {
+        'Starbase': (25.997, -97.156),
+        'Vandy': (34.742, -120.572),
+        'Cape': (28.483, -80.577),
+        'Hawthorne': (33.921, -118.330)
+    }
+    lat, lon = coords.get(location, (25.997, -97.156))
+    # Request current conditions plus hourly data
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=windspeed_10m,winddirection_10m,windgusts_10m&timezone=auto"
+    
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        current = data.get('current', {})
+        wind_speed_kmh = current.get('windspeed_10m')  # km/h
+        wind_gust_kmh = current.get('windgusts_10m')   # km/h
+        wind_direction = current.get('winddirection_10m')  # degrees
+        timestamp = current.get('time')
+        
+        result = {}
+        if wind_speed_kmh is not None:
+            # Convert km/h to knots (1 km/h = 0.539957 knots)
+            result['speed_kts'] = round(wind_speed_kmh * 0.539957, 1)
+        if wind_gust_kmh is not None:
+            result['gust_kts'] = round(wind_gust_kmh * 0.539957, 1)
+        if wind_direction is not None:
+            result['direction'] = int(wind_direction)
+        
+        result['timestamp'] = timestamp
+        result['source'] = 'Open-Meteo Real-time'
+        
+        return result
+    except Exception as e:
+        print(f"Error fetching Open-Meteo wind for {location}: {e}")
+        return {}
+
 def fetch_forecast(location: str):
     """Fetch 7-day forecast (daily + hourly) from Open-Meteo."""
     increment_metric("api_calls")
@@ -1280,31 +1321,39 @@ def fetch_weather(location: str):
     }
     station_id = metar_stations.get(location, 'KBRO')
     
-    # Try to fetch live wind from NWS API for higher frequency (often includes SPECI or more frequent updates)
+    # Determine which wind data source to use
+    use_open_meteo_wind = location in ['Vandy', 'Cape']
+    
+    # Try to fetch live wind data
     live_wind = {}
-    try:
-        # User-Agent is required for NWS API
-        nws_headers = {'User-Agent': '(my-launch-app, contact@example.com)'}
-        nws_url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
-        nws_res = requests.get(nws_url, headers=nws_headers, timeout=5)
-        if nws_res.status_code == 200:
-            nws_data = nws_res.json().get('properties', {})
-            wind_speed = nws_data.get('windSpeed', {}).get('value') # km/h
-            wind_gust = nws_data.get('windGust', {}).get('value')   # km/h
-            wind_dir = nws_data.get('windDirection', {}).get('value') # degrees
-            
-            if wind_speed is not None:
-                # NWS API returns speed in km/h (wmoUnit:km_h-1)
-                live_wind['speed_kts'] = round(wind_speed * 0.539957, 1)
-            if wind_gust is not None:
-                live_wind['gust_kts'] = round(wind_gust * 0.539957, 1)
-            if wind_dir is not None:
-                live_wind['direction'] = int(wind_dir)
-            
-            live_wind['timestamp'] = nws_data.get('timestamp')
-            live_wind['source'] = 'NWS Real-time'
-    except Exception as e:
-        print(f"Error fetching NWS live wind for {location}: {e}")
+    if use_open_meteo_wind:
+        # For Vandy and Cape, use Open-Meteo for wind data (same source as long-term forecasting)
+        live_wind = fetch_open_meteo_wind(location)
+    else:
+        # For other locations, use NWS API for higher frequency updates
+        try:
+            # User-Agent is required for NWS API
+            nws_headers = {'User-Agent': '(my-launch-app, contact@example.com)'}
+            nws_url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
+            nws_res = requests.get(nws_url, headers=nws_headers, timeout=5)
+            if nws_res.status_code == 200:
+                nws_data = nws_res.json().get('properties', {})
+                wind_speed = nws_data.get('windSpeed', {}).get('value') # km/h
+                wind_gust = nws_data.get('windGust', {}).get('value')   # km/h
+                wind_dir = nws_data.get('windDirection', {}).get('value') # degrees
+                
+                if wind_speed is not None:
+                    # NWS API returns speed in km/h (wmoUnit:km_h-1)
+                    live_wind['speed_kts'] = round(wind_speed * 0.539957, 1)
+                if wind_gust is not None:
+                    live_wind['gust_kts'] = round(wind_gust * 0.539957, 1)
+                if wind_dir is not None:
+                    live_wind['direction'] = int(wind_dir)
+                
+                live_wind['timestamp'] = nws_data.get('timestamp')
+                live_wind['source'] = 'NWS Real-time'
+        except Exception as e:
+            print(f"Error fetching NWS live wind for {location}: {e}")
 
     url = f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=raw"
     try:
@@ -1315,8 +1364,22 @@ def fetch_weather(location: str):
             raise ValueError("Empty METAR response")
         
         parsed = parse_metar(raw_metar)
-        if live_wind:
+        
+        # For Vandy and Cape, override wind data from METAR with Open-Meteo data
+        if use_open_meteo_wind and live_wind:
+            # Update the main wind fields with Open-Meteo data
+            if 'speed_kts' in live_wind:
+                parsed['wind_speed_kts'] = int(live_wind['speed_kts'])
+            if 'gust_kts' in live_wind:
+                parsed['wind_gust_kts'] = int(live_wind['gust_kts'])
+            if 'direction' in live_wind:
+                parsed['wind_direction'] = live_wind['direction']
+            # Also add as live_wind for UI display
             parsed['live_wind'] = live_wind
+        elif live_wind:
+            # For other locations, add NWS live wind as supplementary data
+            parsed['live_wind'] = live_wind
+            
         return parsed
     except Exception as e:
         print(f"Error fetching weather for {location}: {e}")
