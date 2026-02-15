@@ -1293,16 +1293,18 @@ def parse_metar(raw_metar: str):
         'raw': raw_metar
     }
 
-def fetch_forecast(location: str):
+def fetch_forecast(location: str = None, lat: float = None, lon: float = None):
     """Fetch 7-day forecast (daily + hourly) from Open-Meteo."""
     increment_metric("api_calls")
-    coords = {
-        'Starbase': (25.997, -97.156),
-        'Vandy': (34.742, -120.572),
-        'Cape': (28.483, -80.577),
-        'Hawthorne': (33.921, -118.330)
-    }
-    lat, lon = coords.get(location, (25.997, -97.156))
+    if lat is None or lon is None:
+        coords = {
+            'Starbase': (25.997, -97.156),
+            'Vandy': (34.742, -120.572),
+            'Cape': (28.483, -80.577),
+            'Hawthorne': (33.921, -118.330)
+        }
+        lat, lon = coords.get(location, (25.997, -97.156))
+    
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m,windspeed_10m,winddirection_10m&timezone=auto"
     
     try:
@@ -1310,19 +1312,45 @@ def fetch_forecast(location: str):
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        print(f"Error fetching forecast for {location}: {e}")
+        print(f"Error fetching forecast for {location or (lat, lon)}: {e}")
         return None
 
-def fetch_weather(location: str):
-    """Fetch METAR weather data for a given location."""
+def fetch_weather(location: str = None, station_id: str = None, lat: float = None, lon: float = None):
+    """Fetch METAR weather data for a given location, station ID, or coordinates."""
     increment_metric("api_calls")
-    metar_stations = {
-        'Starbase': 'KBRO',
-        'Vandy': 'KVBG',
-        'Cape': 'KMLB',
-        'Hawthorne': 'KHHR'
-    }
-    station_id = metar_stations.get(location, 'KBRO')
+    
+    # If coordinates are provided but no station_id, try to find the nearest station
+    if not station_id and lat is not None and lon is not None:
+        try:
+            # Search within 50nm
+            search_url = f"https://aviationweather.gov/api/data/metar?radialDistance={lat},{lon};50&format=raw"
+            res = requests.get(search_url, timeout=5)
+            if res.status_code == 200 and res.text.strip():
+                # Take the first METAR and extract the station ID (first word)
+                first_metar = res.text.strip().split('\n')[0]
+                station_id = first_metar.split(' ')[0]
+                print(f"Found nearest station {station_id} for {lat}, {lon}")
+        except Exception as e:
+            print(f"Error finding nearest station for {lat}, {lon}: {e}")
+
+    if not station_id:
+        metar_stations = {
+            'Starbase': 'KBRO',
+            'Vandy': 'KVBG',
+            'Cape': 'KMLB',
+            'Hawthorne': 'KHHR'
+        }
+        if location:
+            station_id = metar_stations.get(location, 'KBRO')
+        elif not lat or not lon: # Only fallback to KBRO if no coordinates provided either
+            station_id = 'KBRO'
+    
+    if not station_id:
+        return {
+            'error': 'No weather station found for the provided location',
+            'temperature_c': 25, 'temperature_f': 77,
+            'wind_speed_kts': 0, 'flight_category': 'VFR'
+        }
     
     # Try to fetch live wind from NWS API for higher frequency (often includes SPECI or more frequent updates)
     live_wind = {}
@@ -1348,7 +1376,7 @@ def fetch_weather(location: str):
             live_wind['timestamp'] = nws_data.get('timestamp')
             live_wind['source'] = 'NWS Real-time'
     except Exception as e:
-        print(f"Error fetching NWS live wind for {location}: {e}")
+        print(f"Error fetching NWS live wind for {station_id}: {e}")
 
     url = f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=raw"
     try:
@@ -1363,7 +1391,7 @@ def fetch_weather(location: str):
             parsed['live_wind'] = live_wind
         return parsed
     except Exception as e:
-        print(f"Error fetching weather for {location}: {e}")
+        print(f"Error fetching weather for {station_id}: {e}")
         return {
             'temperature_c': 25, 'temperature_f': 77,
             'dewpoint_c': 15, 'dewpoint_f': 59,
@@ -1585,6 +1613,25 @@ def get_weather(location: str, force: bool = False, internal: bool = False):
     else:
         increment_metric("cache_misses")
     return res
+
+@app.get("/user_weather")
+def get_user_weather(lat: float, lon: float, station_id: str = None, internal: bool = False):
+    """Retrieve weather (METAR + forecast) for a user-specified location."""
+    if not internal:
+        increment_metric("total_requests")
+    
+    # Always a cache miss as we don't cache user-specific locations by default
+    increment_metric("cache_misses")
+    
+    # Fetch METAR
+    weather_data = fetch_weather(station_id=station_id, lat=lat, lon=lon)
+    
+    # Fetch forecast
+    forecast = fetch_forecast(lat=lat, lon=lon)
+    weather_data['forecast'] = forecast
+    weather_data['last_updated'] = datetime.now(timezone.utc).isoformat()
+    
+    return weather_data
 
 @app.get("/weather_all")
 def get_all_weather(force: bool = False, internal: bool = False):

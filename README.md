@@ -47,10 +47,17 @@ Returns exhaustive structured data for both upcoming and previous SpaceX launche
 *   **Fields (Launch Object - Top Level):**
     *   `id`: (string) Unique UUID for the launch.
     *   `name`: (string) Full name of the mission.
-    *   `trajectory_data`: (object, optional) Orbital trajectory data (usually present for the next upcoming launch).
-        *   `trajectory`: (array) List of `{lat, lon, r}` points for ascent.
+    *   `trajectory_data`: (object, optional) High-fidelity orbital trajectory data (usually present for the next upcoming launch). Accounts for Earth's rotation and realistic ascent profiles.
+        *   `trajectory`: (array) List of `{lat, lon, r}` points for ascent (starts at surface, radius 1.0).
         *   `orbit_path`: (array) List of `{lat, lon, r}` points for the full orbit.
-        *   `booster_trajectory`: (array) Points for the booster return path.
+        *   `booster_trajectory`: (array) Points for the booster return path (ASDS or RTLS).
+        *   `sep_idx`: (int) Index in `trajectory` where stage separation occurs (usually ~80km downrange).
+        *   `launch_site`: (object) Coordinates and name of the launch site.
+        *   `landing_location`: (string) Name of the landing zone or droneship.
+        *   `landing_type`: (string) Type of landing (ASDS, RTLS, Ocean, etc.).
+        *   `orbit`: (string) Normalized orbit type (LEO-Equatorial, LEO-Polar, GTO, etc.).
+        *   `mission`: (string) Mission name.
+        *   `pad`: (string) Full name of the launch pad.
     *   `all_data`: (object) Complete recursive map of ALL fields returned by the source API.
     *   *(See /launches_slim for other convenience fields)*
 *   **Caching:** 10 minutes.
@@ -147,7 +154,19 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
 ```
 *   **Caching:** 5 minutes.
 
-### 4. Get API Metrics
+### 6. Get User-Specific Weather Data
+Returns METAR and 7-day forecast data for any user-provided location.
+
+*   **Endpoint:** `GET /user_weather`
+*   **Parameters:**
+    *   `lat`: (float, required) Latitude of the location.
+    *   `lon`: (float, required) Longitude of the location.
+    *   `station_id`: (string, optional) ICAO METAR station ID (e.g., "KBRO").
+*   **Response Format:** JSON
+*   **Fields:** Combined METAR (if `station_id` provided) and Forecast data.
+*   **Caching:** None. Always fetches fresh data.
+
+### 7. Get API Metrics
 Provides real-time and historical performance data, including request counts, cache efficiency, and interactive history.
 
 *   **Endpoint:** `GET /metrics`
@@ -185,7 +204,7 @@ Provides real-time and historical performance data, including request counts, ca
 }
 ```
 
-### 5. Force Cache Refresh
+### 8. Force Cache Refresh
 Manually triggers the API to poll for new launches and generate new narratives using Grok.
 
 *   **Endpoint:** `POST /refresh`
@@ -204,7 +223,7 @@ Manually triggers the API to poll for new launches and generate new narratives u
 ```
 *   **Behavior:** Incremental. It only generates narratives for launches not already in the cache.
 
-### 6. Utility Endpoints
+### 9. Utility Endpoints
 *   **Get Single Launch Details:** `GET /launch_details/{launch_id}`
     *   Returns full raw API response for a specific launch from the LL API.
     *   **Sample Response:** (Large JSON object containing technical mission/rocket/pad details)
