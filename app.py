@@ -177,6 +177,66 @@ def _ang_dist_deg(p1, p2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1-a)))
     return math.degrees(c)
 
+def get_destination_point(lat, lon, distance_km, bearing_deg):
+    """Calculate destination point given start point, distance, and bearing."""
+    R = 6371.0
+    brng = math.radians(bearing_deg)
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+    lat2 = math.asin(math.sin(lat1) * math.cos(distance_km/R) +
+                     math.cos(lat1) * math.sin(distance_km/R) * math.cos(brng))
+    lon2 = lon1 + math.atan2(math.sin(brng) * math.sin(distance_km/R) * math.cos(lat1),
+                             math.cos(distance_km/R) - math.sin(lat1) * math.sin(lat2))
+    return {'lat': math.degrees(lat2), 'lon': (math.degrees(lon2) + 180) % 360 - 180}
+
+def generate_ground_track(start_point, inclination_deg, num_points=2000, descending=False, duration_min=90):
+    """Generate a ground track accounting for Earth's rotation."""
+    lat0 = float(start_point['lat']); lon0 = float(start_point['lon'])
+    eff_i_deg = max(0.1, min(179.9, abs(inclination_deg)))
+    i_rad = math.radians(eff_i_deg)
+    lat0_rad = math.radians(lat0); lon0_rad = math.radians(lon0)
+    
+    x0 = math.cos(lat0_rad) * math.cos(lon0_rad)
+    y0 = math.cos(lat0_rad) * math.sin(lon0_rad)
+    z0 = math.sin(lat0_rad)
+    
+    sin_i = math.sin(i_rad)
+    u0 = math.asin(max(-1.0, min(1.0, z0 / (sin_i or 1e-6))))
+    if descending:
+        u0 = math.pi - u0
+        
+    Omega = math.atan2(y0, x0) - math.atan2(math.sin(u0) * math.cos(i_rad), math.cos(u0))
+    
+    cosO = math.cos(Omega); sinO = math.sin(Omega)
+    cosi = math.cos(i_rad); sili = math.sin(i_rad)
+    
+    points = []
+    omega_e = 2 * math.pi / 86400.0 
+    period_sec = duration_min * 60
+    
+    for k in range(num_points):
+        t_frac = k / (num_points - 1)
+        t_sec = t_frac * period_sec
+        u = u0 + (2.0 * math.pi * t_frac)
+        
+        cu = math.cos(u); su = math.sin(u)
+        xo = cu
+        yo = su * cosi
+        zo = su * sili
+        
+        x_i = cosO * xo - sinO * yo
+        y_i = sinO * xo + cosO * yo
+        z_i = zo
+        
+        lon_i = math.atan2(y_i, x_i)
+        lon_fixed = lon_i - omega_e * t_sec
+        
+        lat = math.degrees(math.atan2(z_i, math.hypot(x_i, y_i)))
+        lon = (math.degrees(lon_fixed) + 180) % 360 - 180
+        
+        points.append({'lat': lat, 'lon': lon})
+    return points
+
 def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     """
     Get trajectory data for the next upcoming launch or a specific launch.
@@ -289,7 +349,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         launch_site.get('lat', 0.0)
     )
 
-    ORBIT_CACHE_VERSION = 'v230-hybrid-ro'
+    ORBIT_CACHE_VERSION = 'v240-accurate-groundtrack'
     landing_type = next_launch.get('landing_type')
     landing_loc = next_launch.get('landing_location')
     cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl,1)}:{landing_type}:{landing_loc}"
@@ -323,13 +383,6 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     traj_cache = _TRAJECTORY_DATA_CACHE
     logger.info(f"Trajectory cache miss for {cache_key}; generating new trajectory")
 
-    def get_radius(progress, target_radius, offset=0.0):
-        """Calculate visual radius with a smooth quadratic ease-out to avoid janky dips."""
-        TRAJ_START_RADIUS = 1.012 
-        # Use quadratic ease-out: 2t - t^2. This ensures vertical velocity is zero at the end.
-        climb_progress = 2 * progress - progress**2
-        radius = TRAJ_START_RADIUS + (target_radius - TRAJ_START_RADIUS) * climb_progress + offset
-        return radius
 
     def generate_curved_trajectory(start_point, end_point, num_points, orbit_type='default', end_bearing_deg=None):
         points = []
@@ -389,46 +442,6 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             points.append({'lat': lat, 'lon': lon})
         return points
 
-    def generate_spherical_path(start_point, inclination_deg, num_points=2000, descending=False):
-        """Generate a full Great Circle path passing through start_point with given inclination."""
-        lat0 = float(start_point['lat']); lon0 = float(start_point['lon'])
-        # Handle nearly-polar or nearly-equatorial cases with small epsilon
-        eff_i_deg = max(0.1, min(179.9, abs(inclination_deg)))
-        i_rad = math.radians(eff_i_deg)
-        lat0_rad = math.radians(lat0); lon0_rad = math.radians(lon0)
-        
-        # Position vector
-        x0 = math.cos(lat0_rad) * math.cos(lon0_rad)
-        y0 = math.cos(lat0_rad) * math.sin(lon0_rad)
-        z0 = math.sin(lat0_rad)
-        
-        sin_i = math.sin(i_rad)
-        # Argument of latitude u0 at start_point
-        u0 = math.asin(max(-1.0, min(1.0, z0 / (sin_i or 1e-6))))
-        
-        # If we want to be on the descending part of the orbit (going South)
-        if descending:
-            u0 = math.pi - u0
-            
-        # Longitude of Ascending Node (Omega)
-        Omega = math.atan2(y0, x0) - math.atan2(math.sin(u0) * math.cos(i_rad), math.cos(u0))
-        
-        cosO = math.cos(Omega); sinO = math.sin(Omega)
-        cosi = math.cos(i_rad); sili = math.sin(i_rad)
-        
-        points = []
-        for k in range(num_points):
-            u = u0 + (2.0 * math.pi * k) / num_points
-            cu = math.cos(u); su = math.sin(u)
-            # Transform from orbital frame to ECEF-like lat/lon
-            x = cosO * cu - sinO * (su * cosi)
-            y = sinO * cu + cosO * (su * cosi)
-            z = su * sili
-            points.append({
-                'lat': math.degrees(math.atan2(z, max(1e-12, math.hypot(x, y)))), 
-                'lon': (math.degrees(math.atan2(y, x)) + 180) % 360 - 180
-            })
-        return points
 
     # Main generation
     target_r = compute_orbit_radius(orbit)
@@ -438,19 +451,17 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     if 'Vandenberg' in launch_site.get('name', '') or 'SLC-4E' in pad:
         is_desc = True
     
-    # Generate the Master Path (The Orbit)
-    # We use 2000 points for a smooth full circle
-    master_path = generate_spherical_path(launch_site, assumed_incl, num_points=2000, descending=is_desc)
+    # Generate the Master Path (The Orbit Ground Track)
+    # Accounting for Earth's rotation makes the orbit path more realistic.
+    master_path = generate_ground_track(launch_site, assumed_incl, num_points=2000, descending=is_desc, duration_min=90)
     
     # The ascent trajectory is a segment of the SAME Master Path
-    # LEO ascent usually takes ~10% of an orbit. Let's use 12.5% for visual length.
-    traj_len = int(len(master_path) * 0.125)
+    # LEO insertion usually happens ~2000-3000km downrange (~6-8% of ground track)
+    traj_len = int(len(master_path) * 0.08)
     trajectory = [p.copy() for p in master_path[:traj_len]]
     
-    # The orbit path is the REMAINING part of the Master Path to avoid overlap and "double touching"
+    # The orbit path is the REMAINING part of the Master Path to avoid overlap
     if normalized_orbit != 'Suborbital':
-        # Starts at the insertion point (traj_len-1) and goes around to the end of the master path circle.
-        # This prevents the orbit line from being drawn over the ascent segment.
         orbit_path = [p.copy() for p in master_path[traj_len-1:]]
     else:
         orbit_path = []
@@ -459,27 +470,22 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     for p in orbit_path:
         p['r'] = target_r
 
-    # Add radii to main trajectory
+    # Add radii to main trajectory (Ascent profile)
     for i, p in enumerate(trajectory):
         progress = i / (len(trajectory) - 1)
-        p['r'] = get_radius(progress, target_r)
+        # Smoother climb from surface (1.0) to orbit radius
+        # Using 0.5 power for a steeper initial climb (reaching ~70km at MECO)
+        p['r'] = 1.0 + (target_r - 1.0) * (progress ** 0.5)
 
     # Booster Return Trajectory (RTLS vs ASDS vs Expendable simulation)
     booster_trajectory = []
     sep_idx = None
-    if trajectory and len(trajectory) > 5:
+    if trajectory and len(trajectory) > 10:
         try:
-            # Separation usually around 1/5th of the way to orbit
-            sep_idx = max(2, len(trajectory) // 5)
-            # Create booster ascent with a tiny radius offset to ensure it's visible outside main trajectory
-            ascent_part = []
-            for i, p in enumerate(trajectory[:sep_idx+1]):
-                bp = p.copy()
-                # Apply a subtle 0.001 offset (approx 6km) to keep booster visible
-                bp['r'] = (bp.get('r') or 1.012) + 0.001
-                ascent_part.append(bp)
-                
-            sep_point = ascent_part[-1]
+            # MECO is typically ~80km downrange, which is 4 points in a 2000-point 40000km orbit
+            sep_idx = max(4, int(len(master_path) * 0.002))
+            
+            sep_point = trajectory[sep_idx].copy()
             sep_radius = sep_point['r']
 
             l_type = (landing_type or '').upper()
@@ -491,46 +497,51 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             rtls_keywords = ['RTLS', 'LAUNCH SITE', 'CATCH', 'TOWER', 'LZ', 'LANDING ZONE']
             
             if any(k in combined_landing_info for k in asds_keywords):
-                # Droneship landing: continues downrange to a point further along the trajectory
-                landing_idx = min(len(trajectory) - 1, max(sep_idx + 3, len(trajectory) // 3))
-                landing_point = trajectory[landing_idx]
+                # Droneship landing: ~600-700km downrange
+                dist_frac = 0.016 # ~640km
+                if normalized_orbit == 'GTO':
+                    dist_frac = 0.018 # ~720km
+                
+                landing_idx = min(len(master_path) - 1, int(len(master_path) * dist_frac)) 
+                landing_point = master_path[landing_idx]
+                
                 return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
                 
                 # Add radius to return part (ballistic arc)
                 for i, p in enumerate(return_part):
                     prog = i / (len(return_part) - 1)
-                    # Parabolic arc from sep_radius to 1.01, peaking at sep_radius + 0.02
-                    p['r'] = sep_radius + (1.012 - sep_radius) * prog + 0.02 * math.sin(prog * math.pi)
+                    # Parabolic arc peaking at sep_radius + 0.01, then down to surface (1.0)
+                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
                 
                 booster_trajectory = return_part
-                sep_idx = 0
-                logger.info(f"Generated ASDS booster trajectory (info: {combined_landing_info})")
+                sep_idx = 0 # Indicates start of booster_trajectory in visual tools
+                logger.info(f"Generated accurate ASDS booster trajectory (dist: ~650km)")
             elif any(k in combined_landing_info for k in rtls_keywords):
                 # RTLS/Catch: returns to launch site
                 return_part = generate_curved_trajectory(sep_point, launch_site, 100, orbit_type='suborbital')
                 for i, p in enumerate(return_part):
                     prog = i / (len(return_part) - 1)
-                    # Higher arc for RTLS boostback (~300km peak)
-                    p['r'] = sep_radius + (1.012 - sep_radius) * prog + 0.03 * math.sin(prog * math.pi)
+                    # Higher arc for RTLS boostback (~150km peak)
+                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.02 * math.sin(prog * math.pi)
                 
                 booster_trajectory = return_part
                 sep_idx = 0
-                logger.info(f"Generated RTLS/Catch booster trajectory (info: {combined_landing_info})")
+                logger.info(f"Generated accurate RTLS booster trajectory")
             elif any(k in combined_landing_info for k in ['OCEAN', 'SPLASHDOWN']):
-                landing_idx = min(len(trajectory) - 1, max(sep_idx + 2, len(trajectory) // 4))
-                landing_point = trajectory[landing_idx]
+                # Ballistic splashdown further downrange than RTLS but before ASDS
+                landing_idx = min(len(master_path) - 1, int(len(master_path) * 0.01))
+                landing_point = master_path[landing_idx]
                 return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
                 for i, p in enumerate(return_part):
                     prog = i / (len(return_part) - 1)
-                    p['r'] = sep_radius + (1.012 - sep_radius) * prog + 0.015 * math.sin(prog * math.pi)
+                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
                 booster_trajectory = return_part
                 sep_idx = 0
-                logger.info(f"Generated Ocean splashdown booster trajectory (type: {landing_type})")
+                logger.info(f"Generated Ocean splashdown booster trajectory")
             else:
-                # Expendable/Unknown: no return trajectory to show
                 booster_trajectory = []
                 sep_idx = None
-                logger.info(f"Skipping booster trajectory for unknown/expendable type: {landing_type}")
+                logger.info(f"Skipping booster trajectory for unknown/expendable type")
         except Exception as e:
             logger.warning(f"Booster trajectory generation failed: {e}")
 
