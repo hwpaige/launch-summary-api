@@ -688,10 +688,16 @@ def get_metrics(include_history=True, range_type="1h"):
         history = [h for h in history if datetime.fromisoformat(h['timestamp'].replace('Z', '+00:00')) > start_time]
 
     # Calculate range-relative current stats if we have history
+    range_stats = {
+        "total_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "api_calls": 0
+    }
     if history:
         first = history[0]['data']
         last = history[-1]['data']
-        current = {
+        range_stats = {
             "total_requests": last.get('total_requests', 0) - first.get('total_requests', 0),
             "cache_hits": last.get('cache_hits', 0) - first.get('cache_hits', 0),
             "cache_misses": last.get('cache_misses', 0) - first.get('cache_misses', 0),
@@ -722,6 +728,7 @@ def get_metrics(include_history=True, range_type="1h"):
 
     return {
         "current": current, 
+        "range_stats": range_stats,
         "history": history, 
         "hits_per_day": round(hits_per_day, 1)
     }
@@ -1571,11 +1578,13 @@ def get_all_weather(force: bool = False):
 @app.get("/launch_details/{launch_id}")
 def get_launch_details(launch_id: str):
     increment_metric("total_requests")
+    increment_metric("cache_misses") # Detailed fetch is always a direct API call/miss in this impl
     return fetch_launch_details(launch_id)
 
 @app.get("/external_narratives")
 def get_all_narratives():
     increment_metric("total_requests")
+    increment_metric("cache_misses") # This endpoint always fetches from external source
     return {"descriptions": fetch_external_narratives()}
 
 @app.get("/recent_launches_narratives")
@@ -1760,7 +1769,7 @@ def dashboard(request: Request):
         <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
             <div>
                 <h2 class="text-2xl font-bold tracking-tight">System Metrics</h2>
-                <p class="text-slate-400 text-sm">Real-time performance and API usage tracking.</p>
+                <p class="text-slate-400 text-sm">Real-time performance and absolute API usage tracking.</p>
             </div>
             <div class="flex bg-slate-900 border border-slate-800 p-1 rounded-xl">
                 <button onclick="changeRange('1h')" id="range-1h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all range-active">1h</button>
@@ -2256,16 +2265,18 @@ def dashboard(request: Request):
                 const data = await response.json();
                 
                 const current = data.current || {};
+                const rangeStats = data.range_stats || {};
                 const history = data.history || [];
-                
+        
+                // Use live absolute totals for the main metrics
                 const total = current.total_requests || 0;
                 const hits = current.cache_hits || 0;
                 const apiCalls = current.api_calls || 0;
-                
+        
                 document.getElementById('metric-total-requests').textContent = total.toLocaleString();
                 document.getElementById('metric-cache-hits').textContent = hits.toLocaleString();
                 document.getElementById('metric-api-calls').textContent = apiCalls.toLocaleString();
-                
+        
                 const efficiency = total > 0 ? Math.round((hits / total) * 100) : 0;
                 document.getElementById('metric-efficiency').textContent = efficiency + '%';
 
