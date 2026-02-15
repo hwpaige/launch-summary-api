@@ -1469,8 +1469,9 @@ def refresh_weather_internal():
 # --- New Endpoints ---
 
 @app.get("/launches")
-def get_launches(force: bool = False):
-    increment_metric("total_requests")
+def get_launches(force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
     cache_key = "launches_cache_v2"
     if force:
         increment_metric("cache_misses")
@@ -1486,9 +1487,10 @@ def get_launches(force: bool = False):
     return {"upcoming": [], "previous": [], "last_updated": None}
 
 @app.get("/launches_slim")
-def get_launches_slim(force: bool = False):
+def get_launches_slim(force: bool = False, internal: bool = False):
     """Dashboard-optimized endpoint that strips 'all_data'."""
-    increment_metric("total_requests")
+    if not internal:
+        increment_metric("total_requests")
     cache_key = "launches_cache_v2"
     
     data = None
@@ -1516,9 +1518,10 @@ def get_launches_slim(force: bool = False):
     return {"upcoming": [], "previous": [], "last_updated": None}
 
 @app.get("/launch_raw/{launch_id}")
-def get_launch_raw(launch_id: str):
+def get_launch_raw(launch_id: str, internal: bool = False):
     """Fetch the raw 'all_data' for a specific launch from the cache."""
-    increment_metric("total_requests")
+    if not internal:
+        increment_metric("total_requests")
     cache_key = "launches_cache_v2"
     cached = get_cached_data(cache_key)
     if not cached:
@@ -1562,8 +1565,9 @@ def _get_weather_cached(location: str, force: bool = False):
     }, False
 
 @app.get("/weather/{location}")
-def get_weather(location: str, force: bool = False):
-    increment_metric("total_requests")
+def get_weather(location: str, force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
     res, is_hit = _get_weather_cached(location, force)
     if is_hit:
         increment_metric("cache_hits")
@@ -1572,8 +1576,9 @@ def get_weather(location: str, force: bool = False):
     return res
 
 @app.get("/weather_all")
-def get_all_weather(force: bool = False):
-    increment_metric("total_requests")
+def get_all_weather(force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
     if force:
         increment_metric("cache_misses")
         return refresh_weather_internal()
@@ -1602,21 +1607,24 @@ def get_all_weather(force: bool = False):
     }
 
 @app.get("/launch_details/{launch_id}")
-def get_launch_details(launch_id: str):
-    increment_metric("total_requests")
+def get_launch_details(launch_id: str, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
     increment_metric("cache_misses") # Detailed fetch is always a direct API call/miss in this impl
     return fetch_launch_details(launch_id)
 
 @app.get("/external_narratives")
-def get_all_narratives():
-    increment_metric("total_requests")
+def get_all_narratives(internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
     increment_metric("cache_misses") # This endpoint always fetches from external source
     return {"descriptions": fetch_external_narratives()}
 
 @app.get("/recent_launches_narratives")
-def get_narratives(force: bool = False):
+def get_narratives(force: bool = False, internal: bool = False):
     """Serve from cache only (timer-based refresh)."""
-    increment_metric("total_requests")
+    if not internal:
+        increment_metric("total_requests")
     
     if force:
         increment_metric("cache_misses")
@@ -1643,9 +1651,10 @@ def get_narratives(force: bool = False):
     return {"descriptions": [], "last_updated": None}
 
 @app.get("/metrics")
-def get_app_metrics(range: str = "1h"):
+def get_app_metrics(range: str = "1h", internal: bool = False):
     """Endpoint to fetch application metrics."""
-    record_snapshot()
+    if not internal:
+        record_snapshot()
     return get_metrics(range_type=range)
 
 @app.post("/reset_metrics")
@@ -2140,7 +2149,7 @@ def dashboard(request: Request):
             if (!contentEl) return;
             
             try {
-                const response = await fetch('/launch_raw/' + id);
+                const response = await fetch('/launch_raw/' + id + '?internal=true');
                 const rawData = await response.json();
                 
                 if (rawData.error) throw new Error(rawData.error);
@@ -2342,7 +2351,7 @@ def dashboard(request: Request):
 
         async function fetchMetrics() {
             try {
-                const response = await fetch(`/metrics?range=${currentRange}`);
+                const response = await fetch(`/metrics?range=${currentRange}&internal=true`);
                 const data = await response.json();
                 
                 const current = data.current || {};
@@ -2484,7 +2493,7 @@ def dashboard(request: Request):
 
         async function fetchNarratives(force = false) {
             try {
-                const url = force ? '/recent_launches_narratives?force=true' : '/recent_launches_narratives';
+                const url = force ? '/recent_launches_narratives?force=true&internal=true' : '/recent_launches_narratives?internal=true';
                 const response = await fetch(url);
                 const data = await response.json();
                 const list = document.getElementById('narratives-list');
@@ -2527,7 +2536,7 @@ def dashboard(request: Request):
             const upList = document.getElementById('upcoming-launches-list');
             
             try {
-                const url = force ? '/launches_slim?force=true' : '/launches_slim';
+                const url = force ? '/launches_slim?force=true&internal=true' : '/launches_slim?internal=true';
                 const response = await fetch(url);
                 const data = await response.json();
                 
@@ -2818,7 +2827,7 @@ def dashboard(request: Request):
             });
             
             try {
-                const url = force ? `/weather_all?force=true` : `/weather_all`;
+                const url = force ? `/weather_all?force=true&internal=true` : `/weather_all?internal=true`;
                 const response = await fetch(url);
                 const data = await response.json();
                 lastWeatherData = data.weather;
