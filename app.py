@@ -109,6 +109,22 @@ CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
+
+# Reliable weather stations for key launch sites (prioritized)
+METAR_STATIONS = {
+    'Starbase': ['KBRO', 'KHRL', 'KMFE'],
+    'Vandy': ['KVBG', 'KLPC', 'KSMX'],
+    'Cape': ['KXMR', 'KTTS', 'KCOF', 'KMLB'],
+    'Hawthorne': ['KHHR', 'KLAX', 'KSMO']
+}
+
+# Approximate coordinates for fallbacks
+LOCATION_COORDS = {
+    'Starbase': {'lat': 25.997, 'lon': -97.157},
+    'Vandy': {'lat': 34.632, 'lon': -120.611},
+    'Cape': {'lat': 28.562, 'lon': -80.577},
+    'Hawthorne': {'lat': 33.921, 'lon': -118.332}
+}
 HISTORY_LIMIT = 43200 # 30 days at 1 minute intervals
 SEEDING_STATUS_KEY = "seeding_status_v2"
 SEEDING_STOP_SIGNAL_KEY = "seeding_stop_signal_v2"
@@ -1305,7 +1321,7 @@ def fetch_forecast(location: str = None, lat: float = None, lon: float = None):
         }
         lat, lon = coords.get(location, (25.997, -97.156))
     
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m,windspeed_10m,winddirection_10m&timezone=auto"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m,windspeed_10m,winddirection_10m&current_weather=true&timezone=auto"
     
     try:
         response = requests.get(url, timeout=10)
@@ -1315,92 +1331,141 @@ def fetch_forecast(location: str = None, lat: float = None, lon: float = None):
         print(f"Error fetching forecast for {location or (lat, lon)}: {e}")
         return None
 
+def is_nws_fresh(timestamp_str):
+    """Check if NWS timestamp is within the last 3 hours."""
+    if not timestamp_str: return False
+    try:
+        # NWS timestamp is often like 2024-01-01T00:00:00+00:00
+        ts = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        return datetime.now(timezone.utc) - ts < timedelta(hours=3)
+    except Exception:
+        return False
+
 def fetch_weather(location: str = None, station_id: str = None, lat: float = None, lon: float = None):
-    """Fetch METAR weather data for a given location, station ID, or coordinates."""
+    """Fetch METAR weather data with multiple station fallbacks and Open-Meteo backup."""
     increment_metric("api_calls")
     
-    # If coordinates are provided but no station_id, try to find the nearest station
-    if not station_id and lat is not None and lon is not None:
+    stations_to_try = []
+    if station_id:
+        stations_to_try = [station_id]
+    elif location and location in METAR_STATIONS:
+        stations_to_try = METAR_STATIONS[location]
+        if not lat or not lon:
+            coords = LOCATION_COORDS.get(location)
+            if coords:
+                lat, lon = coords['lat'], coords['lon']
+    elif lat is not None and lon is not None:
         try:
             # Search within 50nm
             search_url = f"https://aviationweather.gov/api/data/metar?radialDistance={lat},{lon};50&format=raw"
             res = requests.get(search_url, timeout=5)
             if res.status_code == 200 and res.text.strip():
-                # Take the first METAR and extract the station ID (first word)
+                # Take the first METAR station ID
                 first_metar = res.text.strip().split('\n')[0]
-                station_id = first_metar.split(' ')[0]
-                print(f"Found nearest station {station_id} for {lat}, {lon}")
+                found_sid = first_metar.split(' ')[0]
+                stations_to_try = [found_sid]
+        except Exception:
+            pass
+
+    if not stations_to_try:
+        if location == 'Starbase' or not location:
+            stations_to_try = ['KBRO']
+            if not lat: lat, lon = LOCATION_COORDS['Starbase']['lat'], LOCATION_COORDS['Starbase']['lon']
+        else:
+            # If we have a location but it's not in METAR_STATIONS, we might still have coords
+            if not lat and location in LOCATION_COORDS:
+                lat, lon = LOCATION_COORDS[location]['lat'], LOCATION_COORDS[location]['lon']
+
+    errors = []
+    # Try each station until one succeeds
+    for sid in stations_to_try:
+        try:
+            # 1. Try to fetch live wind/data from NWS API
+            live_data = {}
+            try:
+                nws_headers = {'User-Agent': '(my-launch-app, contact@example.com)'}
+                nws_url = f"https://api.weather.gov/stations/{sid}/observations/latest"
+                nws_res = requests.get(nws_url, headers=nws_headers, timeout=5)
+                if nws_res.status_code == 200:
+                    props = nws_res.json().get('properties', {})
+                    live_data = {
+                        'temp': props.get('temperature', {}).get('value'),
+                        'dew': props.get('dewpoint', {}).get('value'),
+                        'wind_speed': props.get('windSpeed', {}).get('value'),
+                        'wind_gust': props.get('windGust', {}).get('value'),
+                        'wind_dir': props.get('windDirection', {}).get('value'),
+                        'vis': props.get('visibility', {}).get('value'),
+                        'timestamp': props.get('timestamp'),
+                        'source': 'NWS Real-time'
+                    }
+            except Exception as e:
+                print(f"NWS error for {sid}: {e}")
+
+            # 2. Try to fetch METAR from Aviation Weather
+            aw_url = f"https://aviationweather.gov/api/data/metar?ids={sid}&format=raw"
+            aw_res = requests.get(aw_url, timeout=5)
+            raw_metar = aw_res.text.strip() if aw_res.status_code == 200 else ""
+            
+            if raw_metar:
+                parsed = parse_metar(raw_metar)
+                # Merge with NWS data if NWS is fresh
+                if live_data.get('timestamp') and is_nws_fresh(live_data['timestamp']):
+                    if live_data['temp'] is not None:
+                        parsed['temperature_c'] = live_data['temp']
+                        parsed['temperature_f'] = round(live_data['temp'] * 9/5 + 32, 1)
+                    if live_data['wind_speed'] is not None:
+                        parsed['wind_speed_kts'] = round(live_data['wind_speed'] * 0.539957, 1)
+                    if live_data['wind_gust'] is not None:
+                        parsed['wind_gust_kts'] = round(live_data['wind_gust'] * 0.539957, 1)
+                    if live_data['wind_dir'] is not None:
+                        parsed['wind_direction'] = int(live_data['wind_dir'])
+                    parsed['live_wind'] = live_data # Backward compatibility
+                return parsed
+            
+            # 3. If no METAR but NWS data is fresh, use NWS as primary
+            if live_data.get('temp') is not None and is_nws_fresh(live_data['timestamp']):
+                temp_c = live_data['temp']
+                return {
+                    'temperature_c': temp_c,
+                    'temperature_f': round(temp_c * 9/5 + 32, 1),
+                    'dewpoint_c': live_data.get('dew') or (temp_c - 5),
+                    'dewpoint_f': round((live_data.get('dew') or (temp_c - 5)) * 9/5 + 32, 1),
+                    'wind_speed_kts': round(live_data.get('wind_speed', 0) * 0.539957, 1) if live_data.get('wind_speed') else 0,
+                    'wind_gust_kts': round(live_data.get('wind_gust', 0) * 0.539957, 1) if live_data.get('wind_gust') else 0,
+                    'wind_direction': int(live_data.get('wind_dir') or 0),
+                    'visibility_sm': round(live_data.get('vis', 16093) / 1609.34, 1) if live_data.get('vis') else 10.0,
+                    'flight_category': 'VFR',
+                    'timestamp': live_data['timestamp'],
+                    'source': 'NWS Real-time (No METAR)'
+                }
         except Exception as e:
-            print(f"Error finding nearest station for {lat}, {lon}: {e}")
+            errors.append(f"{sid}: {str(e)}")
 
-    if not station_id:
-        metar_stations = {
-            'Starbase': 'KBRO',
-            'Vandy': 'KVBG',
-            'Cape': 'KMLB',
-            'Hawthorne': 'KHHR'
-        }
-        if location:
-            station_id = metar_stations.get(location, 'KBRO')
-        elif not lat or not lon: # Only fallback to KBRO if no coordinates provided either
-            station_id = 'KBRO'
-    
-    if not station_id:
-        return {
-            'error': 'No weather station found for the provided location',
-            'temperature_c': 25, 'temperature_f': 77,
-            'wind_speed_kts': 0, 'flight_category': 'VFR'
-        }
-    
-    # Try to fetch live wind from NWS API for higher frequency (often includes SPECI or more frequent updates)
-    live_wind = {}
-    try:
-        # User-Agent is required for NWS API
-        nws_headers = {'User-Agent': '(my-launch-app, contact@example.com)'}
-        nws_url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
-        nws_res = requests.get(nws_url, headers=nws_headers, timeout=5)
-        if nws_res.status_code == 200:
-            nws_data = nws_res.json().get('properties', {})
-            wind_speed = nws_data.get('windSpeed', {}).get('value') # km/h
-            wind_gust = nws_data.get('windGust', {}).get('value')   # km/h
-            wind_dir = nws_data.get('windDirection', {}).get('value') # degrees
-            
-            if wind_speed is not None:
-                # NWS API returns speed in km/h (wmoUnit:km_h-1)
-                live_wind['speed_kts'] = round(wind_speed * 0.539957, 1)
-            if wind_gust is not None:
-                live_wind['gust_kts'] = round(wind_gust * 0.539957, 1)
-            if wind_dir is not None:
-                live_wind['direction'] = int(wind_dir)
-            
-            live_wind['timestamp'] = nws_data.get('timestamp')
-            live_wind['source'] = 'NWS Real-time'
-    except Exception as e:
-        print(f"Error fetching NWS live wind for {station_id}: {e}")
+    # 4. If all station attempts failed, fall back to Open-Meteo (model-based current weather)
+    if lat is not None and lon is not None:
+        try:
+            forecast = fetch_forecast(lat=lat, lon=lon)
+            if forecast and 'current_weather' in forecast:
+                cw = forecast['current_weather']
+                temp_c = cw['temperature']
+                return {
+                    'temperature_c': temp_c,
+                    'temperature_f': round(temp_c * 9/5 + 32, 1),
+                    'wind_speed_kts': round(cw.get('windspeed', 0) * 0.539957, 1),
+                    'wind_direction': cw.get('winddirection', 0),
+                    'flight_category': 'VFR',
+                    'source': 'Open-Meteo',
+                    'note': 'Modeled data (all METAR/NWS stations failed)'
+                }
+        except Exception as e:
+            errors.append(f"Open-Meteo: {str(e)}")
 
-    url = f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=raw"
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        raw_metar = response.text.strip()
-        if not raw_metar:
-            raise ValueError("Empty METAR response")
-        
-        parsed = parse_metar(raw_metar)
-        if live_wind:
-            parsed['live_wind'] = live_wind
-        return parsed
-    except Exception as e:
-        print(f"Error fetching weather for {station_id}: {e}")
-        return {
-            'temperature_c': 25, 'temperature_f': 77,
-            'dewpoint_c': 15, 'dewpoint_f': 59,
-            'humidity': 50,
-            'wind_speed_kts': 0, 'wind_gust_kts': 0,
-            'wind_direction': 0, 'visibility_sm': 10,
-            'altimeter_inhg': 29.92, 'cloud_cover': 0,
-            'flight_category': 'VFR', 'error': str(e)
-        }
+    # Final fallback if everything failed - at least it's marked as an error
+    return {
+        'temperature_c': 25, 'temperature_f': 77,
+        'wind_speed_kts': 0, 'flight_category': 'VFR',
+        'error': f"All weather sources failed: {'; '.join(errors)}"
+    }
 
 def fetch_external_narratives():
     """Fetch narratives from the external API as specified in functions.py."""
@@ -1585,23 +1650,15 @@ def _get_weather_cached(location: str, force: bool = False):
                 return json.loads(cached), True
         except: pass
     
-    if force:
-        data = fetch_weather(location)
-        last_updated = datetime.now(timezone.utc).isoformat()
-        data['last_updated'] = last_updated
-        if r:
-            try:
-                r.setex(cache_key, 300, json.dumps(data))
-            except: pass
-        return data, False
-
-    # Return default empty if not in cache (timer will populate)
-    return {
-        "temperature_c": 25, "temperature_f": 77, 
-        "dewpoint_c": 15, "dewpoint_f": 59,
-        "humidity": 50, "wind_speed_kts": 0, 
-        "flight_category": "VFR", "last_updated": None
-    }, False
+    # If force=True or cache miss, perform a foreground fetch
+    data = fetch_weather(location)
+    last_updated = datetime.now(timezone.utc).isoformat()
+    data['last_updated'] = last_updated
+    if r:
+        try:
+            r.setex(cache_key, 300, json.dumps(data))
+        except: pass
+    return data, False
 
 @app.get("/weather/{location}")
 def get_weather(location: str, force: bool = False, internal: bool = False):
