@@ -639,6 +639,32 @@ def record_snapshot():
     if len(_local_metrics_history) > HISTORY_LIMIT:
         _local_metrics_history.pop(0)
 
+@app.post("/reset_metrics")
+def reset_app_metrics():
+    """Endpoint to reset all metrics and history."""
+    global _local_metrics, _local_metrics_history, _last_snapshot_time
+    
+    # Reset in-memory
+    _local_metrics = {
+        "total_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "api_calls": 0
+    }
+    _local_metrics_history = []
+    _last_snapshot_time = 0
+    
+    # Reset Redis
+    if r:
+        try:
+            r.delete(METRICS_KEY)
+            r.delete(METRICS_HISTORY_KEY)
+        except Exception as e:
+            print(f"Redis error in reset_app_metrics: {e}")
+            return {"status": "Error", "message": str(e)}
+            
+    return {"status": "Success", "message": "All metrics and history have been reset."}
+
 def get_metrics(include_history=True, range_type="1h"):
     """Retrieve metrics from Redis or memory."""
     current = {
@@ -1622,6 +1648,32 @@ def get_app_metrics(range: str = "1h"):
     record_snapshot()
     return get_metrics(range_type=range)
 
+@app.post("/reset_metrics")
+def reset_app_metrics():
+    """Endpoint to reset all metrics and history."""
+    global _local_metrics, _local_metrics_history, _last_snapshot_time
+    
+    # Reset in-memory
+    _local_metrics = {
+        "total_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "api_calls": 0
+    }
+    _local_metrics_history = []
+    _last_snapshot_time = 0
+    
+    # Reset Redis
+    if r:
+        try:
+            r.delete(METRICS_KEY)
+            r.delete(METRICS_HISTORY_KEY)
+        except Exception as e:
+            print(f"Redis error in reset_app_metrics: {e}")
+            return {"status": "Error", "message": str(e)}
+            
+    return {"status": "Success", "message": "All metrics and history have been reset."}
+
 @app.get("/seed_status")
 def get_seed_status():
     """Endpoint to check the status of historical seeding."""
@@ -1771,11 +1823,17 @@ def dashboard(request: Request):
                 <h2 class="text-2xl font-bold tracking-tight">System Metrics</h2>
                 <p class="text-slate-400 text-sm">Real-time performance and absolute API usage tracking.</p>
             </div>
-            <div class="flex bg-slate-900 border border-slate-800 p-1 rounded-xl">
-                <button onclick="changeRange('1h')" id="range-1h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all range-active">1h</button>
-                <button onclick="changeRange('24h')" id="range-24h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">24h</button>
-                <button onclick="changeRange('7d')" id="range-7d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">7d</button>
-                <button onclick="changeRange('30d')" id="range-30d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">30d</button>
+            <div class="flex flex-col sm:flex-row gap-3">
+                <div class="flex bg-slate-900 border border-slate-800 p-1 rounded-xl">
+                    <button onclick="changeRange('1h')" id="range-1h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all range-active">1h</button>
+                    <button onclick="changeRange('24h')" id="range-24h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">24h</button>
+                    <button onclick="changeRange('7d')" id="range-7d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">7d</button>
+                    <button onclick="changeRange('30d')" id="range-30d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">30d</button>
+                </div>
+                <button onclick="resetMetrics()" class="flex items-center justify-center gap-2 px-4 py-1.5 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 rounded-xl text-red-400 text-sm font-bold transition-all" title="Reset all metrics and history">
+                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                    Reset
+                </button>
             </div>
         </div>
 
@@ -2230,18 +2288,41 @@ def dashboard(request: Request):
             currentRange = range;
             ['1h', '24h', '7d', '30d'].forEach(r => {
                 const btn = document.getElementById(`range-${r}`);
-                if (r === range) {
-                    btn.classList.add('range-active');
-                    btn.classList.remove('text-slate-400', 'hover:text-slate-200');
-                    btn.classList.add('text-white');
-                } else {
-                    btn.classList.remove('range-active', 'text-white');
-                    btn.classList.add('text-slate-400', 'hover:text-slate-200');
+                if (btn) {
+                    if (r === range) {
+                        btn.classList.add('range-active');
+                        btn.classList.remove('text-slate-400', 'hover:text-slate-200');
+                        btn.classList.add('text-white');
+                    } else {
+                        btn.classList.remove('range-active', 'text-white');
+                        btn.classList.add('text-slate-400', 'hover:text-slate-200');
+                    }
                 }
             });
             fetchMetrics();
             // Reset metrics timer
             nextRefresh.metrics = Date.now() + refreshIntervals.metrics * 1000;
+        }
+
+        async function resetMetrics() {
+            if (!confirm('Are you sure you want to reset all metrics and history? This cannot be undone.')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/reset_metrics', { method: 'POST' });
+                const result = await response.json();
+                if (result.status === 'Success') {
+                    // Force refresh metrics immediately
+                    fetchMetrics();
+                    alert('Metrics have been reset successfully.');
+                } else {
+                    alert('Error: ' + result.message);
+                }
+            } catch (error) {
+                console.error('Error resetting metrics:', error);
+                alert('Failed to reset metrics. See console for details.');
+            }
         }
 
         function showTab(tab) {
