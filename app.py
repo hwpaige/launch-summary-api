@@ -283,7 +283,7 @@ def generate_narratives(existing_narratives=None):
         f"?lsp__name=SpaceX"
         f"&net__gte={three_months_ago.strftime('%Y-%m-%d')}"
         f"&net__lte={current_time.strftime('%Y-%m-%d')}"
-        f"&limit=40"
+        f"&limit=5"
         f"&ordering=-net"
     )
     response = requests.get(url)
@@ -407,14 +407,14 @@ Output as a Python list assignment: launch_descriptions = [...]"""
         print(f"Successfully generated {len(new_descriptions)} new narratives.")
         
         if existing_narratives:
-            # Prepend new ones and limit the total list size
+            # Prepend new ones and limit the total list size to the 5 most recent
             combined = new_descriptions + existing_narratives
             # We assume they are mostly sorted, but we could do a final sort if needed.
             # However, since we don't have the year in the string, a simple string sort is risky.
             # Prepending preserves the newest-first order from the API.
-            return combined[:50]
+            return combined[:5]
         
-        return new_descriptions
+        return new_descriptions[:5]
     except Exception as e:
         raise ValueError(f"Failed to parse Grok response: {str(e)}")
 
@@ -1081,16 +1081,19 @@ def get_all_weather(force: bool = False):
     weather_results = {}
     timestamps = []
     
-    hit_count = 0
+    hits = 0
+    misses = 0
     for loc in locations:
         res, is_hit = _get_weather_cached(loc, force)
         weather_results[loc] = res
         if res.get('last_updated'):
             timestamps.append(res.get('last_updated'))
         if is_hit:
-            hit_count += 1
+            hits += 1
+        else:
+            misses += 1
             
-    if hit_count == len(locations):
+    if misses == 0:
         increment_metric("cache_hits")
     else:
         increment_metric("cache_misses")
@@ -1103,12 +1106,19 @@ def get_all_weather(force: bool = False):
 @app.get("/launch_details/{launch_id}")
 def get_launch_details(launch_id: str):
     increment_metric("total_requests")
-    return fetch_launch_details(launch_id)
+    res = fetch_launch_details(launch_id)
+    if res:
+        increment_metric("cache_misses") # Details are always a fresh fetch from LL API
+    else:
+        increment_metric("cache_misses")
+    return res
 
 @app.get("/external_narratives")
 def get_all_narratives():
     increment_metric("total_requests")
-    return {"descriptions": fetch_external_narratives()}
+    res = fetch_external_narratives()
+    increment_metric("cache_misses") # External API fetch is a miss from our cache
+    return {"descriptions": res}
 
 @app.get("/recent_launches_narratives")
 def get_narratives(force: bool = False):
