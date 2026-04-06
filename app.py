@@ -12,6 +12,7 @@ import time
 import threading
 import zlib
 import base64
+import pytz
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
@@ -108,10 +109,490 @@ CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
+
+# Reliable weather stations for key launch sites (prioritized)
+METAR_STATIONS = {
+    'Starbase': ['KBRO', 'KHRL', 'KMFE'],
+    'Vandy': ['KVBG', 'KLPC', 'KSMX'],
+    'Cape': ['KXMR', 'KTTS', 'KCOF', 'KMLB'],
+    'Hawthorne': ['KHHR', 'KLAX', 'KSMO']
+}
+
+# Approximate coordinates for fallbacks
+LOCATION_COORDS = {
+    'Starbase': {'lat': 25.997, 'lon': -97.157},
+    'Vandy': {'lat': 34.632, 'lon': -120.611},
+    'Cape': {'lat': 28.562, 'lon': -80.577},
+    'Hawthorne': {'lat': 33.921, 'lon': -118.332}
+}
 HISTORY_LIMIT = 43200 # 30 days at 1 minute intervals
 SEEDING_STATUS_KEY = "seeding_status_v2"
 SEEDING_STOP_SIGNAL_KEY = "seeding_stop_signal_v2"
 _last_snapshot_time = 0
+
+# Trajectory Helpers and Cache
+class Profiler:
+    def mark(self, msg):
+        print(f"[PROFILER] {msg}")
+
+class Logger:
+    def info(self, msg):
+        print(f"[INFO] {msg}")
+    def warning(self, msg):
+        print(f"[WARNING] {msg}")
+
+profiler = Profiler()
+logger = Logger()
+
+_TRAJECTORY_DATA_CACHE = None
+TRAJECTORY_CACHE_FILE = "trajectory_cache.json"
+
+def load_cache_from_file(filename):
+    """Load cache from Redis instead of file if possible, or fallback to file."""
+    if r:
+        data = get_cached_data("trajectory_cache_v2")
+        if data:
+            return {"data": data}
+
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r') as f:
+                return {"data": json.load(f)}
+        except Exception as e:
+            print(f"Error loading cache file: {e}")
+    return {"data": {}}
+
+def save_cache_to_file(filename, data, updated_at=None):
+    """Save cache to Redis and local file."""
+    if r:
+        set_cached_data("trajectory_cache_v2", data)
+
+    try:
+        with open(filename, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Error saving cache file: {e}")
+
+def compute_orbit_radius(orbit_label):
+    """Compute orbital radius based on orbit type."""
+    label = (orbit_label or '').lower()
+    EARTH_RADIUS = 1.0 # Normalized
+    if 'gto' in label:
+        return 1.15 # Geostationary Transfer
+    if 'suborbital' in label:
+        return 1.05
+    return 1.08 # Standard LEO
+
+def _ang_dist_deg(p1, p2):
+    """Calculate angular distance between two points in degrees."""
+    lat1, lon1 = math.radians(p1['lat']), math.radians(p1['lon'])
+    lat2, lon2 = math.radians(p2['lat']), math.radians(p2['lon'])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1-a)))
+    return math.degrees(c)
+
+def get_destination_point(lat, lon, distance_km, bearing_deg):
+    """Calculate destination point given start point, distance, and bearing."""
+    R = 6371.0
+    brng = math.radians(bearing_deg)
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+    lat2 = math.asin(math.sin(lat1) * math.cos(distance_km/R) +
+                     math.cos(lat1) * math.sin(distance_km/R) * math.cos(brng))
+    lon2 = lon1 + math.atan2(math.sin(brng) * math.sin(distance_km/R) * math.cos(lat1),
+                             math.cos(distance_km/R) - math.sin(lat1) * math.sin(lat2))
+    return {'lat': math.degrees(lat2), 'lon': (math.degrees(lon2) + 180) % 360 - 180}
+
+def generate_ground_track(start_point, inclination_deg, num_points=2000, descending=False, duration_min=90):
+    """Generate a ground track accounting for Earth's rotation."""
+    lat0 = float(start_point['lat']); lon0 = float(start_point['lon'])
+    eff_i_deg = max(0.1, min(179.9, abs(inclination_deg)))
+    i_rad = math.radians(eff_i_deg)
+    lat0_rad = math.radians(lat0); lon0_rad = math.radians(lon0)
+
+    x0 = math.cos(lat0_rad) * math.cos(lon0_rad)
+    y0 = math.cos(lat0_rad) * math.sin(lon0_rad)
+    z0 = math.sin(lat0_rad)
+
+    sin_i = math.sin(i_rad)
+    u0 = math.asin(max(-1.0, min(1.0, z0 / (sin_i or 1e-6))))
+    if descending:
+        u0 = math.pi - u0
+
+    Omega = math.atan2(y0, x0) - math.atan2(math.sin(u0) * math.cos(i_rad), math.cos(u0))
+
+    cosO = math.cos(Omega); sinO = math.sin(Omega)
+    cosi = math.cos(i_rad); sili = math.sin(i_rad)
+
+    points = []
+    omega_e = 2 * math.pi / 86400.0
+    period_sec = duration_min * 60
+
+    for k in range(num_points):
+        t_frac = k / (num_points - 1)
+        t_sec = t_frac * period_sec
+        u = u0 + (2.0 * math.pi * t_frac)
+
+        cu = math.cos(u); su = math.sin(u)
+        xo = cu
+        yo = su * cosi
+        zo = su * sili
+
+        x_i = cosO * xo - sinO * yo
+        y_i = sinO * xo + cosO * yo
+        z_i = zo
+
+        lon_i = math.atan2(y_i, x_i)
+        lon_fixed = lon_i - omega_e * t_sec
+
+        lat = math.degrees(math.atan2(z_i, math.hypot(x_i, y_i)))
+        lon = (math.degrees(lon_fixed) + 180) % 360 - 180
+
+        points.append({'lat': lat, 'lon': lon})
+    return points
+
+def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
+    """
+    Get trajectory data for the next upcoming launch or a specific launch.
+    If upcoming_launches is a dict, treat it as a single launch object.
+    If upcoming_launches is a list, use the first item (existing behavior).
+    Standalone version of Backend.get_launch_trajectory.
+    """
+    profiler.mark("get_launch_trajectory_data Start")
+    logger.info("get_launch_trajectory_data called")
+
+    # Handle single launch object (dict) vs list of launches
+    if isinstance(upcoming_launches, dict):
+        # Single launch object
+        display_launches = [upcoming_launches]
+    else:
+        # List of launches (existing behavior)
+        display_launches = upcoming_launches
+        if not display_launches:
+            logger.info("No upcoming launches, trying recent launches")
+            if previous_launches:
+                recent_launches = previous_launches[:5]
+                if recent_launches:
+                    display_launches = [{
+                        'mission': launch.get('mission', 'Unknown'),
+                        'pad': launch.get('pad', 'Cape Canaveral'),
+                        'orbit': launch.get('orbit', 'LEO'),
+                        'net': launch.get('net', ''),
+                        'landing_type': launch.get('landing_type'),
+                        'landing_location': launch.get('landing_location')
+                    } for launch in recent_launches]
+                    logger.info(f"Using {len(display_launches)} recent launches for demo")
+
+    if not display_launches:
+        logger.info("No launches available at all")
+        return None
+
+    next_launch = display_launches[0]
+    mission_name = next_launch.get('mission', 'Unknown')
+    pad = next_launch.get('pad', '')
+    orbit = next_launch.get('orbit', '')
+    logger.info(f"Next launch: {mission_name} from {pad}")
+
+    # Launch site coordinates
+    launch_sites = {
+        'LC-39A': {'lat': 28.6084, 'lon': -80.6043, 'name': 'Cape Canaveral, FL'},
+        'LC-40': {'lat': 28.5619, 'lon': -80.5773, 'name': 'Cape Canaveral, FL'},
+        'SLC-4E': {'lat': 34.6321, 'lon': -120.6107, 'name': 'Vandenberg, CA'},
+        'Starbase': {'lat': 25.9975, 'lon': -97.1566, 'name': 'Starbase, TX'},
+        'Launch Complex 39A': {'lat': 28.6084, 'lon': -80.6043, 'name': 'Cape Canaveral, FL'},
+        'Launch Complex 40': {'lat': 28.5619, 'lon': -80.5773, 'name': 'Cape Canaveral, FL'},
+        'Space Launch Complex 4E': {'lat': 34.6321, 'lon': -120.6107, 'name': 'Vandenberg, CA'}
+    }
+
+    # Find launch site coordinates
+    launch_site = None
+    matched_site_key = None
+    for site_key, site_data in launch_sites.items():
+        if site_key in pad:
+            launch_site = site_data
+            matched_site_key = site_key
+            break
+
+    if not launch_site:
+        launch_site = launch_sites['LC-39A']
+        matched_site_key = 'LC-39A'
+        logger.info(f"Using default launch site: {launch_site}")
+
+    def _normalize_orbit(orbit_label: str, site_name: str) -> str:
+        try:
+            label = (orbit_label or '').lower()
+            if 'gto' in label or 'geostationary' in label:
+                return 'GTO'
+            if 'suborbital' in label:
+                return 'Suborbital'
+            # Explicit Polar/SSO detection
+            if any(k in label for k in ['polar', 'sso', 'sun-synchronous']):
+                return 'LEO-Polar'
+            if 'leo' in label or 'low earth orbit' in label:
+                if 'Vandenberg' in site_name:
+                    return 'LEO-Polar'
+                return 'LEO-Equatorial'
+            return 'Default'
+        except Exception:
+            return 'Default'
+
+    normalized_orbit = _normalize_orbit(orbit, launch_site.get('name', ''))
+
+    # Resolve an inclination assumption
+    def _resolve_inclination_deg(norm_orbit: str, site_name: str, site_lat: float) -> float:
+        try:
+            label = (orbit or '').lower()
+            if 'iss' in label:
+                return 51.6
+            if norm_orbit == 'LEO-Polar' or 'sso' in label or 'sun-synchronous' in label:
+                return 97.5 # Better average for SSO
+            if norm_orbit == 'LEO-Equatorial':
+                base = abs(site_lat)
+                return max(20.0, min(60.0, base + 0.5))
+            if norm_orbit == 'GTO':
+                return max(20.0, min(35.0, abs(site_lat)))
+            if norm_orbit == 'Suborbital':
+                return max(10.0, min(45.0, abs(site_lat)))
+        except Exception:
+            pass
+        return 30.0
+
+    assumed_incl = _resolve_inclination_deg(
+        normalized_orbit,
+        launch_site.get('name', ''),
+        launch_site.get('lat', 0.0)
+    )
+
+    ORBIT_CACHE_VERSION = 'v240-accurate-groundtrack'
+    landing_type = next_launch.get('landing_type')
+    landing_loc = next_launch.get('landing_location')
+    cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl,1)}:{landing_type}:{landing_loc}"
+
+    global _TRAJECTORY_DATA_CACHE
+    if _TRAJECTORY_DATA_CACHE is None:
+        logger.info("Loading trajectory cache from disk...")
+        cache_loaded = load_cache_from_file(TRAJECTORY_CACHE_FILE)
+        if cache_loaded and isinstance(cache_loaded.get('data'), dict):
+            _TRAJECTORY_DATA_CACHE = cache_loaded['data']
+        else:
+            # Handle direct dictionary without 'data' wrapper if it exists
+            _TRAJECTORY_DATA_CACHE = cache_loaded if isinstance(cache_loaded, dict) else {}
+
+    if cache_key in _TRAJECTORY_DATA_CACHE:
+        cached = _TRAJECTORY_DATA_CACHE[cache_key]
+        logger.info(f"Trajectory in-memory cache hit for {cache_key}")
+        return {
+            'launch_site': cached.get('launch_site', launch_site),
+            'trajectory': cached.get('trajectory', []),
+            'booster_trajectory': cached.get('booster_trajectory', []),
+            'sep_idx': cached.get('sep_idx'),
+            'orbit_path': cached.get('orbit_path', []),
+            'orbit': orbit or cached.get('orbit', normalized_orbit),
+            'mission': mission_name,
+            'pad': pad,
+            'landing_type': landing_type,
+            'landing_location': cached.get('landing_location', next_launch.get('landing_location'))
+        }
+
+    traj_cache = _TRAJECTORY_DATA_CACHE
+    logger.info(f"Trajectory cache miss for {cache_key}; generating new trajectory")
+
+
+    def generate_curved_trajectory(start_point, end_point, num_points, orbit_type='default', end_bearing_deg=None):
+        points = []
+        start_lat = start_point['lat']
+        start_lon = start_point['lon']
+        end_lat = end_point['lat']
+        end_lon = end_point['lon']
+
+        if end_bearing_deg is not None:
+            lat1 = math.radians(start_lat); lon1 = math.radians(start_lon)
+            lat2 = math.radians(end_lat);   lon2 = math.radians(end_lon)
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1-a)))
+            ang_deg = math.degrees(c)
+            # Tighter control point distance (L) to avoid "flat" segments near insertion
+            L = min(15.0, max(3.0, ang_deg / 4.0))
+            br = math.radians(end_bearing_deg)
+            cos_lat = max(1e-6, math.cos(math.radians(end_lat)))
+            dlat_deg = L * math.cos(br)
+            dlon_deg = (L * math.sin(br)) / cos_lat
+            control_lat = end_lat - dlat_deg
+            control_lon = (end_lon - dlon_deg + 180.0) % 360.0 - 180.0
+        else:
+            mid_lat = (start_lat + end_lat) / 2
+            mid_lon = (start_lon + end_lon) / 2
+            dist = _ang_dist_deg(start_point, end_point)
+
+            # Scale control point offset based on distance
+            offset = max(5, min(30, dist * 0.4))
+
+            if orbit_type == 'polar':
+                control_lat = max(-85.0, mid_lat - offset)
+                control_lon = mid_lon - offset/2
+            elif orbit_type == 'equatorial':
+                # Aim more towards equator
+                target_equator_lat = 0
+                control_lat = (mid_lat + target_equator_lat) / 2
+                control_lon = mid_lon + offset
+            elif orbit_type == 'gto':
+                control_lat = mid_lat + offset
+                control_lon = mid_lon + offset * 2
+            elif orbit_type == 'suborbital':
+                # Suborbital/Booster return needs a tighter arc
+                control_lat = mid_lat + offset/4
+                control_lon = mid_lon + offset/4
+            else:
+                control_lat = mid_lat + offset
+                control_lon = mid_lon + offset * 1.5
+
+        for i in range(num_points + 1):
+            t = i / num_points
+            lat = (1-t)**2 * start_lat + 2*(1-t)*t * control_lat + t**2 * end_lat
+            lon = (1-t)**2 * start_lon + 2*(1-t)*t * control_lon + t**2 * end_lon
+            lon = (lon + 180) % 360 - 180
+            points.append({'lat': lat, 'lon': lon})
+        return points
+
+
+    # Main generation
+    target_r = compute_orbit_radius(orbit)
+
+    # Heuristic for launch direction: VAFB launches are usually descending (Southward)
+    is_desc = False
+    if 'Vandenberg' in launch_site.get('name', '') or 'SLC-4E' in pad:
+        is_desc = True
+
+    # Generate the Master Path (The Orbit Ground Track)
+    # Accounting for Earth's rotation makes the orbit path more realistic.
+    master_path = generate_ground_track(launch_site, assumed_incl, num_points=2000, descending=is_desc, duration_min=90)
+
+    # The ascent trajectory is a segment of the SAME Master Path
+    # LEO insertion usually happens ~2000-3000km downrange (~6-8% of ground track)
+    traj_len = int(len(master_path) * 0.08)
+    trajectory = [p.copy() for p in master_path[:traj_len]]
+
+    # The orbit path is the REMAINING part of the Master Path to avoid overlap
+    if normalized_orbit != 'Suborbital':
+        orbit_path = [p.copy() for p in master_path[traj_len-1:]]
+    else:
+        orbit_path = []
+
+    # Set radii for the orbit path
+    for p in orbit_path:
+        p['r'] = target_r
+
+    # Add radii to main trajectory (Ascent profile)
+    for i, p in enumerate(trajectory):
+        progress = i / (len(trajectory) - 1)
+        # Smoother climb from surface (1.0) to orbit radius
+        # Using 0.5 power for a steeper initial climb (reaching ~70km at MECO)
+        p['r'] = 1.0 + (target_r - 1.0) * (progress ** 0.5)
+
+    # Booster Return Trajectory (RTLS vs ASDS vs Expendable simulation)
+    booster_trajectory = []
+    sep_idx = None
+    if trajectory and len(trajectory) > 10:
+        try:
+            # MECO is typically ~80km downrange, which is 4 points in a 2000-point 40000km orbit
+            sep_idx = max(4, int(len(master_path) * 0.002))
+
+            sep_point = trajectory[sep_idx].copy()
+            sep_radius = sep_point['r']
+
+            l_type = (landing_type or '').upper()
+            l_loc = (next_launch.get('landing_location') or '').upper()
+            combined_landing_info = f"{l_type} {l_loc}"
+
+            # Expanded detection for ASDS and RTLS
+            asds_keywords = ['ASDS', 'DRONE', 'SHIP', 'OCISLY', 'JRTI', 'ASOG', 'GRAVITAS', 'INSTRUCTIONS', 'STILL LOVE YOU']
+            rtls_keywords = ['RTLS', 'LAUNCH SITE', 'CATCH', 'TOWER', 'LZ', 'LANDING ZONE']
+
+            if any(k in combined_landing_info for k in asds_keywords):
+                # Droneship landing: ~600-700km downrange
+                dist_frac = 0.016 # ~640km
+                if normalized_orbit == 'GTO':
+                    dist_frac = 0.018 # ~720km
+
+                landing_idx = min(len(master_path) - 1, int(len(master_path) * dist_frac))
+                landing_point = master_path[landing_idx]
+
+                return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
+
+                # Add radius to return part (ballistic arc)
+                for i, p in enumerate(return_part):
+                    prog = i / (len(return_part) - 1)
+                    # Parabolic arc peaking at sep_radius + 0.01, then down to surface (1.0)
+                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
+
+                booster_trajectory = return_part
+                sep_idx = 0 # Indicates start of booster_trajectory in visual tools
+                logger.info(f"Generated accurate ASDS booster trajectory (dist: ~650km)")
+            elif any(k in combined_landing_info for k in rtls_keywords):
+                # RTLS/Catch: returns to launch site
+                return_part = generate_curved_trajectory(sep_point, launch_site, 100, orbit_type='suborbital')
+                for i, p in enumerate(return_part):
+                    prog = i / (len(return_part) - 1)
+                    # Higher arc for RTLS boostback (~150km peak)
+                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.02 * math.sin(prog * math.pi)
+
+                booster_trajectory = return_part
+                sep_idx = 0
+                logger.info(f"Generated accurate RTLS booster trajectory")
+            elif any(k in combined_landing_info for k in ['OCEAN', 'SPLASHDOWN']):
+                # Ballistic splashdown further downrange than RTLS but before ASDS
+                landing_idx = min(len(master_path) - 1, int(len(master_path) * 0.01))
+                landing_point = master_path[landing_idx]
+                return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
+                for i, p in enumerate(return_part):
+                    prog = i / (len(return_part) - 1)
+                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
+                booster_trajectory = return_part
+                sep_idx = 0
+                logger.info(f"Generated Ocean splashdown booster trajectory")
+            else:
+                booster_trajectory = []
+                sep_idx = None
+                logger.info(f"Skipping booster trajectory for unknown/expendable type")
+        except Exception as e:
+            logger.warning(f"Booster trajectory generation failed: {e}")
+
+    result = {
+        'launch_site': launch_site,
+        'trajectory': trajectory,
+        'booster_trajectory': booster_trajectory,
+        'sep_idx': sep_idx,
+        'orbit_path': orbit_path,
+        'orbit': orbit,
+        'mission': mission_name,
+        'pad': pad,
+        'landing_type': landing_type,
+        'landing_location': next_launch.get('landing_location')
+    }
+
+    # Persist to cache
+    try:
+        traj_cache[cache_key] = {
+            'launch_site': launch_site,
+            'trajectory': trajectory,
+            'booster_trajectory': booster_trajectory,
+            'sep_idx': sep_idx,
+            'orbit_path': orbit_path,
+            'orbit': normalized_orbit,
+            'inclination_deg': assumed_incl,
+            'landing_type': landing_type,
+            'landing_location': next_launch.get('landing_location'),
+            'model': 'v11-non-overlapping-orbit'
+        }
+        save_cache_to_file(TRAJECTORY_CACHE_FILE, traj_cache, datetime.now(pytz.utc))
+    except Exception as e:
+        logger.warning(f"Failed to save trajectory cache: {e}")
+
+    return result
 
 _local_seeding_status = {"is_running": False, "last_status": "Idle", "total_pulled": 0, "oldest_launch": None}
 _stop_seeding_requested = False
@@ -185,6 +666,32 @@ def record_snapshot():
     if len(_local_metrics_history) > HISTORY_LIMIT:
         _local_metrics_history.pop(0)
 
+@app.post("/reset_metrics")
+def reset_app_metrics():
+    """Endpoint to reset all metrics and history."""
+    global _local_metrics, _local_metrics_history, _last_snapshot_time
+
+    # Reset in-memory
+    _local_metrics = {
+        "total_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "api_calls": 0
+    }
+    _local_metrics_history = []
+    _last_snapshot_time = 0
+
+    # Reset Redis
+    if r:
+        try:
+            r.delete(METRICS_KEY)
+            r.delete(METRICS_HISTORY_KEY)
+        except Exception as e:
+            print(f"Redis error in reset_app_metrics: {e}")
+            return {"status": "Error", "message": str(e)}
+
+    return {"status": "Success", "message": "All metrics and history have been reset."}
+
 def get_metrics(include_history=True, range_type="1h"):
     """Retrieve metrics from Redis or memory."""
     current = {
@@ -234,10 +741,16 @@ def get_metrics(include_history=True, range_type="1h"):
         history = [h for h in history if datetime.fromisoformat(h['timestamp'].replace('Z', '+00:00')) > start_time]
 
     # Calculate range-relative current stats if we have history
+    range_stats = {
+        "total_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "api_calls": 0
+    }
     if history:
         first = history[0]['data']
         last = history[-1]['data']
-        current = {
+        range_stats = {
             "total_requests": last.get('total_requests', 0) - first.get('total_requests', 0),
             "cache_hits": last.get('cache_hits', 0) - first.get('cache_hits', 0),
             "cache_misses": last.get('cache_misses', 0) - first.get('cache_misses', 0),
@@ -268,7 +781,8 @@ def get_metrics(include_history=True, range_type="1h"):
 
     return {
         "current": current, 
-        "history": history, 
+        "range_stats": range_stats,
+        "history": history,
         "hits_per_day": round(hits_per_day, 1)
     }
 
@@ -795,86 +1309,163 @@ def parse_metar(raw_metar: str):
         'raw': raw_metar
     }
 
-def fetch_forecast(location: str):
+def fetch_forecast(location: str = None, lat: float = None, lon: float = None):
     """Fetch 7-day forecast (daily + hourly) from Open-Meteo."""
     increment_metric("api_calls")
-    coords = {
-        'Starbase': (25.997, -97.156),
-        'Vandy': (34.742, -120.572),
-        'Cape': (28.483, -80.577),
-        'Hawthorne': (33.921, -118.330)
-    }
-    lat, lon = coords.get(location, (25.997, -97.156))
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m,windspeed_10m,winddirection_10m&timezone=auto"
+    if lat is None or lon is None:
+        coords = {
+            'Starbase': (25.997, -97.156),
+            'Vandy': (34.742, -120.572),
+            'Cape': (28.483, -80.577),
+            'Hawthorne': (33.921, -118.330)
+        }
+        lat, lon = coords.get(location, (25.997, -97.156))
+
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m,windspeed_10m,winddirection_10m&current_weather=true&timezone=auto"
     
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        print(f"Error fetching forecast for {location}: {e}")
+        print(f"Error fetching forecast for {location or (lat, lon)}: {e}")
         return None
 
-def fetch_weather(location: str):
-    """Fetch METAR weather data for a given location."""
-    increment_metric("api_calls")
-    metar_stations = {
-        'Starbase': 'KBRO',
-        'Vandy': 'KVBG',
-        'Cape': 'KMLB',
-        'Hawthorne': 'KHHR'
-    }
-    station_id = metar_stations.get(location, 'KBRO')
-    
-    # Try to fetch live wind from NWS API for higher frequency (often includes SPECI or more frequent updates)
-    live_wind = {}
+def is_nws_fresh(timestamp_str):
+    """Check if NWS timestamp is within the last 3 hours."""
+    if not timestamp_str: return False
     try:
-        # User-Agent is required for NWS API
-        nws_headers = {'User-Agent': '(my-launch-app, contact@example.com)'}
-        nws_url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
-        nws_res = requests.get(nws_url, headers=nws_headers, timeout=5)
-        if nws_res.status_code == 200:
-            nws_data = nws_res.json().get('properties', {})
-            wind_speed = nws_data.get('windSpeed', {}).get('value') # km/h
-            wind_gust = nws_data.get('windGust', {}).get('value')   # km/h
-            wind_dir = nws_data.get('windDirection', {}).get('value') # degrees
-            
-            if wind_speed is not None:
-                # NWS API returns speed in km/h (wmoUnit:km_h-1)
-                live_wind['speed_kts'] = round(wind_speed * 0.539957, 1)
-            if wind_gust is not None:
-                live_wind['gust_kts'] = round(wind_gust * 0.539957, 1)
-            if wind_dir is not None:
-                live_wind['direction'] = int(wind_dir)
-            
-            live_wind['timestamp'] = nws_data.get('timestamp')
-            live_wind['source'] = 'NWS Real-time'
-    except Exception as e:
-        print(f"Error fetching NWS live wind for {location}: {e}")
+        # NWS timestamp is often like 2024-01-01T00:00:00+00:00
+        ts = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        return datetime.now(timezone.utc) - ts < timedelta(hours=3)
+    except Exception:
+        return False
 
-    url = f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=raw"
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        raw_metar = response.text.strip()
-        if not raw_metar:
-            raise ValueError("Empty METAR response")
-        
-        parsed = parse_metar(raw_metar)
-        if live_wind:
-            parsed['live_wind'] = live_wind
-        return parsed
-    except Exception as e:
-        print(f"Error fetching weather for {location}: {e}")
-        return {
-            'temperature_c': 25, 'temperature_f': 77,
-            'dewpoint_c': 15, 'dewpoint_f': 59,
-            'humidity': 50,
-            'wind_speed_kts': 0, 'wind_gust_kts': 0,
-            'wind_direction': 0, 'visibility_sm': 10,
-            'altimeter_inhg': 29.92, 'cloud_cover': 0,
-            'flight_category': 'VFR', 'error': str(e)
-        }
+def fetch_weather(location: str = None, station_id: str = None, lat: float = None, lon: float = None):
+    """Fetch METAR weather data with multiple station fallbacks and Open-Meteo backup."""
+    increment_metric("api_calls")
+    
+    stations_to_try = []
+    if station_id:
+        stations_to_try = [station_id]
+    elif location and location in METAR_STATIONS:
+        stations_to_try = METAR_STATIONS[location]
+        if not lat or not lon:
+            coords = LOCATION_COORDS.get(location)
+            if coords:
+                lat, lon = coords['lat'], coords['lon']
+    elif lat is not None and lon is not None:
+        try:
+            # Search within 50nm
+            search_url = f"https://aviationweather.gov/api/data/metar?radialDistance={lat},{lon};50&format=raw"
+            res = requests.get(search_url, timeout=5)
+            if res.status_code == 200 and res.text.strip():
+                # Take the first METAR station ID
+                first_metar = res.text.strip().split('\n')[0]
+                found_sid = first_metar.split(' ')[0]
+                stations_to_try = [found_sid]
+        except Exception:
+            pass
+
+    if not stations_to_try:
+        if location == 'Starbase' or not location:
+            stations_to_try = ['KBRO']
+            if not lat: lat, lon = LOCATION_COORDS['Starbase']['lat'], LOCATION_COORDS['Starbase']['lon']
+        else:
+            # If we have a location but it's not in METAR_STATIONS, we might still have coords
+            if not lat and location in LOCATION_COORDS:
+                lat, lon = LOCATION_COORDS[location]['lat'], LOCATION_COORDS[location]['lon']
+
+    errors = []
+    # Try each station until one succeeds
+    for sid in stations_to_try:
+        try:
+            # 1. Try to fetch live wind/data from NWS API
+            live_data = {}
+            try:
+                nws_headers = {'User-Agent': '(my-launch-app, contact@example.com)'}
+                nws_url = f"https://api.weather.gov/stations/{sid}/observations/latest"
+                nws_res = requests.get(nws_url, headers=nws_headers, timeout=5)
+                if nws_res.status_code == 200:
+                    props = nws_res.json().get('properties', {})
+                    live_data = {
+                        'temp': props.get('temperature', {}).get('value'),
+                        'dew': props.get('dewpoint', {}).get('value'),
+                        'wind_speed': props.get('windSpeed', {}).get('value'),
+                        'wind_gust': props.get('windGust', {}).get('value'),
+                        'wind_dir': props.get('windDirection', {}).get('value'),
+                        'vis': props.get('visibility', {}).get('value'),
+                        'timestamp': props.get('timestamp'),
+                        'source': 'NWS Real-time'
+                    }
+            except Exception as e:
+                print(f"NWS error for {sid}: {e}")
+
+            # 2. Try to fetch METAR from Aviation Weather
+            aw_url = f"https://aviationweather.gov/api/data/metar?ids={sid}&format=raw"
+            aw_res = requests.get(aw_url, timeout=5)
+            raw_metar = aw_res.text.strip() if aw_res.status_code == 200 else ""
+
+            if raw_metar:
+                parsed = parse_metar(raw_metar)
+                # Merge with NWS data if NWS is fresh
+                if live_data.get('timestamp') and is_nws_fresh(live_data['timestamp']):
+                    if live_data['temp'] is not None:
+                        parsed['temperature_c'] = live_data['temp']
+                        parsed['temperature_f'] = round(live_data['temp'] * 9/5 + 32, 1)
+                    if live_data['wind_speed'] is not None:
+                        parsed['wind_speed_kts'] = round(live_data['wind_speed'] * 0.539957, 1)
+                    if live_data['wind_gust'] is not None:
+                        parsed['wind_gust_kts'] = round(live_data['wind_gust'] * 0.539957, 1)
+                    if live_data['wind_dir'] is not None:
+                        parsed['wind_direction'] = int(live_data['wind_dir'])
+                    parsed['live_wind'] = live_data # Backward compatibility
+                return parsed
+
+            # 3. If no METAR but NWS data is fresh, use NWS as primary
+            if live_data.get('temp') is not None and is_nws_fresh(live_data['timestamp']):
+                temp_c = live_data['temp']
+                return {
+                    'temperature_c': temp_c,
+                    'temperature_f': round(temp_c * 9/5 + 32, 1),
+                    'dewpoint_c': live_data.get('dew') or (temp_c - 5),
+                    'dewpoint_f': round((live_data.get('dew') or (temp_c - 5)) * 9/5 + 32, 1),
+                    'wind_speed_kts': round(live_data.get('wind_speed', 0) * 0.539957, 1) if live_data.get('wind_speed') else 0,
+                    'wind_gust_kts': round(live_data.get('wind_gust', 0) * 0.539957, 1) if live_data.get('wind_gust') else 0,
+                    'wind_direction': int(live_data.get('wind_dir') or 0),
+                    'visibility_sm': round(live_data.get('vis', 16093) / 1609.34, 1) if live_data.get('vis') else 10.0,
+                    'flight_category': 'VFR',
+                    'timestamp': live_data['timestamp'],
+                    'source': 'NWS Real-time (No METAR)'
+                }
+        except Exception as e:
+            errors.append(f"{sid}: {str(e)}")
+
+    # 4. If all station attempts failed, fall back to Open-Meteo (model-based current weather)
+    if lat is not None and lon is not None:
+        try:
+            forecast = fetch_forecast(lat=lat, lon=lon)
+            if forecast and 'current_weather' in forecast:
+                cw = forecast['current_weather']
+                temp_c = cw['temperature']
+                return {
+                    'temperature_c': temp_c,
+                    'temperature_f': round(temp_c * 9/5 + 32, 1),
+                    'wind_speed_kts': round(cw.get('windspeed', 0) * 0.539957, 1),
+                    'wind_direction': cw.get('winddirection', 0),
+                    'flight_category': 'VFR',
+                    'source': 'Open-Meteo',
+                    'note': 'Modeled data (all METAR/NWS stations failed)'
+                }
+        except Exception as e:
+            errors.append(f"Open-Meteo: {str(e)}")
+
+    # Final fallback if everything failed - at least it's marked as an error
+    return {
+        'temperature_c': 25, 'temperature_f': 77,
+        'wind_speed_kts': 0, 'flight_category': 'VFR',
+        'error': f"All weather sources failed: {'; '.join(errors)}"
+    }
 
 def fetch_external_narratives():
     """Fetch narratives from the external API as specified in functions.py."""
@@ -926,10 +1517,24 @@ def refresh_launches_internal():
 
     try:
         data = fetch_launches(existing_previous=existing_previous, existing_upcoming=existing_upcoming)
+
+        # Add trajectory data to the first upcoming launch
+        upcoming = data.get("upcoming", [])
+        previous = data.get("previous", [])
+        if upcoming:
+            traj = get_launch_trajectory_data(upcoming[0], previous)
+            if traj:
+                upcoming[0]['trajectory_data'] = traj
+        elif previous:
+            # Fallback to most recent previous launch if no upcoming
+            traj = get_launch_trajectory_data(previous[0], previous)
+            if traj:
+                previous[0]['trajectory_data'] = traj
+
         last_updated = datetime.now(timezone.utc).isoformat()
         result = {
-            "upcoming": data.get("upcoming", []),
-            "previous": data.get("previous", []),
+            "upcoming": upcoming,
+            "previous": previous,
             "last_updated": last_updated
         }
         set_cached_data(cache_key, result)
@@ -968,8 +1573,9 @@ def refresh_weather_internal():
 # --- New Endpoints ---
 
 @app.get("/launches")
-def get_launches(force: bool = False):
-    increment_metric("total_requests")
+def get_launches(force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
     cache_key = "launches_cache_v2"
     if force:
         increment_metric("cache_misses")
@@ -985,9 +1591,10 @@ def get_launches(force: bool = False):
     return {"upcoming": [], "previous": [], "last_updated": None}
 
 @app.get("/launches_slim")
-def get_launches_slim(force: bool = False):
+def get_launches_slim(force: bool = False, internal: bool = False):
     """Dashboard-optimized endpoint that strips 'all_data'."""
-    increment_metric("total_requests")
+    if not internal:
+        increment_metric("total_requests")
     cache_key = "launches_cache_v2"
     
     data = None
@@ -1015,9 +1622,10 @@ def get_launches_slim(force: bool = False):
     return {"upcoming": [], "previous": [], "last_updated": None}
 
 @app.get("/launch_raw/{launch_id}")
-def get_launch_raw(launch_id: str):
+def get_launch_raw(launch_id: str, internal: bool = False):
     """Fetch the raw 'all_data' for a specific launch from the cache."""
-    increment_metric("total_requests")
+    if not internal:
+        increment_metric("total_requests")
     cache_key = "launches_cache_v2"
     cached = get_cached_data(cache_key)
     if not cached:
@@ -1042,27 +1650,20 @@ def _get_weather_cached(location: str, force: bool = False):
                 return json.loads(cached), True
         except: pass
     
-    if force:
-        data = fetch_weather(location)
-        last_updated = datetime.now(timezone.utc).isoformat()
-        data['last_updated'] = last_updated
-        if r:
-            try:
-                r.setex(cache_key, 300, json.dumps(data))
-            except: pass
-        return data, False
-
-    # Return default empty if not in cache (timer will populate)
-    return {
-        "temperature_c": 25, "temperature_f": 77, 
-        "dewpoint_c": 15, "dewpoint_f": 59,
-        "humidity": 50, "wind_speed_kts": 0, 
-        "flight_category": "VFR", "last_updated": None
-    }, False
+    # If force=True or cache miss, perform a foreground fetch
+    data = fetch_weather(location)
+    last_updated = datetime.now(timezone.utc).isoformat()
+    data['last_updated'] = last_updated
+    if r:
+        try:
+            r.setex(cache_key, 300, json.dumps(data))
+        except: pass
+    return data, False
 
 @app.get("/weather/{location}")
-def get_weather(location: str, force: bool = False):
-    increment_metric("total_requests")
+def get_weather(location: str, force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
     res, is_hit = _get_weather_cached(location, force)
     if is_hit:
         increment_metric("cache_hits")
@@ -1070,9 +1671,29 @@ def get_weather(location: str, force: bool = False):
         increment_metric("cache_misses")
     return res
 
+@app.get("/user_weather")
+def get_user_weather(lat: float, lon: float, station_id: str = None, internal: bool = False):
+    """Retrieve weather (METAR + forecast) for a user-specified location."""
+    if not internal:
+        increment_metric("total_requests")
+
+    # Always a cache miss as we don't cache user-specific locations by default
+    increment_metric("cache_misses")
+
+    # Fetch METAR
+    weather_data = fetch_weather(station_id=station_id, lat=lat, lon=lon)
+
+    # Fetch forecast
+    forecast = fetch_forecast(lat=lat, lon=lon)
+    weather_data['forecast'] = forecast
+    weather_data['last_updated'] = datetime.now(timezone.utc).isoformat()
+
+    return weather_data
+
 @app.get("/weather_all")
-def get_all_weather(force: bool = False):
-    increment_metric("total_requests")
+def get_all_weather(force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
     if force:
         increment_metric("cache_misses")
         return refresh_weather_internal()
@@ -1081,19 +1702,16 @@ def get_all_weather(force: bool = False):
     weather_results = {}
     timestamps = []
     
-    hits = 0
-    misses = 0
+    hit_count = 0
     for loc in locations:
         res, is_hit = _get_weather_cached(loc, force)
         weather_results[loc] = res
         if res.get('last_updated'):
             timestamps.append(res.get('last_updated'))
         if is_hit:
-            hits += 1
-        else:
-            misses += 1
+            hit_count += 1
             
-    if misses == 0:
+    if hit_count == len(locations):
         increment_metric("cache_hits")
     else:
         increment_metric("cache_misses")
@@ -1104,26 +1722,24 @@ def get_all_weather(force: bool = False):
     }
 
 @app.get("/launch_details/{launch_id}")
-def get_launch_details(launch_id: str):
-    increment_metric("total_requests")
-    res = fetch_launch_details(launch_id)
-    if res:
-        increment_metric("cache_misses") # Details are always a fresh fetch from LL API
-    else:
-        increment_metric("cache_misses")
-    return res
+def get_launch_details(launch_id: str, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
+    increment_metric("cache_misses") # Detailed fetch is always a direct API call/miss in this impl
+    return fetch_launch_details(launch_id)
 
 @app.get("/external_narratives")
-def get_all_narratives():
-    increment_metric("total_requests")
-    res = fetch_external_narratives()
-    increment_metric("cache_misses") # External API fetch is a miss from our cache
-    return {"descriptions": res}
+def get_all_narratives(internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
+    increment_metric("cache_misses") # This endpoint always fetches from external source
+    return {"descriptions": fetch_external_narratives()}
 
 @app.get("/recent_launches_narratives")
-def get_narratives(force: bool = False):
+def get_narratives(force: bool = False, internal: bool = False):
     """Serve from cache only (timer-based refresh)."""
-    increment_metric("total_requests")
+    if not internal:
+        increment_metric("total_requests")
     
     if force:
         increment_metric("cache_misses")
@@ -1150,10 +1766,37 @@ def get_narratives(force: bool = False):
     return {"descriptions": [], "last_updated": None}
 
 @app.get("/metrics")
-def get_app_metrics(range: str = "1h"):
+def get_app_metrics(range: str = "1h", internal: bool = False):
     """Endpoint to fetch application metrics."""
-    record_snapshot()
+    if not internal:
+        record_snapshot()
     return get_metrics(range_type=range)
+
+@app.post("/reset_metrics")
+def reset_app_metrics():
+    """Endpoint to reset all metrics and history."""
+    global _local_metrics, _local_metrics_history, _last_snapshot_time
+
+    # Reset in-memory
+    _local_metrics = {
+        "total_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "api_calls": 0
+    }
+    _local_metrics_history = []
+    _last_snapshot_time = 0
+
+    # Reset Redis
+    if r:
+        try:
+            r.delete(METRICS_KEY)
+            r.delete(METRICS_HISTORY_KEY)
+        except Exception as e:
+            print(f"Redis error in reset_app_metrics: {e}")
+            return {"status": "Error", "message": str(e)}
+
+    return {"status": "Success", "message": "All metrics and history have been reset."}
 
 @app.get("/seed_status")
 def get_seed_status():
@@ -1302,13 +1945,19 @@ def dashboard(request: Request):
         <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
             <div>
                 <h2 class="text-2xl font-bold tracking-tight">System Metrics</h2>
-                <p class="text-slate-400 text-sm">Real-time performance and API usage tracking.</p>
+                <p class="text-slate-400 text-sm">Real-time performance and absolute API usage tracking.</p>
             </div>
-            <div class="flex bg-slate-900 border border-slate-800 p-1 rounded-xl">
-                <button onclick="changeRange('1h')" id="range-1h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all range-active">1h</button>
-                <button onclick="changeRange('24h')" id="range-24h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">24h</button>
-                <button onclick="changeRange('7d')" id="range-7d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">7d</button>
-                <button onclick="changeRange('30d')" id="range-30d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">30d</button>
+            <div class="flex flex-col sm:flex-row gap-3">
+                <div class="flex bg-slate-900 border border-slate-800 p-1 rounded-xl">
+                    <button onclick="changeRange('1h')" id="range-1h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all range-active">1h</button>
+                    <button onclick="changeRange('24h')" id="range-24h" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">24h</button>
+                    <button onclick="changeRange('7d')" id="range-7d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">7d</button>
+                    <button onclick="changeRange('30d')" id="range-30d" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all text-slate-400 hover:text-slate-200">30d</button>
+                </div>
+                <button onclick="resetMetrics()" class="flex items-center justify-center gap-2 px-4 py-1.5 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 rounded-xl text-red-400 text-sm font-bold transition-all" title="Reset all metrics and history">
+                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                    Reset
+                </button>
             </div>
         </div>
 
@@ -1615,7 +2264,7 @@ def dashboard(request: Request):
             if (!contentEl) return;
             
             try {
-                const response = await fetch('/launch_raw/' + id);
+                const response = await fetch('/launch_raw/' + id + '?internal=true');
                 const rawData = await response.json();
                 
                 if (rawData.error) throw new Error(rawData.error);
@@ -1763,18 +2412,41 @@ def dashboard(request: Request):
             currentRange = range;
             ['1h', '24h', '7d', '30d'].forEach(r => {
                 const btn = document.getElementById(`range-${r}`);
-                if (r === range) {
-                    btn.classList.add('range-active');
-                    btn.classList.remove('text-slate-400', 'hover:text-slate-200');
-                    btn.classList.add('text-white');
-                } else {
-                    btn.classList.remove('range-active', 'text-white');
-                    btn.classList.add('text-slate-400', 'hover:text-slate-200');
+                if (btn) {
+                    if (r === range) {
+                        btn.classList.add('range-active');
+                        btn.classList.remove('text-slate-400', 'hover:text-slate-200');
+                        btn.classList.add('text-white');
+                    } else {
+                        btn.classList.remove('range-active', 'text-white');
+                        btn.classList.add('text-slate-400', 'hover:text-slate-200');
+                    }
                 }
             });
             fetchMetrics();
             // Reset metrics timer
             nextRefresh.metrics = Date.now() + refreshIntervals.metrics * 1000;
+        }
+
+        async function resetMetrics() {
+            if (!confirm('Are you sure you want to reset all metrics and history? This cannot be undone.')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/reset_metrics', { method: 'POST' });
+                const result = await response.json();
+                if (result.status === 'Success') {
+                    // Force refresh metrics immediately
+                    fetchMetrics();
+                    alert('Metrics have been reset successfully.');
+                } else {
+                    alert('Error: ' + result.message);
+                }
+            } catch (error) {
+                console.error('Error resetting metrics:', error);
+                alert('Failed to reset metrics. See console for details.');
+            }
         }
 
         function showTab(tab) {
@@ -1794,20 +2466,22 @@ def dashboard(request: Request):
 
         async function fetchMetrics() {
             try {
-                const response = await fetch(`/metrics?range=${currentRange}`);
+                const response = await fetch(`/metrics?range=${currentRange}&internal=true`);
                 const data = await response.json();
                 
                 const current = data.current || {};
+                const rangeStats = data.range_stats || {};
                 const history = data.history || [];
-                
+        
+                // Use live absolute totals for the main metrics
                 const total = current.total_requests || 0;
                 const hits = current.cache_hits || 0;
                 const apiCalls = current.api_calls || 0;
-                
+        
                 document.getElementById('metric-total-requests').textContent = total.toLocaleString();
                 document.getElementById('metric-cache-hits').textContent = hits.toLocaleString();
                 document.getElementById('metric-api-calls').textContent = apiCalls.toLocaleString();
-                
+        
                 const efficiency = total > 0 ? Math.round((hits / total) * 100) : 0;
                 document.getElementById('metric-efficiency').textContent = efficiency + '%';
 
@@ -1934,7 +2608,7 @@ def dashboard(request: Request):
 
         async function fetchNarratives(force = false) {
             try {
-                const url = force ? '/recent_launches_narratives?force=true' : '/recent_launches_narratives';
+                const url = force ? '/recent_launches_narratives?force=true&internal=true' : '/recent_launches_narratives?internal=true';
                 const response = await fetch(url);
                 const data = await response.json();
                 const list = document.getElementById('narratives-list');
@@ -1977,7 +2651,7 @@ def dashboard(request: Request):
             const upList = document.getElementById('upcoming-launches-list');
             
             try {
-                const url = force ? '/launches_slim?force=true' : '/launches_slim';
+                const url = force ? '/launches_slim?force=true&internal=true' : '/launches_slim?internal=true';
                 const response = await fetch(url);
                 const data = await response.json();
                 
@@ -2268,7 +2942,7 @@ def dashboard(request: Request):
             });
             
             try {
-                const url = force ? `/weather_all?force=true` : `/weather_all`;
+                const url = force ? `/weather_all?force=true&internal=true` : `/weather_all?internal=true`;
                 const response = await fetch(url);
                 const data = await response.json();
                 lastWeatherData = data.weather;
