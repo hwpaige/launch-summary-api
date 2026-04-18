@@ -241,6 +241,33 @@ Manually triggers the API to poll for new launches and generate new narratives u
 }
 ```
 
+### 10. Spotify Auth Relay
+Allows this API to relay Spotify OAuth callback results to remote dashboard/device clients.
+
+*   **Callback Endpoint:** `GET /spotify/callback`
+    *   Called by your Spotify app redirect URI.
+    *   Reads query params: `code`, `state`, `error`.
+    *   Stores `{code,state,error,ts}` by state with short TTL (default 300 seconds).
+    *   Returns simple HTML confirming success/failure and that the page can be closed.
+*   **Poll Endpoint:** `GET /spotify/oauth-result?state=...`
+    *   Requires header `X-Relay-Key`.
+    *   Optional header `X-Device-Id` for cleaner per-device rate limiting.
+    *   Returns `{"pending": true}` if callback data has not arrived.
+    *   Returns the stored payload once, then deletes it (one-time consume).
+*   **Security behavior:**
+    *   High-entropy state validation (minimum length + safe characters).
+    *   HTTPS-only enforcement for relay endpoints (configurable).
+    *   Poll rate limit defaults to ~1 request/second per device+state.
+
+**Relay Environment Variables**
+
+*   `SPOTIFY_RELAY_KEY` (required for `/spotify/oauth-result`)
+*   `SPOTIFY_RELAY_TTL_SECONDS` (optional, default `300`, clamped to `120-600`)
+*   `SPOTIFY_RELAY_STATE_MIN_LEN` (optional, default `24`)
+*   `SPOTIFY_RELAY_REQUIRE_HTTPS` (optional, default `true`)
+*   `SPOTIFY_RELAY_POLL_WINDOW_SECONDS` (optional, default `1`)
+*   `SPOTIFY_RELAY_POLL_MAX_REQUESTS` (optional, default `1`)
+
 ---
 
 ## Interactive Dashboard

@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 import requests
 import ast
 import re
@@ -109,6 +109,19 @@ CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
+
+# Spotify relay config
+SPOTIFY_RELAY_KEY = os.getenv("SPOTIFY_RELAY_KEY", "")
+SPOTIFY_RELAY_TTL_SECONDS = max(120, min(600, int(os.getenv("SPOTIFY_RELAY_TTL_SECONDS", "300"))))
+SPOTIFY_RELAY_STATE_MIN_LEN = int(os.getenv("SPOTIFY_RELAY_STATE_MIN_LEN", "24"))
+SPOTIFY_RELAY_REQUIRE_HTTPS = os.getenv("SPOTIFY_RELAY_REQUIRE_HTTPS", "true").strip().lower() in {"1", "true", "yes", "on"}
+SPOTIFY_RELAY_POLL_WINDOW_SECONDS = max(1, int(os.getenv("SPOTIFY_RELAY_POLL_WINDOW_SECONDS", "1")))
+SPOTIFY_RELAY_POLL_MAX_REQUESTS = max(1, int(os.getenv("SPOTIFY_RELAY_POLL_MAX_REQUESTS", "1")))
+SPOTIFY_RELAY_STATE_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+_local_spotify_relay = {}
+_local_spotify_rate_limits = {}
+_spotify_relay_lock = threading.Lock()
 
 # Reliable weather stations for key launch sites (prioritized)
 METAR_STATIONS = {
@@ -1570,7 +1583,138 @@ def refresh_weather_internal():
         "last_updated": min(timestamps) if timestamps else datetime.now(timezone.utc).isoformat()
     }
 
+def _spotify_state_key(state: str) -> str:
+    return f"spotify:oauth:{state}"
+
+def _spotify_rate_limit_key(device_key: str) -> str:
+    return f"spotify:oauth:poll:{device_key}"
+
+def _is_valid_spotify_state(state: str) -> bool:
+    if not state or len(state) < SPOTIFY_RELAY_STATE_MIN_LEN:
+        return False
+    return bool(SPOTIFY_RELAY_STATE_RE.fullmatch(state))
+
+def _is_https_request(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    return forwarded_proto.split(",")[0].strip().lower() == "https"
+
+def _set_spotify_relay_payload(state: str, payload: dict):
+    if r:
+        try:
+            r.setex(_spotify_state_key(state), SPOTIFY_RELAY_TTL_SECONDS, json.dumps(payload))
+            return
+        except Exception as e:
+            print(f"Redis write error for spotify relay state: {e}")
+
+    with _spotify_relay_lock:
+        _local_spotify_relay[state] = {
+            "payload": payload,
+            "expiry": int(time.time()) + SPOTIFY_RELAY_TTL_SECONDS
+        }
+
+def _consume_spotify_relay_payload(state: str):
+    if r:
+        try:
+            # Atomic get-and-delete for one-time consume across instances.
+            raw = r.eval(
+                "local v=redis.call('GET', KEYS[1]); if v then redis.call('DEL', KEYS[1]); end; return v",
+                1,
+                _spotify_state_key(state)
+            )
+            if not raw:
+                return None
+            return json.loads(raw)
+        except Exception as e:
+            print(f"Redis consume error for spotify relay state: {e}")
+            return None
+
+    now = int(time.time())
+    with _spotify_relay_lock:
+        item = _local_spotify_relay.pop(state, None)
+        if not item:
+            return None
+        if item.get("expiry", 0) <= now:
+            return None
+        return item.get("payload")
+
+def _is_spotify_poll_rate_limited(device_key: str) -> bool:
+    if r:
+        try:
+            key = _spotify_rate_limit_key(device_key)
+            count = r.incr(key)
+            if count == 1:
+                r.expire(key, SPOTIFY_RELAY_POLL_WINDOW_SECONDS)
+            return count > SPOTIFY_RELAY_POLL_MAX_REQUESTS
+        except Exception as e:
+            print(f"Redis rate-limit error for spotify relay poll: {e}")
+            return False
+
+    now = int(time.time())
+    with _spotify_relay_lock:
+        start, count = _local_spotify_rate_limits.get(device_key, (now, 0))
+        if now - start >= SPOTIFY_RELAY_POLL_WINDOW_SECONDS:
+            start, count = now, 0
+        count += 1
+        _local_spotify_rate_limits[device_key] = (start, count)
+        return count > SPOTIFY_RELAY_POLL_MAX_REQUESTS
+
 # --- New Endpoints ---
+
+@app.get("/spotify/callback", response_class=HTMLResponse)
+def spotify_callback(request: Request):
+    if SPOTIFY_RELAY_REQUIRE_HTTPS and not _is_https_request(request):
+        raise HTTPException(status_code=400, detail="https_required")
+
+    code = request.query_params.get("code", "")
+    state = request.query_params.get("state", "")
+    error = request.query_params.get("error", "")
+
+    if not _is_valid_spotify_state(state):
+        return HTMLResponse("<h3>Invalid or missing state</h3>", status_code=400)
+
+    payload = {
+        "code": code,
+        "state": state,
+        "error": error,
+        "ts": int(time.time())
+    }
+    _set_spotify_relay_payload(state, payload)
+
+    ok = bool(code) and not error
+    html = (
+        "<html><head><meta charset='utf-8'><title>Spotify Login</title></head>"
+        "<body style='font-family:Arial,sans-serif;background:#111;color:#eee;padding:24px;'>"
+        + ("<h3>Spotify connected.</h3><p>You can close this page.</p>" if ok
+           else "<h3>Spotify login failed.</h3><p>You can close this page and try again.</p>")
+        + "</body></html>"
+    )
+    return HTMLResponse(html, status_code=200)
+
+@app.get("/spotify/oauth-result")
+def spotify_oauth_result(
+    request: Request,
+    state: str = "",
+    x_relay_key: str = Header(default=""),
+    x_device_id: str = Header(default="")
+):
+    if SPOTIFY_RELAY_REQUIRE_HTTPS and not _is_https_request(request):
+        raise HTTPException(status_code=400, detail="https_required")
+    if not SPOTIFY_RELAY_KEY or x_relay_key != SPOTIFY_RELAY_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if not _is_valid_spotify_state(state):
+        raise HTTPException(status_code=400, detail="invalid_or_missing_state")
+
+    client_ip = request.client.host if request.client else "unknown"
+    device_scope = x_device_id.strip() or client_ip
+    if _is_spotify_poll_rate_limited(f"{device_scope}:{state}"):
+        raise HTTPException(status_code=429, detail="rate_limited")
+
+    payload = _consume_spotify_relay_payload(state)
+    if not payload:
+        return JSONResponse({"pending": True})
+    return JSONResponse(payload)
 
 @app.get("/launches")
 def get_launches(force: bool = False, internal: bool = False):
