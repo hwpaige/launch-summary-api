@@ -19,11 +19,12 @@ load_dotenv()  # Load environment variables from .env if present
 
 app = FastAPI()
 
+
 # Redis Configuration for persistence across Heroku builds
 def get_redis_client():
     # List of potential Redis environment variables used by various Heroku add-ons
     redis_env_vars = ["REDIS_URL", "REDISCLOUD_URL", "REDISTOGO_URL"]
-    
+
     # Also check for HEROKU_REDIS_*_URL
     for key in os.environ:
         if key.startswith("HEROKU_REDIS_") and key.endswith("_URL"):
@@ -43,11 +44,13 @@ def get_redis_client():
                 return client
             except Exception as e:
                 print(f"Failed to connect to Redis via {var}: {e}")
-    
+
     print("No Redis instance found or connection failed. Using in-memory fallback (non-persistent).")
     return None
 
+
 r = get_redis_client()
+
 
 def set_cached_data(key, data, ttl=None):
     """Set data in Redis with compression and better error handling."""
@@ -67,6 +70,7 @@ def set_cached_data(key, data, ttl=None):
         print(f"Redis write error for {key}: {e}")
         return False
 
+
 def get_cached_data(key):
     """Get data from Redis with decompression support."""
     if not r:
@@ -75,7 +79,7 @@ def get_cached_data(key):
         data = r.get(key)
         if not data:
             return None
-        
+
         # Try to decompress (it will be base64 encoded string)
         try:
             decoded = base64.b64decode(data)
@@ -90,6 +94,7 @@ def get_cached_data(key):
     except Exception as e:
         print(f"Redis read error for {key}: {e}")
         return None
+
 
 # In-memory storage fallback (used only if Redis is unavailable)
 _local_cache = {
@@ -111,10 +116,12 @@ METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
 
 # Spotify relay config
-SPOTIFY_RELAY_KEY = os.getenv("SPOTIFY_RELAY_KEY", "")
+SPOTIFY_RELAY_KEY_DEFAULT = "spxrelay_Tp4r8Qm2Vz6Ld1Jx9Nc7Hk5Bw3Ys0FaE"
+SPOTIFY_RELAY_KEY = (os.getenv("SPOTIFY_RELAY_KEY") or SPOTIFY_RELAY_KEY_DEFAULT).strip()
 SPOTIFY_RELAY_TTL_SECONDS = max(120, min(600, int(os.getenv("SPOTIFY_RELAY_TTL_SECONDS", "300"))))
 SPOTIFY_RELAY_STATE_MIN_LEN = int(os.getenv("SPOTIFY_RELAY_STATE_MIN_LEN", "24"))
-SPOTIFY_RELAY_REQUIRE_HTTPS = os.getenv("SPOTIFY_RELAY_REQUIRE_HTTPS", "true").strip().lower() in {"1", "true", "yes", "on"}
+SPOTIFY_RELAY_REQUIRE_HTTPS = os.getenv("SPOTIFY_RELAY_REQUIRE_HTTPS", "true").strip().lower() in {"1", "true", "yes",
+                                                                                                   "on"}
 SPOTIFY_RELAY_POLL_WINDOW_SECONDS = max(1, int(os.getenv("SPOTIFY_RELAY_POLL_WINDOW_SECONDS", "1")))
 SPOTIFY_RELAY_POLL_MAX_REQUESTS = max(1, int(os.getenv("SPOTIFY_RELAY_POLL_MAX_REQUESTS", "1")))
 SPOTIFY_RELAY_STATE_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
@@ -138,27 +145,32 @@ LOCATION_COORDS = {
     'Cape': {'lat': 28.562, 'lon': -80.577},
     'Hawthorne': {'lat': 33.921, 'lon': -118.332}
 }
-HISTORY_LIMIT = 43200 # 30 days at 1 minute intervals
+HISTORY_LIMIT = 43200  # 30 days at 1 minute intervals
 SEEDING_STATUS_KEY = "seeding_status_v2"
 SEEDING_STOP_SIGNAL_KEY = "seeding_stop_signal_v2"
 _last_snapshot_time = 0
+
 
 # Trajectory Helpers and Cache
 class Profiler:
     def mark(self, msg):
         print(f"[PROFILER] {msg}")
 
+
 class Logger:
     def info(self, msg):
         print(f"[INFO] {msg}")
+
     def warning(self, msg):
         print(f"[WARNING] {msg}")
+
 
 profiler = Profiler()
 logger = Logger()
 
 _TRAJECTORY_DATA_CACHE = None
 TRAJECTORY_CACHE_FILE = "trajectory_cache.json"
+
 
 def load_cache_from_file(filename):
     """Load cache from Redis instead of file if possible, or fallback to file."""
@@ -175,6 +187,7 @@ def load_cache_from_file(filename):
             print(f"Error loading cache file: {e}")
     return {"data": {}}
 
+
 def save_cache_to_file(filename, data, updated_at=None):
     """Save cache to Redis and local file."""
     if r:
@@ -186,15 +199,17 @@ def save_cache_to_file(filename, data, updated_at=None):
     except Exception as e:
         print(f"Error saving cache file: {e}")
 
+
 def compute_orbit_radius(orbit_label):
     """Compute orbital radius based on orbit type."""
     label = (orbit_label or '').lower()
-    EARTH_RADIUS = 1.0 # Normalized
+    EARTH_RADIUS = 1.0  # Normalized
     if 'gto' in label:
-        return 1.15 # Geostationary Transfer
+        return 1.15  # Geostationary Transfer
     if 'suborbital' in label:
         return 1.05
-    return 1.08 # Standard LEO
+    return 1.08  # Standard LEO
+
 
 def _ang_dist_deg(p1, p2):
     """Calculate angular distance between two points in degrees."""
@@ -202,9 +217,10 @@ def _ang_dist_deg(p1, p2):
     lat2, lon2 = math.radians(p2['lat']), math.radians(p2['lon'])
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1-a)))
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1 - a)))
     return math.degrees(c)
+
 
 def get_destination_point(lat, lon, distance_km, bearing_deg):
     """Calculate destination point given start point, distance, and bearing."""
@@ -212,18 +228,21 @@ def get_destination_point(lat, lon, distance_km, bearing_deg):
     brng = math.radians(bearing_deg)
     lat1 = math.radians(lat)
     lon1 = math.radians(lon)
-    lat2 = math.asin(math.sin(lat1) * math.cos(distance_km/R) +
-                     math.cos(lat1) * math.sin(distance_km/R) * math.cos(brng))
-    lon2 = lon1 + math.atan2(math.sin(brng) * math.sin(distance_km/R) * math.cos(lat1),
-                             math.cos(distance_km/R) - math.sin(lat1) * math.sin(lat2))
+    lat2 = math.asin(math.sin(lat1) * math.cos(distance_km / R) +
+                     math.cos(lat1) * math.sin(distance_km / R) * math.cos(brng))
+    lon2 = lon1 + math.atan2(math.sin(brng) * math.sin(distance_km / R) * math.cos(lat1),
+                             math.cos(distance_km / R) - math.sin(lat1) * math.sin(lat2))
     return {'lat': math.degrees(lat2), 'lon': (math.degrees(lon2) + 180) % 360 - 180}
+
 
 def generate_ground_track(start_point, inclination_deg, num_points=2000, descending=False, duration_min=90):
     """Generate a ground track accounting for Earth's rotation."""
-    lat0 = float(start_point['lat']); lon0 = float(start_point['lon'])
+    lat0 = float(start_point['lat']);
+    lon0 = float(start_point['lon'])
     eff_i_deg = max(0.1, min(179.9, abs(inclination_deg)))
     i_rad = math.radians(eff_i_deg)
-    lat0_rad = math.radians(lat0); lon0_rad = math.radians(lon0)
+    lat0_rad = math.radians(lat0);
+    lon0_rad = math.radians(lon0)
 
     x0 = math.cos(lat0_rad) * math.cos(lon0_rad)
     y0 = math.cos(lat0_rad) * math.sin(lon0_rad)
@@ -236,8 +255,10 @@ def generate_ground_track(start_point, inclination_deg, num_points=2000, descend
 
     Omega = math.atan2(y0, x0) - math.atan2(math.sin(u0) * math.cos(i_rad), math.cos(u0))
 
-    cosO = math.cos(Omega); sinO = math.sin(Omega)
-    cosi = math.cos(i_rad); sili = math.sin(i_rad)
+    cosO = math.cos(Omega);
+    sinO = math.sin(Omega)
+    cosi = math.cos(i_rad);
+    sili = math.sin(i_rad)
 
     points = []
     omega_e = 2 * math.pi / 86400.0
@@ -248,7 +269,8 @@ def generate_ground_track(start_point, inclination_deg, num_points=2000, descend
         t_sec = t_frac * period_sec
         u = u0 + (2.0 * math.pi * t_frac)
 
-        cu = math.cos(u); su = math.sin(u)
+        cu = math.cos(u);
+        su = math.sin(u)
         xo = cu
         yo = su * cosi
         zo = su * sili
@@ -265,6 +287,7 @@ def generate_ground_track(start_point, inclination_deg, num_points=2000, descend
 
         points.append({'lat': lat, 'lon': lon})
     return points
+
 
 def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     """
@@ -360,7 +383,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             if 'iss' in label:
                 return 51.6
             if norm_orbit == 'LEO-Polar' or 'sso' in label or 'sun-synchronous' in label:
-                return 97.5 # Better average for SSO
+                return 97.5  # Better average for SSO
             if norm_orbit == 'LEO-Equatorial':
                 base = abs(site_lat)
                 return max(20.0, min(60.0, base + 0.5))
@@ -381,7 +404,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     ORBIT_CACHE_VERSION = 'v240-accurate-groundtrack'
     landing_type = next_launch.get('landing_type')
     landing_loc = next_launch.get('landing_location')
-    cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl,1)}:{landing_type}:{landing_loc}"
+    cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl, 1)}:{landing_type}:{landing_loc}"
 
     global _TRAJECTORY_DATA_CACHE
     if _TRAJECTORY_DATA_CACHE is None:
@@ -412,7 +435,6 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     traj_cache = _TRAJECTORY_DATA_CACHE
     logger.info(f"Trajectory cache miss for {cache_key}; generating new trajectory")
 
-
     def generate_curved_trajectory(start_point, end_point, num_points, orbit_type='default', end_bearing_deg=None):
         points = []
         start_lat = start_point['lat']
@@ -421,12 +443,14 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         end_lon = end_point['lon']
 
         if end_bearing_deg is not None:
-            lat1 = math.radians(start_lat); lon1 = math.radians(start_lon)
-            lat2 = math.radians(end_lat);   lon2 = math.radians(end_lon)
+            lat1 = math.radians(start_lat);
+            lon1 = math.radians(start_lon)
+            lat2 = math.radians(end_lat);
+            lon2 = math.radians(end_lon)
             dlat = lat2 - lat1
             dlon = lon2 - lon1
-            a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1-a)))
+            a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1 - a)))
             ang_deg = math.degrees(c)
             # Tighter control point distance (L) to avoid "flat" segments near insertion
             L = min(15.0, max(3.0, ang_deg / 4.0))
@@ -446,7 +470,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
 
             if orbit_type == 'polar':
                 control_lat = max(-85.0, mid_lat - offset)
-                control_lon = mid_lon - offset/2
+                control_lon = mid_lon - offset / 2
             elif orbit_type == 'equatorial':
                 # Aim more towards equator
                 target_equator_lat = 0
@@ -457,20 +481,19 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
                 control_lon = mid_lon + offset * 2
             elif orbit_type == 'suborbital':
                 # Suborbital/Booster return needs a tighter arc
-                control_lat = mid_lat + offset/4
-                control_lon = mid_lon + offset/4
+                control_lat = mid_lat + offset / 4
+                control_lon = mid_lon + offset / 4
             else:
                 control_lat = mid_lat + offset
                 control_lon = mid_lon + offset * 1.5
 
         for i in range(num_points + 1):
             t = i / num_points
-            lat = (1-t)**2 * start_lat + 2*(1-t)*t * control_lat + t**2 * end_lat
-            lon = (1-t)**2 * start_lon + 2*(1-t)*t * control_lon + t**2 * end_lon
+            lat = (1 - t) ** 2 * start_lat + 2 * (1 - t) * t * control_lat + t ** 2 * end_lat
+            lon = (1 - t) ** 2 * start_lon + 2 * (1 - t) * t * control_lon + t ** 2 * end_lon
             lon = (lon + 180) % 360 - 180
             points.append({'lat': lat, 'lon': lon})
         return points
-
 
     # Main generation
     target_r = compute_orbit_radius(orbit)
@@ -491,7 +514,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
 
     # The orbit path is the REMAINING part of the Master Path to avoid overlap
     if normalized_orbit != 'Suborbital':
-        orbit_path = [p.copy() for p in master_path[traj_len-1:]]
+        orbit_path = [p.copy() for p in master_path[traj_len - 1:]]
     else:
         orbit_path = []
 
@@ -522,14 +545,15 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             combined_landing_info = f"{l_type} {l_loc}"
 
             # Expanded detection for ASDS and RTLS
-            asds_keywords = ['ASDS', 'DRONE', 'SHIP', 'OCISLY', 'JRTI', 'ASOG', 'GRAVITAS', 'INSTRUCTIONS', 'STILL LOVE YOU']
+            asds_keywords = ['ASDS', 'DRONE', 'SHIP', 'OCISLY', 'JRTI', 'ASOG', 'GRAVITAS', 'INSTRUCTIONS',
+                             'STILL LOVE YOU']
             rtls_keywords = ['RTLS', 'LAUNCH SITE', 'CATCH', 'TOWER', 'LZ', 'LANDING ZONE']
 
             if any(k in combined_landing_info for k in asds_keywords):
                 # Droneship landing: ~600-700km downrange
-                dist_frac = 0.016 # ~640km
+                dist_frac = 0.016  # ~640km
                 if normalized_orbit == 'GTO':
-                    dist_frac = 0.018 # ~720km
+                    dist_frac = 0.018  # ~720km
 
                 landing_idx = min(len(master_path) - 1, int(len(master_path) * dist_frac))
                 landing_point = master_path[landing_idx]
@@ -543,7 +567,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
                     p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
 
                 booster_trajectory = return_part
-                sep_idx = 0 # Indicates start of booster_trajectory in visual tools
+                sep_idx = 0  # Indicates start of booster_trajectory in visual tools
                 logger.info(f"Generated accurate ASDS booster trajectory (dist: ~650km)")
             elif any(k in combined_landing_info for k in rtls_keywords):
                 # RTLS/Catch: returns to launch site
@@ -607,8 +631,10 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
 
     return result
 
+
 _local_seeding_status = {"is_running": False, "last_status": "Idle", "total_pulled": 0, "oldest_launch": None}
 _stop_seeding_requested = False
+
 
 def update_seeding_status(is_running, last_status, total_pulled=0, oldest_launch=None):
     """Update the seeding status in Redis and memory."""
@@ -628,6 +654,7 @@ def update_seeding_status(is_running, last_status, total_pulled=0, oldest_launch
             print(f"Redis error in update_seeding_status: {e}")
     return status
 
+
 def reset_stuck_seeding():
     """Reset seeding status if it's marked as running but the app just started."""
     if r:
@@ -637,9 +664,11 @@ def reset_stuck_seeding():
                 status = json.loads(data)
                 if status.get("is_running"):
                     print("Detected stuck seeding status at startup. Resetting.")
-                    update_seeding_status(False, "Interrupted (App Restart)", status.get("total_pulled", 0), status.get("oldest_launch"))
+                    update_seeding_status(False, "Interrupted (App Restart)", status.get("total_pulled", 0),
+                                          status.get("oldest_launch"))
         except Exception as e:
             print(f"Error resetting stuck seeding: {e}")
+
 
 def increment_metric(field):
     """Increment a metric in Redis or memory."""
@@ -649,35 +678,37 @@ def increment_metric(field):
             return
         except Exception as e:
             print(f"Redis error in increment_metric: {e}")
-    
+
     # Fallback to in-memory
     if field in _local_metrics:
         _local_metrics[field] += 1
+
 
 def record_snapshot():
     """Record a snapshot of current metrics for historical tracking."""
     global _last_snapshot_time
     now = datetime.now(timezone.utc).timestamp()
-    if now - _last_snapshot_time < 55: # Throttle to ~1m
+    if now - _last_snapshot_time < 55:  # Throttle to ~1m
         return
     _last_snapshot_time = now
-    
+
     current_metrics = get_metrics(include_history=False)
     snapshot = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "data": current_metrics
     }
-    
+
     if r:
         try:
             r.lpush(METRICS_HISTORY_KEY, json.dumps(snapshot))
             r.ltrim(METRICS_HISTORY_KEY, 0, HISTORY_LIMIT - 1)
         except Exception as e:
             print(f"Redis error in record_snapshot: {e}")
-    
+
     _local_metrics_history.append(snapshot)
     if len(_local_metrics_history) > HISTORY_LIMIT:
         _local_metrics_history.pop(0)
+
 
 @app.post("/reset_metrics")
 def reset_app_metrics():
@@ -705,6 +736,7 @@ def reset_app_metrics():
 
     return {"status": "Success", "message": "All metrics and history have been reset."}
 
+
 def get_metrics(include_history=True, range_type="1h"):
     """Retrieve metrics from Redis or memory."""
     current = {
@@ -713,7 +745,7 @@ def get_metrics(include_history=True, range_type="1h"):
         "cache_misses": 0,
         "api_calls": 0
     }
-    
+
     if r:
         try:
             data = r.hgetall(METRICS_KEY)
@@ -723,21 +755,21 @@ def get_metrics(include_history=True, range_type="1h"):
             print(f"Redis error in get_metrics: {e}")
     else:
         current = _local_metrics.copy()
-        
+
     if not include_history:
         return current
-        
+
     history = []
     if r:
         try:
             history_data = r.lrange(METRICS_HISTORY_KEY, 0, -1)
             history = [json.loads(s) for s in history_data]
-            history.reverse() # Oldest first for charting
+            history.reverse()  # Oldest first for charting
         except Exception as e:
             print(f"Redis error fetching history: {e}")
     else:
         history = _local_metrics_history.copy()
-        
+
     # Filter by range
     now = datetime.now(timezone.utc)
     if range_type == "1h":
@@ -779,25 +811,27 @@ def get_metrics(include_history=True, range_type="1h"):
             t1 = datetime.fromisoformat(first_h['timestamp'].replace('Z', '+00:00'))
             t2 = datetime.fromisoformat(last_h['timestamp'].replace('Z', '+00:00'))
             duration_hours = (t2 - t1).total_seconds() / 3600
-            if duration_hours > 0.1: # At least 6 mins of data
+            if duration_hours > 0.1:  # At least 6 mins of data
                 hits_diff = last_h['data']['total_requests'] - first_h['data']['total_requests']
                 hits_per_day = (hits_diff / duration_hours) * 24
-        except: pass
+        except:
+            pass
 
     # Downsample history for charting
     if range_type == "24h" and len(history) > 100:
-        history = history[::15] # ~15m intervals
+        history = history[::15]  # ~15m intervals
     elif range_type == "7d" and len(history) > 200:
-        history = history[::60] # ~1h intervals
+        history = history[::60]  # ~1h intervals
     elif range_type == "30d" and len(history) > 300:
-        history = history[::240] # ~4h intervals
+        history = history[::240]  # ~4h intervals
 
     return {
-        "current": current, 
+        "current": current,
         "range_stats": range_stats,
         "history": history,
         "hits_per_day": round(hits_per_day, 1)
     }
+
 
 def generate_narratives(existing_narratives=None):
     """Fetch launches and generate narratives using Grok, appending new ones only."""
@@ -816,9 +850,9 @@ def generate_narratives(existing_narratives=None):
     response = requests.get(url)
     if response.status_code != 200:
         raise ValueError(f"Failed to fetch launches: {response.status_code}")
-    
+
     data = response.json().get('results', [])
-    
+
     launches = []
     for launch in data:
         net_str = launch['net']
@@ -828,15 +862,15 @@ def generate_narratives(existing_narratives=None):
         except ValueError:
             # Fallback if the format is slightly different
             net_dt = datetime.strptime(net_str, "%Y-%m-%dT%H:%M:%SZ")
-            
+
         date_time = net_dt.strftime("%m/%d %H%M")
-        
+
         mission = launch['name']
         pad = launch['pad']['name']
         rocket = launch['rocket']['configuration']['name']
         orbit = launch.get('mission', {}).get('orbit', {}).get('name', 'Unknown')
         status = launch['status']['name']
-        
+
         launches.append({
             "date_time": date_time,
             "mission": mission,
@@ -845,7 +879,7 @@ def generate_narratives(existing_narratives=None):
             "orbit": orbit,
             "status": status
         })
-    
+
     if not launches:
         return existing_narratives if existing_narratives else []
 
@@ -857,9 +891,9 @@ def generate_narratives(existing_narratives=None):
             parts = narr.split(': ', 1)
             if parts:
                 existing_keys.add(parts[0])
-    
+
     new_launches = [l for l in launches if l['date_time'] not in existing_keys]
-    
+
     if existing_narratives and not new_launches:
         print("No new launches found. Cache is up to date.")
         return existing_narratives
@@ -867,12 +901,12 @@ def generate_narratives(existing_narratives=None):
     # If we have existing narratives, only process the new ones to append
     # If no cache exists, process all fetched launches
     launches_to_process = new_launches if existing_narratives else launches
-    
+
     launch_list = "\n".join([
         f"{l['date_time']}: {l['mission']} from {l['pad']}, {l['rocket']} to {l['orbit']}, status {l['status']}"
         for l in launches_to_process
     ])
-    
+
     prompt = f"""Generate a list of short news like descriptions for these SpaceX launches:
 {launch_list}
 
@@ -888,7 +922,7 @@ Examples:
 Format each as: month/day HHMM: description
 
 Output as a Python list assignment: launch_descriptions = [...]"""
-    
+
     try:
         headers = {
             "Authorization": f"Bearer {os.getenv('XAI_API_KEY')}",
@@ -903,17 +937,17 @@ Output as a Python list assignment: launch_descriptions = [...]"""
         response = requests.post("https://api.x.ai/v1/chat/completions", headers=headers, json=payload)
         if response.status_code != 200:
             raise ValueError(f"Grok API call failed: {response.status_code} - {response.text}")
-        
+
         data = response.json()
         generated_text = data['choices'][0]['message']['content']
         print(f"DEBUG: Raw Grok response: {generated_text}")
     except Exception as e:
         raise ValueError(f"Grok API call failed: {str(e)}")
-    
+
     try:
         # Robust extraction: find all strings that match the pattern "month/day HHMM: description"
         new_descriptions = re.findall(r'["\'](\d{1,2}/\d{1,2} \d{4}: .*?)["\']', generated_text)
-        
+
         if not new_descriptions:
             # Fallback for alternative formatting
             start_idx = generated_text.find('[')
@@ -924,15 +958,15 @@ Output as a Python list assignment: launch_descriptions = [...]"""
                     new_descriptions = ast.literal_eval(list_str)
                 except:
                     pass
-        
+
         if not new_descriptions:
             raise ValueError("No valid launch descriptions found in response")
-        
+
         if not isinstance(new_descriptions, list) or not all(isinstance(d, str) for d in new_descriptions):
             raise ValueError("Parsed content is not a list of strings")
-            
+
         print(f"Successfully generated {len(new_descriptions)} new narratives.")
-        
+
         if existing_narratives:
             # Prepend new ones and limit the total list size to the 5 most recent
             combined = new_descriptions + existing_narratives
@@ -940,14 +974,16 @@ Output as a Python list assignment: launch_descriptions = [...]"""
             # However, since we don't have the year in the string, a simple string sort is risky.
             # Prepending preserves the newest-first order from the API.
             return combined[:5]
-        
+
         return new_descriptions[:5]
     except Exception as e:
         raise ValueError(f"Failed to parse Grok response: {str(e)}")
 
+
 # --- Ported Fetch Functions from functions.py ---
 
 LL_API_KEY = os.getenv("LL_API_KEY", "9b91363961799d7f79aabe547ed0f7be914664dd")
+
 
 def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
     """Helper to parse raw API launch data into the dashboard's internal format."""
@@ -961,18 +997,19 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
             landing_location = landing.get('landing_location', {}).get('name')
             if not landing_location:
                 landing_location = landing.get('location', {}).get('name')
-    
+
     mission_data = launch.get('mission') or {}
-    
+
     # API v2.3.0 uses vid_urls, while v2.0.0 uses vidURLs
     raw_vid_urls = launch.get('vid_urls') or launch.get('vidURLs') or []
     vid_urls = raw_vid_urls if isinstance(raw_vid_urls, list) else []
-    
+
     return {
         'id': launch.get('id'),
         'mission': launch.get('name', 'Unknown'),
         'date': launch.get('net').split('T')[0] if launch.get('net') else 'TBD',
-        'time': launch.get('net').split('T')[1].split('Z')[0] if launch.get('net') and 'T' in launch.get('net') else 'TBD',
+        'time': launch.get('net').split('T')[1].split('Z')[0] if launch.get('net') and 'T' in launch.get(
+            'net') else 'TBD',
         'net': launch.get('net'),
         'status': launch.get('status', {}).get('name', 'Unknown'),
         'status_id': launch.get('status', {}).get('id'),
@@ -980,21 +1017,26 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'orbit': mission_data.get('orbit', {}).get('name', 'Unknown'),
         'pad': launch.get('pad', {}).get('name', 'Unknown'),
         'video_url': vid_urls[0].get('url', '') if vid_urls else '',
-        'x_video_url': next((v['url'] for v in vid_urls if v.get('url') and ('x.com' in v['url'].lower() or 'twitter.com' in v['url'].lower())), '') if vid_urls else '',
+        'x_video_url': next((v['url'] for v in vid_urls if
+                             v.get('url') and ('x.com' in v['url'].lower() or 'twitter.com' in v['url'].lower())),
+                            '') if vid_urls else '',
         'landing_type': landing_type,
         'landing_location': landing_location,
         'is_detailed': is_detailed,
         # New enriched fields for "ALL data" view
         'description': mission_data.get('description', ''),
-        'image': launch.get('image', '') if isinstance(launch.get('image'), str) else (launch.get('image', {}).get('url', '') if isinstance(launch.get('image'), dict) else ''),
+        'image': launch.get('image', '') if isinstance(launch.get('image'), str) else (
+            launch.get('image', {}).get('url', '') if isinstance(launch.get('image'), dict) else ''),
         'window_start': launch.get('window_start'),
         'window_end': launch.get('window_end'),
         'probability': launch.get('probability'),
         'holdreason': launch.get('holdreason'),
         'failreason': launch.get('failreason'),
         # Ensure every field returned by the API is available, but prune redundant URLs to save space
-        'all_data': {k: v for k, v in launch.items() if k not in ['vidURLs', 'infoURLs', 'vid_urls', 'info_urls', 'infographic']}
+        'all_data': {k: v for k, v in launch.items() if
+                     k not in ['vidURLs', 'infoURLs', 'vid_urls', 'info_urls', 'infographic']}
     }
+
 
 def fetch_launch_details(launch_id: str):
     """Fetch detailed information for a single launch to get vidURLs."""
@@ -1016,13 +1058,14 @@ def fetch_launch_details(launch_id: str):
         print(f"Failed to fetch launch details for {launch_id}: {e}")
         return None
 
+
 def fetch_launches(existing_previous=None, existing_upcoming=None):
     """Fetch SpaceX launch data (v2.3.0) using detailed mode to get all fields."""
     headers = {'Authorization': f'Token {LL_API_KEY}'}
-    
+
     combined_prev = existing_previous or []
     combined_up = existing_upcoming or []
-    
+
     # 1. Fetch Previous (Incremental)
     try:
         increment_metric("api_calls")
@@ -1031,7 +1074,7 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
         prev_response.raise_for_status()
         prev_data = prev_response.json().get('results', [])
         parsed_prev = [parse_launch_data(l, is_detailed=True) for l in prev_data]
-        
+
         if existing_previous:
             # Incremental update: Replace existing ones with fresh data if present in latest fetch
             new_ids = {l['id'] for l in parsed_prev if 'id' in l}
@@ -1053,7 +1096,7 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
         up_response = requests.get(up_url, headers=headers, timeout=15)
         up_response.raise_for_status()
         up_data = up_response.json().get('results', [])
-        
+
         parsed_up = [parse_launch_data(l, is_detailed=True) for l in up_data]
         # Filter out finished launches from upcoming list to satisfy user request
         # Status IDs: 3=Success, 4=Failure, 7=Partial Failure
@@ -1061,30 +1104,31 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
         combined_up = [l for l in parsed_up if l.get('status_id') not in [3, 4, 7]]
     except Exception as e:
         print(f"Error fetching upcoming launches: {e}")
-        
+
     return {
         'previous': combined_prev,
         'upcoming': combined_up
     }
 
+
 def seed_historical_launches():
     """Seed the historical launch cache by pulling increasingly older launches in batches of 5 until we hit the api limit."""
     print("Starting historical launch seeding...")
     cache_key = "launches_cache_v2"
-    
+
     # Get initial state
     existing_previous = []
     cached_data = get_cached_data(cache_key)
     if cached_data:
         existing_previous = cached_data.get('previous', [])
-    
+
     # Sort to find the actual oldest launch
     if existing_previous:
         existing_previous.sort(key=lambda x: x.get('net') or '', reverse=True)
         oldest_so_far = existing_previous[-1].get('net')
     else:
         oldest_so_far = None
-        
+
     total_so_far = len(existing_previous)
     update_seeding_status(True, "Starting batch fetch...", total_so_far, oldest_so_far)
 
@@ -1098,15 +1142,18 @@ def seed_historical_launches():
             try:
                 if r.get(SEEDING_STOP_SIGNAL_KEY) == "true":
                     stop_signal = True
-            except: pass
-            
+            except:
+                pass
+
         if stop_signal:
             print("Seeding: Stop signal received. Terminating.")
             update_seeding_status(False, "Stopped by user.", total_so_far, oldest_so_far)
             _stop_seeding_requested = False
             if r:
-                try: r.delete(SEEDING_STOP_SIGNAL_KEY)
-                except: pass
+                try:
+                    r.delete(SEEDING_STOP_SIGNAL_KEY)
+                except:
+                    pass
             break
 
         # Get current state from cache to determine where we are
@@ -1115,26 +1162,26 @@ def seed_historical_launches():
         if cached_data:
             existing_previous = cached_data.get('previous', [])
             upcoming = cached_data.get('upcoming', [])
-        
+
         if existing_previous:
             # Crucial: Always sort to ensure the last item is truly the oldest
             existing_previous.sort(key=lambda x: x.get('net') or '', reverse=True)
             oldest_so_far = existing_previous[-1].get('net')
         else:
             oldest_so_far = None
-        
+
         total_so_far = len(existing_previous)
 
         if total_so_far >= 2000:
             print(f"Seeding: Already at history limit ({total_so_far}). Stopping.")
             update_seeding_status(False, f"Complete. Hit history limit ({total_so_far}).", total_so_far, oldest_so_far)
             break
-        
+
         # Use date-based pagination for robustness against cache shifts
         status_msg = f"Fetching launches older than {oldest_so_far.split('T')[0] if oldest_so_far else 'now'}..."
         update_seeding_status(True, status_msg, total_so_far, oldest_so_far)
         print(f"Seeding: {status_msg}")
-        
+
         try:
             headers = {'Authorization': f'Token {LL_API_KEY}'}
             params = {
@@ -1150,27 +1197,27 @@ def seed_historical_launches():
             increment_metric("api_calls")
             url = 'https://ll.thespacedevs.com/2.3.0/launches/previous/'
             response = requests.get(url, headers=headers, params=params, timeout=15)
-            
+
             if response.status_code == 429:
                 print("Hit API rate limit (429) during seeding. Stopping for now.")
                 update_seeding_status(False, "Hit API rate limit (429).", total_so_far, oldest_so_far)
                 break
-                
+
             response.raise_for_status()
             data = response.json()
             results = data.get('results', [])
-            
+
             if not results:
                 print("No more historical launches found. Seeding complete.")
                 update_seeding_status(False, "Seeding complete. No more data.", total_so_far, oldest_so_far)
                 break
-                
+
             parsed_new = [parse_launch_data(l, is_detailed=True) for l in results]
-            
+
             # Filter out duplicates (possible if multiple launches have exact same timestamp)
             existing_ids = {l['id'] for l in existing_previous if 'id' in l}
             unique_new = [l for l in parsed_new if l.get('id') not in existing_ids]
-            
+
             if not unique_new and results:
                 print("Seeding: All fetched results are duplicates. Stopping.")
                 update_seeding_status(False, "Stopped to avoid duplicate loop.", total_so_far, oldest_so_far)
@@ -1178,10 +1225,10 @@ def seed_historical_launches():
 
             # Append older launches and maintain sorted order
             combined_prev = sorted(existing_previous + unique_new, key=lambda x: x.get('net') or '', reverse=True)
-            
+
             # Limit history to 2000 items for efficiency
             combined_prev = combined_prev[:2000]
-            
+
             # Update cache in Redis
             result = {
                 "upcoming": upcoming,
@@ -1189,15 +1236,15 @@ def seed_historical_launches():
                 "last_updated": datetime.now(timezone.utc).isoformat()
             }
             set_cached_data(cache_key, result)
-            
+
             total_so_far = len(combined_prev)
             oldest_so_far = combined_prev[-1].get('net')
             print(f"Added {len(unique_new)} historical launches. Total: {total_so_far}")
             update_seeding_status(True, f"Added {len(unique_new)} launches.", total_so_far, oldest_so_far)
-            
+
             # Brief sleep between batches
             time.sleep(1)
-            
+
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
                 print("Hit API rate limit (429) during seeding. Stopping.")
@@ -1214,6 +1261,7 @@ def seed_historical_launches():
             update_seeding_status(False, msg, total_so_far, oldest_so_far)
             break
 
+
 def parse_metar(raw_metar: str):
     """Parse METAR string to extract weather data."""
     temperature_c = 25
@@ -1224,7 +1272,7 @@ def parse_metar(raw_metar: str):
     cloud_cover = 0
     visibility_sm = 10
     altimeter_inhg = 29.92
-    
+
     try:
         # Extract temperature and dewpoint
         # Format: 18/14 or M01/M05
@@ -1232,7 +1280,7 @@ def parse_metar(raw_metar: str):
         if temp_dew_match:
             t_str = temp_dew_match.group(1)
             d_str = temp_dew_match.group(2)
-            
+
             temperature_c = int(t_str.replace('M', '-'))
             dewpoint_c = int(d_str.replace('M', '-'))
 
@@ -1322,6 +1370,7 @@ def parse_metar(raw_metar: str):
         'raw': raw_metar
     }
 
+
 def fetch_forecast(location: str = None, lat: float = None, lon: float = None):
     """Fetch 7-day forecast (daily + hourly) from Open-Meteo."""
     increment_metric("api_calls")
@@ -1335,7 +1384,7 @@ def fetch_forecast(location: str = None, lat: float = None, lon: float = None):
         lat, lon = coords.get(location, (25.997, -97.156))
 
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m,windspeed_10m,winddirection_10m&current_weather=true&timezone=auto"
-    
+
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
@@ -1343,6 +1392,7 @@ def fetch_forecast(location: str = None, lat: float = None, lon: float = None):
     except Exception as e:
         print(f"Error fetching forecast for {location or (lat, lon)}: {e}")
         return None
+
 
 def is_nws_fresh(timestamp_str):
     """Check if NWS timestamp is within the last 3 hours."""
@@ -1354,10 +1404,11 @@ def is_nws_fresh(timestamp_str):
     except Exception:
         return False
 
+
 def fetch_weather(location: str = None, station_id: str = None, lat: float = None, lon: float = None):
     """Fetch METAR weather data with multiple station fallbacks and Open-Meteo backup."""
     increment_metric("api_calls")
-    
+
     stations_to_try = []
     if station_id:
         stations_to_try = [station_id]
@@ -1425,14 +1476,14 @@ def fetch_weather(location: str = None, station_id: str = None, lat: float = Non
                 if live_data.get('timestamp') and is_nws_fresh(live_data['timestamp']):
                     if live_data['temp'] is not None:
                         parsed['temperature_c'] = live_data['temp']
-                        parsed['temperature_f'] = round(live_data['temp'] * 9/5 + 32, 1)
+                        parsed['temperature_f'] = round(live_data['temp'] * 9 / 5 + 32, 1)
                     if live_data['wind_speed'] is not None:
                         parsed['wind_speed_kts'] = round(live_data['wind_speed'] * 0.539957, 1)
                     if live_data['wind_gust'] is not None:
                         parsed['wind_gust_kts'] = round(live_data['wind_gust'] * 0.539957, 1)
                     if live_data['wind_dir'] is not None:
                         parsed['wind_direction'] = int(live_data['wind_dir'])
-                    parsed['live_wind'] = live_data # Backward compatibility
+                    parsed['live_wind'] = live_data  # Backward compatibility
                 return parsed
 
             # 3. If no METAR but NWS data is fresh, use NWS as primary
@@ -1440,11 +1491,13 @@ def fetch_weather(location: str = None, station_id: str = None, lat: float = Non
                 temp_c = live_data['temp']
                 return {
                     'temperature_c': temp_c,
-                    'temperature_f': round(temp_c * 9/5 + 32, 1),
+                    'temperature_f': round(temp_c * 9 / 5 + 32, 1),
                     'dewpoint_c': live_data.get('dew') or (temp_c - 5),
-                    'dewpoint_f': round((live_data.get('dew') or (temp_c - 5)) * 9/5 + 32, 1),
-                    'wind_speed_kts': round(live_data.get('wind_speed', 0) * 0.539957, 1) if live_data.get('wind_speed') else 0,
-                    'wind_gust_kts': round(live_data.get('wind_gust', 0) * 0.539957, 1) if live_data.get('wind_gust') else 0,
+                    'dewpoint_f': round((live_data.get('dew') or (temp_c - 5)) * 9 / 5 + 32, 1),
+                    'wind_speed_kts': round(live_data.get('wind_speed', 0) * 0.539957, 1) if live_data.get(
+                        'wind_speed') else 0,
+                    'wind_gust_kts': round(live_data.get('wind_gust', 0) * 0.539957, 1) if live_data.get(
+                        'wind_gust') else 0,
                     'wind_direction': int(live_data.get('wind_dir') or 0),
                     'visibility_sm': round(live_data.get('vis', 16093) / 1609.34, 1) if live_data.get('vis') else 10.0,
                     'flight_category': 'VFR',
@@ -1463,7 +1516,7 @@ def fetch_weather(location: str = None, station_id: str = None, lat: float = Non
                 temp_c = cw['temperature']
                 return {
                     'temperature_c': temp_c,
-                    'temperature_f': round(temp_c * 9/5 + 32, 1),
+                    'temperature_f': round(temp_c * 9 / 5 + 32, 1),
                     'wind_speed_kts': round(cw.get('windspeed', 0) * 0.539957, 1),
                     'wind_direction': cw.get('winddirection', 0),
                     'flight_category': 'VFR',
@@ -1480,6 +1533,7 @@ def fetch_weather(location: str = None, station_id: str = None, lat: float = Non
         'error': f"All weather sources failed: {'; '.join(errors)}"
     }
 
+
 def fetch_external_narratives():
     """Fetch narratives from the external API as specified in functions.py."""
     url = "https://launch-narrative-api-dafccc521fb8.herokuapp.com/recent_launches_narratives"
@@ -1493,6 +1547,7 @@ def fetch_external_narratives():
     except Exception as e:
         print(f"Error fetching external narratives: {e}")
         return []
+
 
 # --- Background Refresh Helpers ---
 
@@ -1508,7 +1563,7 @@ def refresh_narratives_internal():
         current_time = datetime.now(timezone.utc)
         set_cached_data(CACHE_KEY, descriptions)
         set_cached_data(CACHE_TIME_KEY, current_time.isoformat())
-        
+
         _local_cache["launch_narratives"] = descriptions
         _local_cache["last_updated"] = current_time
         return descriptions
@@ -1516,13 +1571,14 @@ def refresh_narratives_internal():
         print(f"Error in refresh_narratives_internal: {e}")
         return cached_narratives
 
+
 def refresh_launches_internal():
     """Internal helper to refresh launches cache."""
     print("Refreshing launches cache...")
     cache_key = "launches_cache_v2"
     existing_previous = None
     existing_upcoming = None
-    
+
     cached_data = get_cached_data(cache_key)
     if cached_data:
         existing_previous = cached_data.get('previous')
@@ -1556,13 +1612,14 @@ def refresh_launches_internal():
         print(f"Error in refresh_launches_internal: {e}")
         return None
 
+
 def refresh_weather_internal():
     """Internal helper to refresh all weather cache."""
     print("Refreshing weather cache...")
     locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne']
     weather_results = {}
     timestamps = []
-    
+
     for loc in locations:
         data = fetch_weather(loc)
         forecast = fetch_forecast(loc)
@@ -1571,34 +1628,40 @@ def refresh_weather_internal():
         data['last_updated'] = last_updated
         weather_results[loc] = data
         timestamps.append(last_updated)
-        
+
         # Update individual cache
         if r:
             try:
                 r.setex(f"weather_cache_v2_{loc}", 300, json.dumps(data))
-            except: pass
-            
+            except:
+                pass
+
     return {
         "weather": weather_results,
         "last_updated": min(timestamps) if timestamps else datetime.now(timezone.utc).isoformat()
     }
 
+
 def _spotify_state_key(state: str) -> str:
     return f"spotify:oauth:{state}"
 
+
 def _spotify_rate_limit_key(device_key: str) -> str:
     return f"spotify:oauth:poll:{device_key}"
+
 
 def _is_valid_spotify_state(state: str) -> bool:
     if not state or len(state) < SPOTIFY_RELAY_STATE_MIN_LEN:
         return False
     return bool(SPOTIFY_RELAY_STATE_RE.fullmatch(state))
 
+
 def _is_https_request(request: Request) -> bool:
     if request.url.scheme == "https":
         return True
     forwarded_proto = request.headers.get("x-forwarded-proto", "")
     return forwarded_proto.split(",")[0].strip().lower() == "https"
+
 
 def _set_spotify_relay_payload(state: str, payload: dict):
     if r:
@@ -1613,6 +1676,7 @@ def _set_spotify_relay_payload(state: str, payload: dict):
             "payload": payload,
             "expiry": int(time.time()) + SPOTIFY_RELAY_TTL_SECONDS
         }
+
 
 def _consume_spotify_relay_payload(state: str):
     if r:
@@ -1639,6 +1703,7 @@ def _consume_spotify_relay_payload(state: str):
             return None
         return item.get("payload")
 
+
 def _is_spotify_poll_rate_limited(device_key: str) -> bool:
     if r:
         try:
@@ -1659,6 +1724,7 @@ def _is_spotify_poll_rate_limited(device_key: str) -> bool:
         count += 1
         _local_spotify_rate_limits[device_key] = (start, count)
         return count > SPOTIFY_RELAY_POLL_MAX_REQUESTS
+
 
 # --- New Endpoints ---
 
@@ -1684,20 +1750,21 @@ def spotify_callback(request: Request):
 
     ok = bool(code) and not error
     html = (
-        "<html><head><meta charset='utf-8'><title>Spotify Login</title></head>"
-        "<body style='font-family:Arial,sans-serif;background:#111;color:#eee;padding:24px;'>"
-        + ("<h3>Spotify connected.</h3><p>You can close this page.</p>" if ok
-           else "<h3>Spotify login failed.</h3><p>You can close this page and try again.</p>")
-        + "</body></html>"
+            "<html><head><meta charset='utf-8'><title>Spotify Login</title></head>"
+            "<body style='font-family:Arial,sans-serif;background:#111;color:#eee;padding:24px;'>"
+            + ("<h3>Spotify connected.</h3><p>You can close this page.</p>" if ok
+               else "<h3>Spotify login failed.</h3><p>You can close this page and try again.</p>")
+            + "</body></html>"
     )
     return HTMLResponse(html, status_code=200)
 
+
 @app.get("/spotify/oauth-result")
 def spotify_oauth_result(
-    request: Request,
-    state: str = "",
-    x_relay_key: str = Header(default=""),
-    x_device_id: str = Header(default="")
+        request: Request,
+        state: str = "",
+        x_relay_key: str = Header(default=""),
+        x_device_id: str = Header(default="")
 ):
     if SPOTIFY_RELAY_REQUIRE_HTTPS and not _is_https_request(request):
         raise HTTPException(status_code=400, detail="https_required")
@@ -1716,6 +1783,7 @@ def spotify_oauth_result(
         return JSONResponse({"pending": True})
     return JSONResponse(payload)
 
+
 @app.get("/launches")
 def get_launches(force: bool = False, internal: bool = False):
     if not internal:
@@ -1729,10 +1797,11 @@ def get_launches(force: bool = False, internal: bool = False):
     if cached:
         increment_metric("cache_hits")
         return cached
-    
+
     increment_metric("cache_misses")
     # Return empty if not in cache and not forcing (timer will populate it)
     return {"upcoming": [], "previous": [], "last_updated": None}
+
 
 @app.get("/launches_slim")
 def get_launches_slim(force: bool = False, internal: bool = False):
@@ -1740,7 +1809,7 @@ def get_launches_slim(force: bool = False, internal: bool = False):
     if not internal:
         increment_metric("total_requests")
     cache_key = "launches_cache_v2"
-    
+
     data = None
     if force:
         increment_metric("cache_misses")
@@ -1753,17 +1822,18 @@ def get_launches_slim(force: bool = False, internal: bool = False):
         else:
             increment_metric("cache_misses")
             return {"upcoming": [], "previous": [], "last_updated": None}
-    
+
     if data:
         def strip_bloat(l):
             return {k: v for k, v in l.items() if k != 'all_data'}
-            
+
         return {
             "upcoming": [strip_bloat(l) for l in data.get("upcoming", [])],
             "previous": [strip_bloat(l) for l in data.get("previous", [])],
             "last_updated": data.get("last_updated")
         }
     return {"upcoming": [], "previous": [], "last_updated": None}
+
 
 @app.get("/launch_raw/{launch_id}")
 def get_launch_raw(launch_id: str, internal: bool = False):
@@ -1774,15 +1844,16 @@ def get_launch_raw(launch_id: str, internal: bool = False):
     cached = get_cached_data(cache_key)
     if not cached:
         return {"error": "Cache empty"}
-    
+
     # Search in both upcoming and previous
     for l in cached.get('upcoming', []) + cached.get('previous', []):
         if l.get('id') == launch_id:
             increment_metric("cache_hits")
             return l.get('all_data', {})
-            
+
     increment_metric("cache_misses")
     return {"error": "Launch not found"}
+
 
 def _get_weather_cached(location: str, force: bool = False):
     """Internal helper to fetch weather with v2 caching metadata."""
@@ -1792,8 +1863,9 @@ def _get_weather_cached(location: str, force: bool = False):
             cached = r.get(cache_key)
             if cached:
                 return json.loads(cached), True
-        except: pass
-    
+        except:
+            pass
+
     # If force=True or cache miss, perform a foreground fetch
     data = fetch_weather(location)
     last_updated = datetime.now(timezone.utc).isoformat()
@@ -1801,8 +1873,10 @@ def _get_weather_cached(location: str, force: bool = False):
     if r:
         try:
             r.setex(cache_key, 300, json.dumps(data))
-        except: pass
+        except:
+            pass
     return data, False
+
 
 @app.get("/weather/{location}")
 def get_weather(location: str, force: bool = False, internal: bool = False):
@@ -1814,6 +1888,7 @@ def get_weather(location: str, force: bool = False, internal: bool = False):
     else:
         increment_metric("cache_misses")
     return res
+
 
 @app.get("/user_weather")
 def get_user_weather(lat: float, lon: float, station_id: str = None, internal: bool = False):
@@ -1834,6 +1909,7 @@ def get_user_weather(lat: float, lon: float, station_id: str = None, internal: b
 
     return weather_data
 
+
 @app.get("/weather_all")
 def get_all_weather(force: bool = False, internal: bool = False):
     if not internal:
@@ -1845,7 +1921,7 @@ def get_all_weather(force: bool = False, internal: bool = False):
     locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne']
     weather_results = {}
     timestamps = []
-    
+
     hit_count = 0
     for loc in locations:
         res, is_hit = _get_weather_cached(loc, force)
@@ -1854,37 +1930,40 @@ def get_all_weather(force: bool = False, internal: bool = False):
             timestamps.append(res.get('last_updated'))
         if is_hit:
             hit_count += 1
-            
+
     if hit_count == len(locations):
         increment_metric("cache_hits")
     else:
         increment_metric("cache_misses")
-        
+
     return {
-        "weather": weather_results, 
+        "weather": weather_results,
         "last_updated": min(timestamps) if timestamps else None
     }
+
 
 @app.get("/launch_details/{launch_id}")
 def get_launch_details(launch_id: str, internal: bool = False):
     if not internal:
         increment_metric("total_requests")
-    increment_metric("cache_misses") # Detailed fetch is always a direct API call/miss in this impl
+    increment_metric("cache_misses")  # Detailed fetch is always a direct API call/miss in this impl
     return fetch_launch_details(launch_id)
+
 
 @app.get("/external_narratives")
 def get_all_narratives(internal: bool = False):
     if not internal:
         increment_metric("total_requests")
-    increment_metric("cache_misses") # This endpoint always fetches from external source
+    increment_metric("cache_misses")  # This endpoint always fetches from external source
     return {"descriptions": fetch_external_narratives()}
+
 
 @app.get("/recent_launches_narratives")
 def get_narratives(force: bool = False, internal: bool = False):
     """Serve from cache only (timer-based refresh)."""
     if not internal:
         increment_metric("total_requests")
-    
+
     if force:
         increment_metric("cache_misses")
         descriptions = refresh_narratives_internal()
@@ -1893,11 +1972,11 @@ def get_narratives(force: bool = False, internal: bool = False):
     # Try to get from Redis
     data = get_cached_data(CACHE_KEY)
     time_str = get_cached_data(CACHE_TIME_KEY)
-    
+
     if data and time_str:
         increment_metric("cache_hits")
         return {"descriptions": data, "last_updated": time_str}
-    
+
     # Fallback to in-memory
     cached_narratives = _local_cache["launch_narratives"]
     last_updated = _local_cache["last_updated"]
@@ -1905,9 +1984,10 @@ def get_narratives(force: bool = False, internal: bool = False):
     if cached_narratives and last_updated:
         increment_metric("cache_hits")
         return {"descriptions": cached_narratives, "last_updated": last_updated.isoformat()}
-    
+
     increment_metric("cache_misses")
     return {"descriptions": [], "last_updated": None}
+
 
 @app.get("/metrics")
 def get_app_metrics(range: str = "1h", internal: bool = False):
@@ -1915,6 +1995,7 @@ def get_app_metrics(range: str = "1h", internal: bool = False):
     if not internal:
         record_snapshot()
     return get_metrics(range_type=range)
+
 
 @app.post("/reset_metrics")
 def reset_app_metrics():
@@ -1942,6 +2023,7 @@ def reset_app_metrics():
 
     return {"status": "Success", "message": "All metrics and history have been reset."}
 
+
 @app.get("/seed_status")
 def get_seed_status():
     """Endpoint to check the status of historical seeding."""
@@ -1954,25 +2036,28 @@ def get_seed_status():
             print(f"Redis error in get_seed_status: {e}")
     return _local_seeding_status
 
+
 @app.post("/seed_history")
 def trigger_seed_history():
     """Endpoint to manually trigger historical launch seeding."""
     status = get_seed_status()
     if status.get("is_running"):
         return {"status": "Seeding already in progress"}
-    
+
     # Clear stop signal if it exists
     global _stop_seeding_requested
     _stop_seeding_requested = False
     if r:
         try:
             r.delete(SEEDING_STOP_SIGNAL_KEY)
-        except: pass
-    
+        except:
+            pass
+
     # Start seeding in a background thread
     seeding_thread = threading.Thread(target=seed_historical_launches, daemon=True)
     seeding_thread.start()
     return {"status": "Historical seeding started"}
+
 
 @app.post("/stop_seeding")
 def stop_seeding():
@@ -1982,14 +2067,16 @@ def stop_seeding():
     if r:
         try:
             r.set(SEEDING_STOP_SIGNAL_KEY, "true")
-        except: pass
+        except:
+            pass
     return {"status": "Stop signal sent"}
+
 
 def start_background_worker():
     def run():
         # Wait a bit for the app to start
         time.sleep(5)
-        
+
         # Initial bootstrap (populate empty caches)
         print("Starting background worker bootstrap...")
         try:
@@ -1997,7 +2084,7 @@ def start_background_worker():
             refresh_narratives_internal()
             refresh_launches_internal()
             refresh_weather_internal()
-            
+
         except Exception as e:
             print(f"Bootstrap error: {e}")
 
@@ -2006,38 +2093,40 @@ def start_background_worker():
             "launches": time.time(),
             "weather": time.time()
         }
-        
+
         while True:
             try:
                 now = time.time()
-                
+
                 # Metrics (every 30s)
                 record_snapshot()
-                
+
                 # Narratives (every 15m)
                 if now - last_run["narratives"] >= 900:
                     refresh_narratives_internal()
                     last_run["narratives"] = now
-                
+
                 # Launches (every 10m)
                 if now - last_run["launches"] >= 600:
                     refresh_launches_internal()
                     last_run["launches"] = now
-                    
+
                 # Weather (every 2m for higher frequency wind updates)
                 if now - last_run["weather"] >= 120:
                     refresh_weather_internal()
                     last_run["weather"] = now
-                    
+
             except Exception as e:
                 print(f"Background worker error: {e}")
-            
-            time.sleep(30) # Loop interval
-            
+
+            time.sleep(30)  # Loop interval
+
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
+
 start_background_worker()
+
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
@@ -2322,7 +2411,7 @@ def dashboard(request: Request):
                     </div>
                 </div>
             </div>
-            
+
             <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
                 <div class="px-6 py-4 border-b border-slate-800 bg-slate-800/30">
                     <h2 class="text-lg font-semibold flex items-center gap-2">
@@ -2386,12 +2475,12 @@ def dashboard(request: Request):
         async function toggleLaunch(id) {
             const detailsEl = document.getElementById('details-' + id);
             if (!detailsEl) return;
-            
+
             const isExpanding = detailsEl.classList.contains('hidden');
-            
+
             // Toggle visibility
             detailsEl.classList.toggle('hidden');
-            
+
             if (isExpanding) {
                 const contentEl = document.getElementById('details-content-' + id);
                 if (contentEl && contentEl.getAttribute('data-loaded') !== 'true') {
@@ -2404,15 +2493,15 @@ def dashboard(request: Request):
         async function fetchLaunchDetailsOnDemand(id) {
             const contentEl = document.getElementById('details-content-' + id);
             const rawEl = document.getElementById('raw-content-' + id);
-            
+
             if (!contentEl) return;
-            
+
             try {
                 const response = await fetch('/launch_raw/' + id + '?internal=true');
                 const rawData = await response.json();
-                
+
                 if (rawData.error) throw new Error(rawData.error);
-                
+
                 contentEl.innerHTML = renderDataCards(rawData);
                 contentEl.setAttribute('data-loaded', 'true');
                 if (rawEl) rawEl.textContent = JSON.stringify(rawData, null, 2);
@@ -2480,12 +2569,12 @@ def dashboard(request: Request):
             const lastUpdatedDate = new Date(lastUpdatedIso);
             const lastUpdated = lastUpdatedDate.getTime();
             const interval = refreshIntervals[category] * 1000;
-            
+
             // Update the next refresh target based on when the backend last updated
             // Robustness: Ensure we don't set a target in the past, which causes infinite refresh loops
             const target = lastUpdated + interval;
             const now = Date.now();
-            
+
             if (target <= now + 5000) { // If expired or expiring in next 5s
                 // Backend is lagging. Set next refresh to 30s from now to avoid spamming
                 nextRefresh[category] = now + 30000;
@@ -2505,7 +2594,7 @@ def dashboard(request: Request):
 
         function updateTimers() {
             const now = Date.now();
-            
+
             // Update UTC Clock
             const nowDate = new Date();
             const utcString = nowDate.getUTCHours().toString().padStart(2, '0') + ':' + 
@@ -2576,7 +2665,7 @@ def dashboard(request: Request):
             if (!confirm('Are you sure you want to reset all metrics and history? This cannot be undone.')) {
                 return;
             }
-            
+
             try {
                 const response = await fetch('/reset_metrics', { method: 'POST' });
                 const result = await response.json();
@@ -2599,11 +2688,11 @@ def dashboard(request: Request):
                 document.getElementById(`tab-${t}`).classList.add('text-slate-400');
                 document.getElementById(`content-${t}`).classList.add('hidden');
             });
-            
+
             document.getElementById(`tab-${tab}`).classList.add('tab-active');
             document.getElementById(`tab-${tab}`).classList.remove('text-slate-400');
             document.getElementById(`content-${tab}`).classList.remove('hidden');
-            
+
             // Note: Automatic fetches removed from here to make it strictly timer-based
             // and prevent unnecessary API calls/loading states when switching tabs.
         }
@@ -2612,20 +2701,20 @@ def dashboard(request: Request):
             try {
                 const response = await fetch(`/metrics?range=${currentRange}&internal=true`);
                 const data = await response.json();
-                
+
                 const current = data.current || {};
                 const rangeStats = data.range_stats || {};
                 const history = data.history || [];
-        
+
                 // Use live absolute totals for the main metrics
                 const total = current.total_requests || 0;
                 const hits = current.cache_hits || 0;
                 const apiCalls = current.api_calls || 0;
-        
+
                 document.getElementById('metric-total-requests').textContent = total.toLocaleString();
                 document.getElementById('metric-cache-hits').textContent = hits.toLocaleString();
                 document.getElementById('metric-api-calls').textContent = apiCalls.toLocaleString();
-        
+
                 const efficiency = total > 0 ? Math.round((hits / total) * 100) : 0;
                 document.getElementById('metric-efficiency').textContent = efficiency + '%';
 
@@ -2648,7 +2737,7 @@ def dashboard(request: Request):
                                 }
                             }
                         }
-                        
+
                         chart.data.labels = history.map(h => '');
                         chart.data.datasets[0].data = values;
                         chart.update('none');
@@ -2689,7 +2778,7 @@ def dashboard(request: Request):
                 const str = JSON.stringify(val);
                 return `<span class="text-[9px] text-slate-500 italic font-mono" title='${str.replace(/'/g, "&apos;")}'>${str.length > 40 ? str.substring(0, 40) + '...' : str}</span>`;
             }
-            
+
             if (Array.isArray(val)) {
                 if (val.length === 0) return formatValue('');
                 return val.map(v => `
@@ -2698,7 +2787,7 @@ def dashboard(request: Request):
                     </div>
                 `).join('');
             }
-            
+
             if (typeof val === 'object') {
                 return Object.entries(val).map(([k, v]) => {
                     return `
@@ -2709,25 +2798,25 @@ def dashboard(request: Request):
                     `;
                 }).join('');
             }
-            
+
             return formatValue(val);
         }
 
         function renderDataCards(data) {
             if (!data || typeof data !== 'object') return '';
-            
+
             let html = '<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">';
-            
+
             // Prioritize these fields to appear first
             const priority = ['status', 'net', 'window_start', 'window_end', 'probability', 'holdreason', 'failreason', 'rocket', 'mission', 'pad'];
-            
+
             const keys = Object.keys(data).sort((a, b) => {
                 const aPrio = priority.indexOf(a);
                 const bPrio = priority.indexOf(b);
                 if (aPrio !== -1 && bPrio !== -1) return aPrio - bPrio;
                 if (aPrio !== -1) return -1;
                 if (bPrio !== -1) return 1;
-                
+
                 const aIsObj = typeof data[a] === 'object' && data[a] !== null;
                 const bIsObj = typeof data[b] === 'object' && data[b] !== null;
                 return aIsObj - bIsObj;
@@ -2745,7 +2834,7 @@ def dashboard(request: Request):
                     </div>
                 `;
             }
-            
+
             html += '</div>';
             return html;
         }
@@ -2757,13 +2846,13 @@ def dashboard(request: Request):
                 const data = await response.json();
                 const list = document.getElementById('narratives-list');
                 list.innerHTML = '';
-                
+
                 if (data.descriptions && data.descriptions.length > 0) {
                     data.descriptions.forEach(desc => {
                         const parts = desc.split(': ', 2);
                         const date = parts[0];
                         const text = parts[1] || '';
-                        
+
                         const div = document.createElement('div');
                         div.className = 'ticker-item bg-slate-800/40 p-4 rounded-r-lg border-l-4 border-blue-500 hover:bg-slate-800/60 transition-colors';
                         div.innerHTML = `
@@ -2777,7 +2866,7 @@ def dashboard(request: Request):
                 } else {
                     list.innerHTML = '<p class="text-slate-500 text-center py-8">No narratives available.</p>';
                 }
-                
+
                 if (data.last_updated) {
                     syncTimer('narratives', data.last_updated);
                     const luDate = new Date(data.last_updated);
@@ -2793,17 +2882,17 @@ def dashboard(request: Request):
 
         async function fetchLaunches(force = false) {
             const upList = document.getElementById('upcoming-launches-list');
-            
+
             try {
                 const url = force ? '/launches_slim?force=true&internal=true' : '/launches_slim?internal=true';
                 const response = await fetch(url);
                 const data = await response.json();
-                
+
                 allPreviousLaunches = data.previous || [];
-                
+
                 renderList(upList, data.upcoming);
                 renderPreviousList(false);
-                
+
                 if (data.last_updated) {
                     syncTimer('launches', data.last_updated);
                 }
@@ -2825,10 +2914,10 @@ def dashboard(request: Request):
             launches.forEach(l => {
                 const div = document.createElement('div');
                 div.className = 'launch-card border-b border-slate-800 last:border-0 hover:bg-slate-800/10 transition-all';
-                
+
                 const id = 'details-' + l.id;
                 const rawId = 'raw-' + l.id;
-                
+
                 div.innerHTML = `
                     <div class="p-4 cursor-pointer" onclick="toggleLaunch('${l.id}')">
                         <div class="flex items-center justify-between">
@@ -2845,12 +2934,12 @@ def dashboard(request: Request):
                             </div>
                         </div>
                     </div>
-                    
+
                     <div id="${id}" class="hidden px-4 pb-6 space-y-4 border-t border-slate-800/50 pt-4 bg-slate-900/30">
                         ${(l.image && typeof l.image === 'string') ? `<img src="${l.image}" class="w-full h-48 object-cover rounded-xl border border-slate-700 shadow-lg" onerror="this.style.display='none'">` : ''}
-                        
+
                         ${l.description ? `<p class="text-sm text-slate-300 leading-relaxed bg-slate-950/50 p-4 rounded-xl border border-slate-800">${l.description}</p>` : ''}
-                        
+
                         <div class="space-y-4">
                             <h3 class="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2 border-b border-slate-800 pb-1">Detailed Mission Data</h3>
                             <div id="details-content-${l.id}" class="min-h-[50px] flex flex-col justify-center">
@@ -2895,17 +2984,17 @@ def dashboard(request: Request):
                 el.innerHTML = '';
                 displayedPreviousCount = 0;
             }
-            
+
             const existingBtn = document.getElementById('btn-load-more');
             if (existingBtn) existingBtn.remove();
 
             const start = displayedPreviousCount;
             const end = Math.min(start + (append ? 50 : 20), allPreviousLaunches.length);
             const launches = allPreviousLaunches.slice(start, end);
-            
+
             renderList(el, launches, true);
             displayedPreviousCount = end;
-            
+
             if (displayedPreviousCount < allPreviousLaunches.length) {
                 const btn = document.createElement('button');
                 btn.id = 'btn-load-more';
@@ -3035,19 +3124,19 @@ def dashboard(request: Request):
             subtitle.textContent = "Hourly Temperature (°C)";
 
             content.innerHTML = '';
-            
+
             // Hourly data starts from index (dayIndex * 24)
             const startIndex = dayIndex * 24;
             for (let i = 0; i < 24; i++) {
                 const idx = startIndex + i;
                 if (idx >= forecast.hourly.time.length) break;
-                
+
                 const timeStr = forecast.hourly.time[idx];
                 const hour = new Date(timeStr).getHours();
                 const temp = Math.round(forecast.hourly.temperature_2m[idx]);
                 const windSpeed = Math.round(forecast.hourly.windspeed_10m[idx]);
                 const windDir = forecast.hourly.winddirection_10m[idx];
-                
+
                 const item = document.createElement('div');
                 item.className = 'flex flex-col items-center p-3 bg-slate-800/50 rounded-xl border border-slate-700/50';
                 item.innerHTML = `
@@ -3075,7 +3164,7 @@ def dashboard(request: Request):
 
         async function fetchWeatherAll(force = false) {
             const container = document.getElementById('weather-grid');
-            
+
             // Show loaders
             container.innerHTML = '';
             ['Starbase', 'Vandy', 'Cape', 'Hawthorne'].forEach(loc => {
@@ -3084,13 +3173,13 @@ def dashboard(request: Request):
                 card.innerHTML = `<div class="animate-pulse h-32 bg-slate-800 rounded"></div>`;
                 container.appendChild(card);
             });
-            
+
             try {
                 const url = force ? `/weather_all?force=true&internal=true` : `/weather_all?internal=true`;
                 const response = await fetch(url);
                 const data = await response.json();
                 lastWeatherData = data.weather;
-                
+
                 container.innerHTML = '';
                 if (data.weather) {
                     Object.entries(data.weather).forEach(([loc, weatherData]) => {
@@ -3101,7 +3190,7 @@ def dashboard(request: Request):
                     });
                     lucide.createIcons();
                 }
-                
+
                 if (data.last_updated) {
                     syncTimer('weather', data.last_updated);
                 }
@@ -3113,15 +3202,15 @@ def dashboard(request: Request):
         async function refreshTab(tab) {
             const icon = document.getElementById(`refresh-icon-${tab}`);
             if (icon) icon.classList.add('animate-spin');
-            
+
             try {
                 if (tab === 'narratives') await fetchNarratives(true);
                 if (tab === 'launches') await fetchLaunches(true);
                 if (tab === 'weather') await fetchWeatherAll(true);
-                
+
                 // Reset timer for this specific tab after manual refresh
                 nextRefresh[tab] = Date.now() + refreshIntervals[tab] * 1000;
-                
+
                 // Also update metrics as a force refresh counts as API calls
                 fetchMetrics();
                 nextRefresh.metrics = Date.now() + refreshIntervals.metrics * 1000;
@@ -3147,7 +3236,7 @@ def dashboard(request: Request):
                 const response = await fetch('/seed_history', { method: 'POST' });
                 const data = await response.json();
                 console.log('Seeding response:', data);
-                
+
                 // Small delay to let the background thread start and update status
                 setTimeout(startSeedingPoll, 1000);
             } catch (error) {
@@ -3186,7 +3275,7 @@ def dashboard(request: Request):
             try {
                 const response = await fetch('/seed_status');
                 const data = await response.json();
-                
+
                 const btn = document.getElementById('btn-seed-history');
                 const stopBtn = document.getElementById('btn-stop-seeding');
                 const tag = document.getElementById('seed-status-tag');
@@ -3195,7 +3284,7 @@ def dashboard(request: Request):
 
                 count.textContent = (data.total_pulled || 0).toLocaleString();
                 oldest.textContent = data.oldest_launch ? data.oldest_launch.split('T')[0] : '--';
-                
+
                 if (data.is_running) {
                     btn.disabled = true;
                     btn.innerHTML = '<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Seeding...';
@@ -3212,7 +3301,7 @@ def dashboard(request: Request):
                     stopBtn.classList.add('hidden');
                     tag.textContent = data.last_status || 'Idle';
                     tag.className = 'text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-slate-700 text-slate-400';
-                    
+
                     // If it stopped and we are polling, we can stop if it's completed or hit limit
                     if (!data.is_running && seedingPollInterval && data.last_status !== 'Starting batch fetch...') {
                         // We keep it polling just in case, or stop it to save resources?
@@ -3239,6 +3328,7 @@ def dashboard(request: Request):
 </html>
     """
 
+
 @app.post("/refresh")
 def refresh_cache():
     """Force refresh the cache (call this via scheduler)."""
@@ -3251,6 +3341,8 @@ def refresh_cache():
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
