@@ -145,7 +145,7 @@ LOCATION_COORDS = {
     'Cape': {'lat': 28.562, 'lon': -80.577},
     'Hawthorne': {'lat': 33.921, 'lon': -118.332}
 }
-HISTORY_LIMIT = 43200  # 30 days at 1 minute intervals
+HISTORY_LIMIT = 2880  # 2 days at 1 minute intervals
 SEEDING_STATUS_KEY = "seeding_status_v2"
 SEEDING_STOP_SIGNAL_KEY = "seeding_stop_signal_v2"
 _last_snapshot_time = 0
@@ -235,7 +235,7 @@ def get_destination_point(lat, lon, distance_km, bearing_deg):
     return {'lat': math.degrees(lat2), 'lon': (math.degrees(lon2) + 180) % 360 - 180}
 
 
-def generate_ground_track(start_point, inclination_deg, num_points=2000, descending=False, duration_min=90):
+def generate_ground_track(start_point, inclination_deg, num_points=500, descending=False, duration_min=90):
     """Generate a ground track accounting for Earth's rotation."""
     lat0 = float(start_point['lat']);
     lon0 = float(start_point['lon'])
@@ -401,7 +401,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         launch_site.get('lat', 0.0)
     )
 
-    ORBIT_CACHE_VERSION = 'v240-accurate-groundtrack'
+    ORBIT_CACHE_VERSION = 'v241-lean-realistic-traj'
     landing_type = next_launch.get('landing_type')
     landing_loc = next_launch.get('landing_location')
     cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl, 1)}:{landing_type}:{landing_loc}"
@@ -505,7 +505,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
 
     # Generate the Master Path (The Orbit Ground Track)
     # Accounting for Earth's rotation makes the orbit path more realistic.
-    master_path = generate_ground_track(launch_site, assumed_incl, num_points=2000, descending=is_desc, duration_min=90)
+    master_path = generate_ground_track(launch_site, assumed_incl, num_points=500, descending=is_desc, duration_min=90)
 
     # The ascent trajectory is a segment of the SAME Master Path
     # LEO insertion usually happens ~2000-3000km downrange (~6-8% of ground track)
@@ -518,26 +518,35 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     else:
         orbit_path = []
 
-    # Set radii for the orbit path
+    # Set radii for the orbit path, then downsample to ~150 points to save memory
     for p in orbit_path:
         p['r'] = target_r
+    if len(orbit_path) > 150:
+        stride = max(1, len(orbit_path) // 150)
+        orbit_path = orbit_path[::stride]
+        # Ensure the last point (orbit closure) is always included
+        if orbit_path[-1] != master_path[-1]:
+            last = master_path[-1].copy()
+            last['r'] = target_r
+            orbit_path.append(last)
 
     # Add radii to main trajectory (Ascent profile)
+    # progress**0.7 gives a more realistic profile: gradual initial vertical climb,
+    # faster pitch-over during gravity turn, levelling off near orbital insertion.
     for i, p in enumerate(trajectory):
-        progress = i / (len(trajectory) - 1)
-        # Smoother climb from surface (1.0) to orbit radius
-        # Using 0.5 power for a steeper initial climb (reaching ~70km at MECO)
-        p['r'] = 1.0 + (target_r - 1.0) * (progress ** 0.5)
+        progress = i / max(1, len(trajectory) - 1)
+        p['r'] = 1.0 + (target_r - 1.0) * (progress ** 0.7)
 
     # Booster Return Trajectory (RTLS vs ASDS vs Expendable simulation)
     booster_trajectory = []
     sep_idx = None
     if trajectory and len(trajectory) > 10:
         try:
-            # MECO is typically ~80km downrange, which is 4 points in a 2000-point 40000km orbit
-            sep_idx = max(4, int(len(master_path) * 0.002))
+            # Stage separation: ~2-3% of orbit circumference downrange from launch
+            # With 500-point track this is ~1% = 5 points ≈ 80km, matching real F9 MECO timing
+            sep_idx_in_traj = min(max(3, int(len(trajectory) * 0.08)), len(trajectory) - 1)
 
-            sep_point = trajectory[sep_idx].copy()
+            sep_point = trajectory[sep_idx_in_traj].copy()
             sep_radius = sep_point['r']
 
             l_type = (landing_type or '').upper()
@@ -550,47 +559,51 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             rtls_keywords = ['RTLS', 'LAUNCH SITE', 'CATCH', 'TOWER', 'LZ', 'LANDING ZONE']
 
             if any(k in combined_landing_info for k in asds_keywords):
-                # Droneship landing: ~600-700km downrange
-                dist_frac = 0.016  # ~640km
+                # Droneship landing: ~600-700km downrange from launch site
+                # 500-pt track covers ~40,000km circumference → 0.016 * 500 = 8 pts ≈ 640km
+                dist_frac = 0.016
                 if normalized_orbit == 'GTO':
-                    dist_frac = 0.018  # ~720km
+                    dist_frac = 0.018  # GTO first stage separation is a bit further downrange
 
                 landing_idx = min(len(master_path) - 1, int(len(master_path) * dist_frac))
                 landing_point = master_path[landing_idx]
 
                 return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
 
-                # Add radius to return part (ballistic arc)
+                # Ballistic re-entry arc: peaks slightly above sep altitude then descends to sea level.
+                # 0.02 peak bump gives a visible but realistic re-entry hump on the map.
                 for i, p in enumerate(return_part):
                     prog = i / (len(return_part) - 1)
-                    # Parabolic arc peaking at sep_radius + 0.01, then down to surface (1.0)
-                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
-
-                booster_trajectory = return_part
-                sep_idx = 0  # Indicates start of booster_trajectory in visual tools
-                logger.info(f"Generated accurate ASDS booster trajectory (dist: ~650km)")
-            elif any(k in combined_landing_info for k in rtls_keywords):
-                # RTLS/Catch: returns to launch site
-                return_part = generate_curved_trajectory(sep_point, launch_site, 100, orbit_type='suborbital')
-                for i, p in enumerate(return_part):
-                    prog = i / (len(return_part) - 1)
-                    # Higher arc for RTLS boostback (~150km peak)
                     p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.02 * math.sin(prog * math.pi)
 
                 booster_trajectory = return_part
-                sep_idx = 0
-                logger.info(f"Generated accurate RTLS booster trajectory")
+                sep_idx = sep_idx_in_traj
+                logger.info(f"Generated ASDS booster trajectory (sep at traj idx {sep_idx_in_traj}, landing ~640km)")
+            elif any(k in combined_landing_info for k in rtls_keywords):
+                # RTLS / mechazilla catch: boostback to launch site.
+                # The booster travels slightly further downrange after sep, then flips and burns back.
+                # Model this as a Bezier arc from sep_point back to launch_site with a pronounced
+                # altitude peak (0.04) representing the ~150km boostback apex.
+                return_part = generate_curved_trajectory(sep_point, launch_site, 100, orbit_type='suborbital')
+                for i, p in enumerate(return_part):
+                    prog = i / (len(return_part) - 1)
+                    # Pronounced boostback arc: booster climbs significantly before descending
+                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.04 * math.sin(prog * math.pi)
+
+                booster_trajectory = return_part
+                sep_idx = sep_idx_in_traj
+                logger.info(f"Generated RTLS booster trajectory (sep at traj idx {sep_idx_in_traj})")
             elif any(k in combined_landing_info for k in ['OCEAN', 'SPLASHDOWN']):
-                # Ballistic splashdown further downrange than RTLS but before ASDS
+                # Expendable/uncontrolled splashdown: ballistic arc further downrange
                 landing_idx = min(len(master_path) - 1, int(len(master_path) * 0.01))
                 landing_point = master_path[landing_idx]
                 return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
                 for i, p in enumerate(return_part):
                     prog = i / (len(return_part) - 1)
-                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
+                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.015 * math.sin(prog * math.pi)
                 booster_trajectory = return_part
-                sep_idx = 0
-                logger.info(f"Generated Ocean splashdown booster trajectory")
+                sep_idx = sep_idx_in_traj
+                logger.info(f"Generated ocean splashdown booster trajectory")
             else:
                 booster_trajectory = []
                 sep_idx = None
@@ -623,7 +636,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             'inclination_deg': assumed_incl,
             'landing_type': landing_type,
             'landing_location': next_launch.get('landing_location'),
-            'model': 'v11-non-overlapping-orbit'
+            'model': 'v12-lean-realistic-traj'
         }
         save_cache_to_file(TRAJECTORY_CACHE_FILE, traj_cache, datetime.now(pytz.utc))
     except Exception as e:
@@ -1085,6 +1098,14 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
             combined_prev = combined_prev[:2000]
         else:
             combined_prev = sorted(parsed_prev, key=lambda x: x.get('net') or '', reverse=True)
+
+        # Strip all_data from older historical launches to keep the cache lean.
+        # The most recent batch (parsed_prev) retains all_data; everything older does not.
+        # Raw details remain available on demand via /launch_raw/{launch_id}.
+        recent_ids = {l['id'] for l in parsed_prev if 'id' in l}
+        for launch in combined_prev:
+            if launch.get('id') not in recent_ids:
+                launch.pop('all_data', None)
     except Exception as e:
         print(f"Error fetching previous launches: {e}")
 
@@ -1213,6 +1234,11 @@ def seed_historical_launches():
                 break
 
             parsed_new = [parse_launch_data(l, is_detailed=True) for l in results]
+
+            # Strip all_data from seeded historical launches to save memory.
+            # Raw details are available on demand via /launch_raw/{launch_id}.
+            for launch in parsed_new:
+                launch.pop('all_data', None)
 
             # Filter out duplicates (possible if multiple launches have exact same timestamp)
             existing_ids = {l['id'] for l in existing_previous if 'id' in l}
