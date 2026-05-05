@@ -524,9 +524,13 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     if len(orbit_path) > 150:
         stride = max(1, len(orbit_path) // 150)
         orbit_path = orbit_path[::stride]
-        # Ensure the last point (orbit closure) is always included
-        if orbit_path[-1] != master_path[-1]:
-            last = master_path[-1].copy()
+        # Ensure the last point (orbit closure) is always present after striding.
+        # Compare by coordinates because the strided copy will never share identity
+        # with the original and both have 'r' set, so value equality is reliable.
+        last_mp = master_path[-1]
+        if (abs(orbit_path[-1].get('lat', 0) - last_mp['lat']) > 1e-6 or
+                abs(orbit_path[-1].get('lon', 0) - last_mp['lon']) > 1e-6):
+            last = last_mp.copy()
             last['r'] = target_r
             orbit_path.append(last)
 
@@ -542,9 +546,10 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     sep_idx = None
     if trajectory and len(trajectory) > 10:
         try:
-            # Stage separation: ~2-3% of orbit circumference downrange from launch
-            # With 500-point track this is ~1% = 5 points ≈ 80km, matching real F9 MECO timing
-            sep_idx_in_traj = min(max(3, int(len(trajectory) * 0.08)), len(trajectory) - 1)
+            # Stage separation index within trajectory[].
+            # Falcon 9 MECO/sep occurs roughly 10% into the ascent trajectory
+            # (~320 km downrange with a 500-point / 40,000 km ground track).
+            sep_idx_in_traj = max(2, min(int(len(trajectory) * 0.10), len(trajectory) - 1))
 
             sep_point = trajectory[sep_idx_in_traj].copy()
             sep_radius = sep_point['r']
@@ -1072,6 +1077,14 @@ def fetch_launch_details(launch_id: str):
         return None
 
 
+def _strip_all_data(launches):
+    """Remove the heavy all_data field from a list of launch dicts in-place.
+    Raw details remain available on demand via /launch_raw/{launch_id}.
+    """
+    for launch in launches:
+        launch.pop('all_data', None)
+
+
 def fetch_launches(existing_previous=None, existing_upcoming=None):
     """Fetch SpaceX launch data (v2.3.0) using detailed mode to get all fields."""
     headers = {'Authorization': f'Token {LL_API_KEY}'}
@@ -1100,12 +1113,10 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
             combined_prev = sorted(parsed_prev, key=lambda x: x.get('net') or '', reverse=True)
 
         # Strip all_data from older historical launches to keep the cache lean.
-        # The most recent batch (parsed_prev) retains all_data; everything older does not.
+        # The latest API batch (limit=15) retains all_data; everything outside that batch does not.
         # Raw details remain available on demand via /launch_raw/{launch_id}.
         recent_ids = {l['id'] for l in parsed_prev if 'id' in l}
-        for launch in combined_prev:
-            if launch.get('id') not in recent_ids:
-                launch.pop('all_data', None)
+        _strip_all_data([l for l in combined_prev if l.get('id') not in recent_ids])
     except Exception as e:
         print(f"Error fetching previous launches: {e}")
 
@@ -1237,8 +1248,7 @@ def seed_historical_launches():
 
             # Strip all_data from seeded historical launches to save memory.
             # Raw details are available on demand via /launch_raw/{launch_id}.
-            for launch in parsed_new:
-                launch.pop('all_data', None)
+            _strip_all_data(parsed_new)
 
             # Filter out duplicates (possible if multiple launches have exact same timestamp)
             existing_ids = {l['id'] for l in existing_previous if 'id' in l}
