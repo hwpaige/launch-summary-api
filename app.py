@@ -200,15 +200,110 @@ def save_cache_to_file(filename, data, updated_at=None):
         print(f"Error saving cache file: {e}")
 
 
-def compute_orbit_radius(orbit_label):
-    """Compute orbital radius based on orbit type."""
+# ── Orbital-mechanics physical constants ──────────────────────────────────────
+_EARTH_RADIUS_KM = 6371.0          # mean Earth radius, km
+_GM_KM3_S2 = 3.986004418e5         # Earth gravitational parameter, km³/s²
+_J2 = 1.08263e-3                   # Earth oblateness coefficient
+# Use the sidereal year (365.25636 d) — the correct period for J2 RAAN precession
+_N_SUN_RAD_S = 2 * math.pi / (365.25636 * 24 * 3600)  # Earth mean motion around Sun, rad/s
+_EARTH_SIDEREAL_DAY_S = 86164.1    # sidereal rotation period, s
+# Pre-computed orbital circumference at Earth's surface (km); used for landing-range fractions
+_EARTH_CIRCUMFERENCE_KM = 2 * math.pi * _EARTH_RADIUS_KM
+
+
+def _compute_sso_inclination_deg(altitude_km: float) -> float:
+    """Return the Sun-synchronous inclination for a circular orbit at altitude_km.
+
+    Derived from the J2-driven RAAN drift condition:
+      dΩ/dt = -(3/2) * J2 * (R_E/a)² * n * cos(i) = n_sun
+    Solving for i:
+      cos(i) = -n_sun / [(3/2) * J2 * (R_E/a)² * n]
+
+    Valid range is roughly 200–2000 km.  Outside this range the cosine saturates
+    at ±1 and a warning is logged.
+    """
+    a_m = (_EARTH_RADIUS_KM + altitude_km) * 1e3          # semi-major axis, m
+    R_E_m = _EARTH_RADIUS_KM * 1e3
+    GM_m3 = _GM_KM3_S2 * 1e9                               # m³/s²
+    n = math.sqrt(GM_m3 / a_m ** 3)                        # mean motion, rad/s
+    cos_i_raw = -_N_SUN_RAD_S / (1.5 * _J2 * (R_E_m / a_m) ** 2 * n)
+    if not (-1.0 <= cos_i_raw <= 1.0):
+        logger.warning(
+            f"SSO inclination: altitude {altitude_km} km is outside the valid SSO range "
+            f"(cos i = {cos_i_raw:.4f} clamped to [-1, 1])"
+        )
+    cos_i = max(-1.0, min(1.0, cos_i_raw))
+    return math.degrees(math.acos(cos_i))
+
+
+def compute_orbital_period_min(orbit_label: str) -> float:
+    """Return orbital period in minutes using Kepler's third law.
+
+    Altitude assumptions per orbit family:
+      Suborbital  – 20 min arc (not a closed orbit)
+      LEO         – 400 km  (~92.6 min)
+      ISS         – 420 km  (~92.7 min)
+      SSO / Polar – 550 km  (~95.6 min)
+      MEO (GPS)   – 20 200 km (~717.9 min)
+      GTO         – a = (perigee_r + apogee_r)/2, perigee 185 km, apogee 35 786 km (~630.8 min)
+      GEO         – 35 786 km (1 436 min, one sidereal day)
+    """
     label = (orbit_label or '').lower()
-    EARTH_RADIUS = 1.0  # Normalized
-    if 'gto' in label:
-        return 1.15  # Geostationary Transfer
+    R_E = _EARTH_RADIUS_KM
+
     if 'suborbital' in label:
-        return 1.05
-    return 1.08  # Standard LEO
+        return 20.0
+    if (('geo' in label and 'stationary' in label)
+            or 'geosynchronous' in label
+            or label.strip() == 'geo'):
+        alt_km = 35786.0
+    elif 'gto' in label or 'geosynchronous transfer' in label:
+        # Semi-major axis of GTO from the average of perigee and apogee radii
+        alt_km = ((R_E + 185.0) + (R_E + 35786.0)) / 2.0 - R_E
+    elif 'meo' in label or 'medium earth' in label:
+        alt_km = 20200.0                   # GPS altitude
+    elif 'sso' in label or 'sun-synchronous' in label:
+        alt_km = 550.0
+    elif 'polar' in label:
+        alt_km = 600.0
+    elif 'iss' in label or 'space station' in label:
+        alt_km = 420.0
+    else:
+        alt_km = 400.0                     # generic LEO
+
+    a_km = R_E + alt_km
+    T_sec = 2.0 * math.pi * math.sqrt(a_km ** 3 / _GM_KM3_S2)
+    return T_sec / 60.0
+
+
+def compute_orbit_radius(orbit_label: str) -> float:
+    """Return normalized orbital radius (Earth radii = 1.0 at surface).
+
+    Values are physically derived from (R_E + altitude) / R_E.
+    GEO and MEO are capped at visually meaningful display limits so they
+    remain on-screen in the globe renderer.
+    """
+    label = (orbit_label or '').lower()
+    R_E = _EARTH_RADIUS_KM
+
+    if (('geo' in label and 'stationary' in label)
+            or 'geosynchronous' in label
+            or label.strip() == 'geo'):
+        return min(2.0, (R_E + 35786.0) / R_E)    # physically ~6.62 → capped
+    if 'gto' in label or 'geosynchronous transfer' in label:
+        return 1.15                                 # representative apogee height
+    if 'meo' in label or 'medium earth' in label:
+        return 1.25                                 # GPS (physical 4.17 → scaled)
+    if 'sso' in label or 'sun-synchronous' in label:
+        return round((R_E + 550.0) / R_E, 4)       # ≈ 1.0863
+    if 'polar' in label:
+        return round((R_E + 600.0) / R_E, 4)       # ≈ 1.0942
+    if 'iss' in label or 'space station' in label:
+        return round((R_E + 420.0) / R_E, 4)       # ≈ 1.0659
+    if 'suborbital' in label:
+        return round((R_E + 100.0) / R_E, 4)       # Kármán line ≈ 1.0157
+    # Generic LEO (~400 km, Starlink / Falcon 9 standard shell)
+    return round((R_E + 400.0) / R_E, 4)           # ≈ 1.0628
 
 
 def _ang_dist_deg(p1, p2):
@@ -261,7 +356,7 @@ def generate_ground_track(start_point, inclination_deg, num_points=2000, descend
     sili = math.sin(i_rad)
 
     points = []
-    omega_e = 2 * math.pi / 86400.0
+    omega_e = 2 * math.pi / _EARTH_SIDEREAL_DAY_S   # sidereal rotation rate, rad/s
     period_sec = duration_min * 60
 
     for k in range(num_points):
@@ -359,38 +454,92 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     def _normalize_orbit(orbit_label: str, site_name: str) -> str:
         try:
             label = (orbit_label or '').lower()
-            if 'gto' in label or 'geostationary' in label:
+            # GEO / GTO — evaluate GEO before the shorter 'geo' substring check
+            if (('geo' in label and 'stationary' in label)
+                    or 'geosynchronous' in label
+                    or label.strip() == 'geo'):
+                return 'GEO'
+            if 'gto' in label or 'geosynchronous transfer' in label:
                 return 'GTO'
             if 'suborbital' in label:
                 return 'Suborbital'
-            # Explicit Polar/SSO detection
-            if any(k in label for k in ['polar', 'sso', 'sun-synchronous']):
-                return 'LEO-Polar'
+            if 'meo' in label or 'medium earth' in label:
+                return 'MEO'
+            # SSO and polar before generic LEO
+            if 'sso' in label or 'sun-synchronous' in label:
+                return 'SSO'
+            if 'polar' in label:
+                return 'Polar'
+            if 'iss' in label or 'space station' in label:
+                return 'ISS'
             if 'leo' in label or 'low earth orbit' in label:
+                # Vandenberg LEO launches are polar/SSO by convention
                 if 'Vandenberg' in site_name:
-                    return 'LEO-Polar'
-                return 'LEO-Equatorial'
-            return 'Default'
+                    return 'SSO'
+                return 'LEO'
+            # Vandenberg catch-all → SSO
+            if 'Vandenberg' in site_name:
+                return 'SSO'
+            return 'LEO'
         except Exception:
-            return 'Default'
+            return 'LEO'
 
     normalized_orbit = _normalize_orbit(orbit, launch_site.get('name', ''))
 
     # Resolve an inclination assumption
     def _resolve_inclination_deg(norm_orbit: str, site_name: str, site_lat: float) -> float:
+        """Return best-estimate orbital inclination in degrees.
+
+        Priority order:
+        1. Mission-name keyword overrides (ISS, Crew/Cargo Dragon, Starlink shell hints)
+        2. Orbit-type formulas (SSO via J2, GPS/MEO standard, GTO ≈ site latitude)
+        3. Generic LEO fallback clamped to a physically achievable range
+        """
         try:
             label = (orbit or '').lower()
-            if 'iss' in label:
+
+            # ── Mission-specific overrides ────────────────────────────────────
+            if 'iss' in label or 'crew dragon' in label or 'cargo dragon' in label:
+                return 51.6   # ISS inclination
+
+            # Starlink: shell depends on launch site and payload name hints
+            if 'starlink' in label:
+                if 'Vandenberg' in site_name:
+                    return _compute_sso_inclination_deg(550.0)  # ~97.6° polar shell
+                if 'polar' in label or '70' in label:
+                    return 70.0   # high-inclination Starlink shell (~70°)
+                return 53.0       # most common Starlink shell from KSC
+
+            # ── Orbit-type formulas ───────────────────────────────────────────
+            if norm_orbit in ('SSO', 'Polar') or 'sso' in label or 'sun-synchronous' in label:
+                # SSO inclination is altitude-dependent (J2 perturbation theory)
+                # Use 550 km for SSO, 600 km for generic polar
+                alt = 600.0 if norm_orbit == 'Polar' else 550.0
+                return _compute_sso_inclination_deg(alt)
+
+            if norm_orbit == 'MEO':
+                return 55.0   # GPS / MEO standard inclination
+
+            if norm_orbit == 'ISS':
                 return 51.6
-            if norm_orbit == 'LEO-Polar' or 'sso' in label or 'sun-synchronous' in label:
-                return 97.5  # Better average for SSO
-            if norm_orbit == 'LEO-Equatorial':
-                base = abs(site_lat)
-                return max(20.0, min(60.0, base + 0.5))
+
+            if norm_orbit == 'GEO':
+                # Direct-to-GEO inclination target is 0°; GTO transfers aim near 0°
+                return 0.0
+
             if norm_orbit == 'GTO':
-                return max(20.0, min(35.0, abs(site_lat)))
+                # Minimum-energy GTO: launch due east → inclination ≈ site latitude.
+                # Subtract a small correction (~0.5°) for typical azimuth biasing.
+                return max(18.0, min(35.0, abs(site_lat) - 0.5))
+
             if norm_orbit == 'Suborbital':
                 return max(10.0, min(45.0, abs(site_lat)))
+
+            # ── Generic LEO ───────────────────────────────────────────────────
+            # Minimum inclination = |site_lat|; add small gravity-turn offset
+            base = abs(site_lat)
+            return max(28.0, min(60.0, base + 0.5))
+
         except Exception:
             pass
         return 30.0
@@ -401,7 +550,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         launch_site.get('lat', 0.0)
     )
 
-    ORBIT_CACHE_VERSION = 'v240-accurate-groundtrack'
+    ORBIT_CACHE_VERSION = 'v260-orbital-mechanics'
     landing_type = next_launch.get('landing_type')
     landing_loc = next_launch.get('landing_location')
     cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl, 1)}:{landing_type}:{landing_loc}"
@@ -498,18 +647,43 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     # Main generation
     target_r = compute_orbit_radius(orbit)
 
-    # Heuristic for launch direction: VAFB launches are usually descending (Southward)
-    is_desc = False
-    if 'Vandenberg' in launch_site.get('name', '') or 'SLC-4E' in pad:
-        is_desc = True
+    # Polar and SSO orbits from VAFB launch southward (descending pass); all
+    # other sites launch eastward on the ascending pass.
+    is_desc = normalized_orbit in ('SSO', 'Polar') and (
+        'Vandenberg' in launch_site.get('name', '') or 'SLC-4E' in pad
+    )
 
-    # Generate the Master Path (The Orbit Ground Track)
-    # Accounting for Earth's rotation makes the orbit path more realistic.
-    master_path = generate_ground_track(launch_site, assumed_incl, num_points=2000, descending=is_desc, duration_min=90)
+    # Orbital period drives both the ground-track duration and ascent fractions.
+    orbital_period_min = compute_orbital_period_min(orbit or normalized_orbit)
 
-    # The ascent trajectory is a segment of the SAME Master Path
-    # LEO insertion usually happens ~2000-3000km downrange (~6-8% of ground track)
-    traj_len = int(len(master_path) * 0.08)
+    # Generate the Master Path (full one-orbit ground track).
+    # Using the true sidereal orbital period gives accurate Earth-rotation westward
+    # drift between successive ground-track passes.
+    master_path = generate_ground_track(
+        launch_site, assumed_incl,
+        num_points=2000, descending=is_desc,
+        duration_min=orbital_period_min
+    )
+
+    # ── Ascent trajectory fraction ────────────────────────────────────────────
+    # Falcon 9 / Starship reach orbit insertion ~9 min after lift-off for LEO,
+    # ~9 min for GTO (SECO), and slightly longer for SSO/polar missions.
+    # Suborbital missions reach apogee in ~5 min.
+    # Values are representative of historical Falcon 9 telemetry.
+    ASCENT_TIME_MIN = {
+        'GTO': 9.0, 'GEO': 9.0,
+        'SSO': 9.5, 'Polar': 9.5,
+        'LEO': 9.0, 'ISS': 9.0,
+        'MEO': 10.0,
+        'Suborbital': 5.0,
+    }.get(normalized_orbit, 9.0)
+
+    # Fraction of master_path that represents the ascent phase.
+    # 20% upper cap prevents ascent from visually overlapping the orbit ring for
+    # very short periods; 2.5% lower floor ensures a minimum visible ascent path
+    # even for long-period orbits (GTO, GEO) where insertion is a tiny fraction.
+    traj_frac = min(0.20, max(0.025, ASCENT_TIME_MIN / orbital_period_min))
+    traj_len = max(50, int(len(master_path) * traj_frac))
     trajectory = [p.copy() for p in master_path[:traj_len]]
 
     # The orbit path is the REMAINING part of the Master Path to avoid overlap
@@ -522,20 +696,25 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     for p in orbit_path:
         p['r'] = target_r
 
-    # Add radii to main trajectory (Ascent profile)
+    # Add radii to main trajectory (ascent altitude profile).
+    # Exponent 0.4 approximates a real gravity-turn: very steep initial vertical
+    # climb (first ~10 s) then a flattening pitch-over toward horizontal.
+    # Lower values (< 0.5) give a sharper initial knee, higher values are more
+    # gradual; 0.4 best matches Falcon 9 altitude-vs-time telemetry.
     for i, p in enumerate(trajectory):
-        progress = i / (len(trajectory) - 1)
-        # Smoother climb from surface (1.0) to orbit radius
-        # Using 0.5 power for a steeper initial climb (reaching ~70km at MECO)
-        p['r'] = 1.0 + (target_r - 1.0) * (progress ** 0.5)
+        progress = i / max(1, len(trajectory) - 1)
+        p['r'] = 1.0 + (target_r - 1.0) * (progress ** 0.4)
 
-    # Booster Return Trajectory (RTLS vs ASDS vs Expendable simulation)
+    # ── Booster Return Trajectory ─────────────────────────────────────────────
+    # MECO (stage separation) for Falcon 9 occurs at T+~2:30 regardless of
+    # mission type.  Compute the corresponding index into the ascent trajectory.
+    MECO_TIME_MIN = 2.5
+    sep_frac = MECO_TIME_MIN / max(0.1, ASCENT_TIME_MIN)
     booster_trajectory = []
     sep_idx = None
     if trajectory and len(trajectory) > 10:
         try:
-            # MECO is typically ~80km downrange, which is 4 points in a 2000-point 40000km orbit
-            sep_idx = max(4, int(len(master_path) * 0.002))
+            sep_idx = max(4, min(int(len(trajectory) * sep_frac), len(trajectory) - 10))
 
             sep_point = trajectory[sep_idx].copy()
             sep_radius = sep_point['r']
@@ -550,44 +729,52 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             rtls_keywords = ['RTLS', 'LAUNCH SITE', 'CATCH', 'TOWER', 'LZ', 'LANDING ZONE']
 
             if any(k in combined_landing_info for k in asds_keywords):
-                # Droneship landing: ~600-700km downrange
-                dist_frac = 0.016  # ~640km
-                if normalized_orbit == 'GTO':
-                    dist_frac = 0.018  # ~720km
-
+                # ASDS droneship: Falcon 9 lands ~650 km downrange for LEO,
+                # ~690 km for GTO (longer coast after higher-energy MECO).
+                # Express as fraction of the orbital circumference (≈ 40 030 km).
+                asds_km = 690.0 if normalized_orbit == 'GTO' else 650.0
+                dist_frac = asds_km / _EARTH_CIRCUMFERENCE_KM
                 landing_idx = min(len(master_path) - 1, int(len(master_path) * dist_frac))
                 landing_point = master_path[landing_idx]
 
                 return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
 
-                # Add radius to return part (ballistic arc)
+                # Altitude profile: parabolic arc peaking at ~80 km above sep altitude
+                # (ASDS peak ≈ 80 km; RTLS peak ≈ 150 km)
+                peak_dr = (80.0 / _EARTH_RADIUS_KM)
                 for i, p in enumerate(return_part):
-                    prog = i / (len(return_part) - 1)
-                    # Parabolic arc peaking at sep_radius + 0.01, then down to surface (1.0)
-                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
+                    prog = i / max(1, len(return_part) - 1)
+                    p['r'] = (sep_radius + (1.0 - sep_radius) * prog
+                              + peak_dr * math.sin(prog * math.pi))
 
                 booster_trajectory = return_part
                 sep_idx = 0  # Indicates start of booster_trajectory in visual tools
-                logger.info(f"Generated accurate ASDS booster trajectory (dist: ~650km)")
+                logger.info(f"Generated accurate ASDS booster trajectory (~{asds_km:.0f} km)")
             elif any(k in combined_landing_info for k in rtls_keywords):
-                # RTLS/Catch: returns to launch site
+                # RTLS / Mechazilla catch: booster returns to launch site with a
+                # higher boostback arc (~150 km peak above sep altitude).
                 return_part = generate_curved_trajectory(sep_point, launch_site, 100, orbit_type='suborbital')
+                peak_dr = (150.0 / _EARTH_RADIUS_KM)
                 for i, p in enumerate(return_part):
-                    prog = i / (len(return_part) - 1)
-                    # Higher arc for RTLS boostback (~150km peak)
-                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.02 * math.sin(prog * math.pi)
+                    prog = i / max(1, len(return_part) - 1)
+                    p['r'] = (sep_radius + (1.0 - sep_radius) * prog
+                              + peak_dr * math.sin(prog * math.pi))
 
                 booster_trajectory = return_part
                 sep_idx = 0
                 logger.info(f"Generated accurate RTLS booster trajectory")
             elif any(k in combined_landing_info for k in ['OCEAN', 'SPLASHDOWN']):
-                # Ballistic splashdown further downrange than RTLS but before ASDS
-                landing_idx = min(len(master_path) - 1, int(len(master_path) * 0.01))
+                # Expendable ocean splashdown: ~400 km downrange (between RTLS and ASDS)
+                ocean_km = 400.0
+                dist_frac = ocean_km / _EARTH_CIRCUMFERENCE_KM
+                landing_idx = min(len(master_path) - 1, int(len(master_path) * dist_frac))
                 landing_point = master_path[landing_idx]
                 return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
+                peak_dr = (60.0 / _EARTH_RADIUS_KM)
                 for i, p in enumerate(return_part):
-                    prog = i / (len(return_part) - 1)
-                    p['r'] = sep_radius + (1.0 - sep_radius) * prog + 0.01 * math.sin(prog * math.pi)
+                    prog = i / max(1, len(return_part) - 1)
+                    p['r'] = (sep_radius + (1.0 - sep_radius) * prog
+                              + peak_dr * math.sin(prog * math.pi))
                 booster_trajectory = return_part
                 sep_idx = 0
                 logger.info(f"Generated Ocean splashdown booster trajectory")
@@ -623,7 +810,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             'inclination_deg': assumed_incl,
             'landing_type': landing_type,
             'landing_location': next_launch.get('landing_location'),
-            'model': 'v11-non-overlapping-orbit'
+            'model': 'v13-orbital-mechanics'
         }
         save_cache_to_file(TRAJECTORY_CACHE_FILE, traj_cache, datetime.now(pytz.utc))
     except Exception as e:
