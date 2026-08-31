@@ -79,7 +79,7 @@ Returns the full, unpruned raw API response for a specific launch from the cache
 *   **Sample Response:** (Large nested JSON object)
 
 ### 5. Get Weather Data
-Returns parsed METAR weather data for SpaceX launch and development sites (Starbase, Vandy, Cape, Hawthorne), enhanced with high-frequency live wind data from the National Weather Service (NWS) API.
+Returns parsed METAR weather data for SpaceX launch and development sites (Starbase, Vandy, Cape, Hawthorne, Bastrop), enhanced with high-frequency live wind data from the National Weather Service (NWS) API.
 
 *   **Endpoint:** `GET /weather/{location}` or `GET /weather_all`
 *   **Parameters:** `force=true` (optional)
@@ -147,7 +147,8 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
     },
     "Vandy": { "temperature_c": 12, "last_updated": "2026-01-04T14:55:00Z" },
     "Cape": { "temperature_c": 22, "last_updated": "2026-01-04T14:55:00Z" },
-    "Hawthorne": { "temperature_c": 19, "last_updated": "2026-01-04T14:55:00Z" }
+    "Hawthorne": { "temperature_c": 19, "last_updated": "2026-01-04T14:55:00Z" },
+    "Bastrop": { "temperature_c": 28, "last_updated": "2026-01-04T14:55:00Z" }
   },
   "last_updated": "2026-01-04T14:55:00Z"
 }
@@ -223,7 +224,39 @@ Manually triggers the API to poll for new launches and generate new narratives u
 ```
 *   **Behavior:** Incremental. It only generates narratives for launches not already in the cache.
 
-### 9. Utility Endpoints
+### 9. Dashboard Snapshot (Recommended for Kiosk / PWA)
+One response with every cloud-side payload the dashboard needs. Device hardware, Wi-Fi, brightness, hostname, and local settings stay on the Pi.
+
+*   **Endpoint:** `GET /dashboard`
+*   **Parameters:**
+    *   `tz` (optional IANA timezone, e.g. `America/Chicago`)
+    *   `location` (optional site name: `Starbase`, `Vandy`, `Cape`, `Hawthorne`, `Bastrop` — used to pick timezone if `tz` is omitted)
+    *   `include_calendar=true` (optional, default true)
+    *   `force=true` (optional)
+*   **Response Fields:**
+    *   `locations`: site coords, timezones, METAR stations, Windy embed URLs
+    *   `launches`: slim upcoming/previous launches (`all_data` stripped; trajectory kept on the next launch)
+    *   `weather`: all sites including Bastrop
+    *   `narratives.descriptions` / `narratives.prepared`: raw ticker strings plus timezone-adjusted rows with launch metadata
+    *   `next_launch`: next T- launch, or in-window T+ launch if nothing is upcoming
+    *   `upcoming`: next 10 dated launches with `local_date` / `local_time`
+    *   `trends`: current-year cumulative + rolling 12-month series for Starship / Falcon 9 / Falcon Heavy
+    *   `calendar`: `YYYY-MM-DD` → slim launches (omitted if `include_calendar=false`)
+    *   `trajectory`: next-launch globe path
+    *   `closest_x_video_url`: nearest-in-time X/Twitter webcast
+    *   `last_updated`: per-source timestamps
+
+### 10. Derived Launch Helpers
+These are the same fields as `/dashboard`, split out for clients that already have launch data cached.
+
+*   **Site metadata:** `GET /locations`
+*   **Next launch:** `GET /next_launch?tz=America/Chicago` (or `location=Starbase`)
+*   **Upcoming list:** `GET /upcoming_launches?tz=...&limit=10`
+*   **Calendar:** `GET /calendar?tz=...`
+*   **Trends:** `GET /launch_trends` or `GET /launch_trends?mode=cumulative` / `mode=rolling`
+*   **Trajectory:** `GET /trajectory` (next launch) or `GET /trajectory/{launch_id}`
+
+### 11. Utility Endpoints
 *   **Get Single Launch Details:** `GET /launch_details/{launch_id}`
     *   Returns full raw API response for a specific launch from the LL API.
     *   **Sample Response:** (Large JSON object containing technical mission/rocket/pad details)
@@ -241,39 +274,12 @@ Manually triggers the API to poll for new launches and generate new narratives u
 }
 ```
 
-### 10. Spotify Auth Relay
-Allows this API to relay Spotify OAuth callback results to remote dashboard/device clients.
-
-*   **Callback Endpoint:** `GET /spotify/callback`
-    *   Called by your Spotify app redirect URI.
-    *   Reads query params: `code`, `state`, `error`.
-    *   Stores `{code,state,error,ts}` by state with short TTL (default 300 seconds).
-    *   Returns simple HTML confirming success/failure and that the page can be closed.
-*   **Poll Endpoint:** `GET /spotify/oauth-result?state=...`
-    *   Requires header `X-Relay-Key`.
-    *   Optional header `X-Device-Id` for cleaner per-device rate limiting.
-    *   Returns `{"pending": true}` if callback data has not arrived.
-    *   Returns the stored payload once, then deletes it (one-time consume).
-*   **Security behavior:**
-    *   High-entropy state validation (minimum length + safe characters).
-    *   HTTPS-only enforcement for relay endpoints (configurable).
-    *   Poll rate limit defaults to ~1 request/second per device+state.
-
-**Relay Environment Variables**
-
-*   `SPOTIFY_RELAY_KEY` (required for `/spotify/oauth-result`)
-*   `SPOTIFY_RELAY_TTL_SECONDS` (optional, default `300`, clamped to `120-600`)
-*   `SPOTIFY_RELAY_STATE_MIN_LEN` (optional, default `24`)
-*   `SPOTIFY_RELAY_REQUIRE_HTTPS` (optional, default `true`)
-*   `SPOTIFY_RELAY_POLL_WINDOW_SECONDS` (optional, default `1`)
-*   `SPOTIFY_RELAY_POLL_MAX_REQUESTS` (optional, default `1`)
-
 ---
 
 ## Interactive Dashboard
 
 Access the root URL (`/`) in any web browser to view the **API Status Dashboard**.
-*   **Tabbed Interface:** Switch between **Narratives**, **Launches**, and **Weather** views.
+*   **Tabbed Interface:** Switch between **Narratives**, **Launches**, and **Weather** views (Starbase, Vandy, Cape, Hawthorne, Bastrop).
 *   **Real-time Monitoring:** Interactive sparkline charts for traffic and efficiency with selectable time ranges (1h, 24h, 7d).
 *   **Live Metrics:** View live performance indicators like "Live Hits / Day" and system uptime.
 *   **Detailed Launch Cards:** Click any launch to see comprehensive technical data, images, mission descriptions, and raw API responses.

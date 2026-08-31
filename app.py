@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 import requests
 import ast
 import re
@@ -115,36 +115,50 @@ METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
 
-# Spotify relay config
-SPOTIFY_RELAY_KEY_DEFAULT = "spxrelay_Tp4r8Qm2Vz6Ld1Jx9Nc7Hk5Bw3Ys0FaE"
-SPOTIFY_RELAY_KEY = (os.getenv("SPOTIFY_RELAY_KEY") or SPOTIFY_RELAY_KEY_DEFAULT).strip()
-SPOTIFY_RELAY_TTL_SECONDS = max(120, min(600, int(os.getenv("SPOTIFY_RELAY_TTL_SECONDS", "300"))))
-SPOTIFY_RELAY_STATE_MIN_LEN = int(os.getenv("SPOTIFY_RELAY_STATE_MIN_LEN", "24"))
-SPOTIFY_RELAY_REQUIRE_HTTPS = os.getenv("SPOTIFY_RELAY_REQUIRE_HTTPS", "true").strip().lower() in {"1", "true", "yes",
-                                                                                                   "on"}
-SPOTIFY_RELAY_POLL_WINDOW_SECONDS = max(1, int(os.getenv("SPOTIFY_RELAY_POLL_WINDOW_SECONDS", "1")))
-SPOTIFY_RELAY_POLL_MAX_REQUESTS = max(1, int(os.getenv("SPOTIFY_RELAY_POLL_MAX_REQUESTS", "1")))
-SPOTIFY_RELAY_STATE_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
-
-_local_spotify_relay = {}
-_local_spotify_rate_limits = {}
-_spotify_relay_lock = threading.Lock()
-
-# Reliable weather stations for key launch sites (prioritized)
-METAR_STATIONS = {
-    'Starbase': ['KBRO', 'KHRL', 'KMFE'],
-    'Vandy': ['KVBG', 'KLPC', 'KSMX'],
-    'Cape': ['KXMR', 'KTTS', 'KCOF', 'KMLB'],
-    'Hawthorne': ['KHHR', 'KLAX', 'KSMO']
+# Canonical dashboard sites. Hardware/settings stay on-device; this API
+# serves weather, launches, narratives, and derived dashboard snapshots.
+DASHBOARD_LOCATIONS = {
+    'Starbase': {
+        'lat': 25.9975,
+        'lon': -97.1566,
+        'timezone': 'America/Chicago',
+        'metar_stations': ['KBRO', 'KHRL', 'KMFE'],
+        'radar_url': 'https://embed.windy.com/embed2.html?lat=25.7975&lon=-95.1566&zoom=8&level=surface&overlay=radar&menu=&message=true&marker=&calendar=&pressure=&type=map&location=coordinates&detail=&detailLat=25.9975&detailLon=-96.1566&metricWind=mph&metricTemp=%C2%B0F',
+    },
+    'Vandy': {
+        'lat': 34.632,
+        'lon': -120.611,
+        'timezone': 'America/Los_Angeles',
+        'metar_stations': ['KVBG', 'KLPC', 'KSMX'],
+        'radar_url': 'https://embed.windy.com/embed2.html?lat=34.432&lon=-118.611&zoom=8&level=surface&overlay=radar&menu=&message=true&marker=&calendar=&pressure=&type=map&location=coordinates&detail=&detailLat=34.632&detailLon=-119.611&metricWind=mph&metricTemp=%C2%B0F',
+    },
+    'Cape': {
+        'lat': 28.392,
+        'lon': -80.605,
+        'timezone': 'America/New_York',
+        'metar_stations': ['KXMR', 'KTTS', 'KCOF', 'KMLB'],
+        'radar_url': 'https://embed.windy.com/embed2.html?lat=28.192&lon=-78.605&zoom=8&level=surface&overlay=radar&menu=&message=true&marker=&calendar=&pressure=&type=map&location=coordinates&detail=&detailLat=28.392&detailLon=-79.605&metricWind=mph&metricTemp=%C2%B0F',
+    },
+    'Hawthorne': {
+        'lat': 33.916,
+        'lon': -118.352,
+        'timezone': 'America/Los_Angeles',
+        'metar_stations': ['KHHR', 'KLAX', 'KSMO'],
+        'radar_url': 'https://embed.windy.com/embed2.html?lat=33.716&lon=-116.352&zoom=8&level=surface&overlay=radar&menu=&message=true&marker=&calendar=&pressure=&type=map&location=coordinates&detail=&detailLat=33.916&detailLon=-117.352&metricWind=mph&metricTemp=%C2%B0F',
+    },
+    'Bastrop': {
+        'lat': 30.1105,
+        'lon': -97.3151,
+        'timezone': 'America/Chicago',
+        'metar_stations': ['KAUS', 'KEDC', 'KHYI'],
+        'radar_url': 'https://embed.windy.com/embed2.html?lat=29.9105&lon=-95.3151&zoom=8&level=surface&overlay=radar&menu=&message=true&marker=&calendar=&pressure=&type=map&location=coordinates&detail=&detailLat=30.1105&detailLon=-96.3151&metricWind=mph&metricTemp=%C2%B0F',
+    },
 }
 
-# Approximate coordinates for fallbacks
-LOCATION_COORDS = {
-    'Starbase': {'lat': 25.997, 'lon': -97.157},
-    'Vandy': {'lat': 34.632, 'lon': -120.611},
-    'Cape': {'lat': 28.562, 'lon': -80.577},
-    'Hawthorne': {'lat': 33.921, 'lon': -118.332}
-}
+METAR_STATIONS = {name: loc['metar_stations'] for name, loc in DASHBOARD_LOCATIONS.items()}
+LOCATION_COORDS = {name: {'lat': loc['lat'], 'lon': loc['lon']} for name, loc in DASHBOARD_LOCATIONS.items()}
+WEATHER_LOCATIONS = list(DASHBOARD_LOCATIONS.keys())
+T_PLUS_ACTIVE_WINDOW_SECONDS = 45 * 60
 HISTORY_LIMIT = 43200  # 30 days at 1 minute intervals
 SEEDING_STATUS_KEY = "seeding_status_v2"
 SEEDING_STOP_SIGNAL_KEY = "seeding_stop_signal_v2"
@@ -1562,13 +1576,8 @@ def fetch_forecast(location: str = None, lat: float = None, lon: float = None):
     """Fetch 7-day forecast (daily + hourly) from Open-Meteo."""
     increment_metric("api_calls")
     if lat is None or lon is None:
-        coords = {
-            'Starbase': (25.997, -97.156),
-            'Vandy': (34.742, -120.572),
-            'Cape': (28.483, -80.577),
-            'Hawthorne': (33.921, -118.330)
-        }
-        lat, lon = coords.get(location, (25.997, -97.156))
+        coords = LOCATION_COORDS.get(location) or LOCATION_COORDS['Starbase']
+        lat, lon = coords['lat'], coords['lon']
 
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,weathercode&hourly=temperature_2m,windspeed_10m,winddirection_10m&current_weather=true&timezone=auto"
 
@@ -1800,19 +1809,30 @@ def refresh_launches_internal():
         return None
 
 
+def _finalize_weather(data):
+    """Normalize weather objects for dashboard clients."""
+    if not isinstance(data, dict):
+        return data
+    if 'wind_gusts_kts' not in data:
+        gust = data.get('wind_gust_kts')
+        speed = data.get('wind_speed_kts') or 0
+        data['wind_gusts_kts'] = gust if gust not in (None, 0) else speed
+    return data
+
+
 def refresh_weather_internal():
     """Internal helper to refresh all weather cache."""
     print("Refreshing weather cache...")
-    locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne']
     weather_results = {}
     timestamps = []
 
-    for loc in locations:
+    for loc in WEATHER_LOCATIONS:
         data = fetch_weather(loc)
         forecast = fetch_forecast(loc)
         data['forecast'] = forecast
         last_updated = datetime.now(timezone.utc).isoformat()
         data['last_updated'] = last_updated
+        _finalize_weather(data)
         weather_results[loc] = data
         timestamps.append(last_updated)
 
@@ -1827,148 +1847,6 @@ def refresh_weather_internal():
         "weather": weather_results,
         "last_updated": min(timestamps) if timestamps else datetime.now(timezone.utc).isoformat()
     }
-
-
-def _spotify_state_key(state: str) -> str:
-    return f"spotify:oauth:{state}"
-
-
-def _spotify_rate_limit_key(device_key: str) -> str:
-    return f"spotify:oauth:poll:{device_key}"
-
-
-def _is_valid_spotify_state(state: str) -> bool:
-    if not state or len(state) < SPOTIFY_RELAY_STATE_MIN_LEN:
-        return False
-    return bool(SPOTIFY_RELAY_STATE_RE.fullmatch(state))
-
-
-def _is_https_request(request: Request) -> bool:
-    if request.url.scheme == "https":
-        return True
-    forwarded_proto = request.headers.get("x-forwarded-proto", "")
-    return forwarded_proto.split(",")[0].strip().lower() == "https"
-
-
-def _set_spotify_relay_payload(state: str, payload: dict):
-    if r:
-        try:
-            r.setex(_spotify_state_key(state), SPOTIFY_RELAY_TTL_SECONDS, json.dumps(payload))
-            return
-        except Exception as e:
-            print(f"Redis write error for spotify relay state: {e}")
-
-    with _spotify_relay_lock:
-        _local_spotify_relay[state] = {
-            "payload": payload,
-            "expiry": int(time.time()) + SPOTIFY_RELAY_TTL_SECONDS
-        }
-
-
-def _consume_spotify_relay_payload(state: str):
-    if r:
-        try:
-            # Atomic get-and-delete for one-time consume across instances.
-            raw = r.eval(
-                "local v=redis.call('GET', KEYS[1]); if v then redis.call('DEL', KEYS[1]); end; return v",
-                1,
-                _spotify_state_key(state)
-            )
-            if not raw:
-                return None
-            return json.loads(raw)
-        except Exception as e:
-            print(f"Redis consume error for spotify relay state: {e}")
-            return None
-
-    now = int(time.time())
-    with _spotify_relay_lock:
-        item = _local_spotify_relay.pop(state, None)
-        if not item:
-            return None
-        if item.get("expiry", 0) <= now:
-            return None
-        return item.get("payload")
-
-
-def _is_spotify_poll_rate_limited(device_key: str) -> bool:
-    if r:
-        try:
-            key = _spotify_rate_limit_key(device_key)
-            count = r.incr(key)
-            if count == 1:
-                r.expire(key, SPOTIFY_RELAY_POLL_WINDOW_SECONDS)
-            return count > SPOTIFY_RELAY_POLL_MAX_REQUESTS
-        except Exception as e:
-            print(f"Redis rate-limit error for spotify relay poll: {e}")
-            return False
-
-    now = int(time.time())
-    with _spotify_relay_lock:
-        start, count = _local_spotify_rate_limits.get(device_key, (now, 0))
-        if now - start >= SPOTIFY_RELAY_POLL_WINDOW_SECONDS:
-            start, count = now, 0
-        count += 1
-        _local_spotify_rate_limits[device_key] = (start, count)
-        return count > SPOTIFY_RELAY_POLL_MAX_REQUESTS
-
-
-# --- New Endpoints ---
-
-@app.get("/spotify/callback", response_class=HTMLResponse)
-def spotify_callback(request: Request):
-    if SPOTIFY_RELAY_REQUIRE_HTTPS and not _is_https_request(request):
-        raise HTTPException(status_code=400, detail="https_required")
-
-    code = request.query_params.get("code", "")
-    state = request.query_params.get("state", "")
-    error = request.query_params.get("error", "")
-
-    if not _is_valid_spotify_state(state):
-        return HTMLResponse("<h3>Invalid or missing state</h3>", status_code=400)
-
-    payload = {
-        "code": code,
-        "state": state,
-        "error": error,
-        "ts": int(time.time())
-    }
-    _set_spotify_relay_payload(state, payload)
-
-    ok = bool(code) and not error
-    html = (
-            "<html><head><meta charset='utf-8'><title>Spotify Login</title></head>"
-            "<body style='font-family:Arial,sans-serif;background:#111;color:#eee;padding:24px;'>"
-            + ("<h3>Spotify connected.</h3><p>You can close this page.</p>" if ok
-               else "<h3>Spotify login failed.</h3><p>You can close this page and try again.</p>")
-            + "</body></html>"
-    )
-    return HTMLResponse(html, status_code=200)
-
-
-@app.get("/spotify/oauth-result")
-def spotify_oauth_result(
-        request: Request,
-        state: str = "",
-        x_relay_key: str = Header(default=""),
-        x_device_id: str = Header(default="")
-):
-    if SPOTIFY_RELAY_REQUIRE_HTTPS and not _is_https_request(request):
-        raise HTTPException(status_code=400, detail="https_required")
-    if not SPOTIFY_RELAY_KEY or x_relay_key != SPOTIFY_RELAY_KEY:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    if not _is_valid_spotify_state(state):
-        raise HTTPException(status_code=400, detail="invalid_or_missing_state")
-
-    client_ip = request.client.host if request.client else "unknown"
-    device_scope = x_device_id.strip() or client_ip
-    if _is_spotify_poll_rate_limited(f"{device_scope}:{state}"):
-        raise HTTPException(status_code=429, detail="rate_limited")
-
-    payload = _consume_spotify_relay_payload(state)
-    if not payload:
-        return JSONResponse({"pending": True})
-    return JSONResponse(payload)
 
 
 @app.get("/launches")
@@ -2049,18 +1927,27 @@ def _get_weather_cached(location: str, force: bool = False):
         try:
             cached = r.get(cache_key)
             if cached:
-                return json.loads(cached), True
-        except:
+                data = json.loads(cached)
+                if not data.get('forecast'):
+                    data['forecast'] = fetch_forecast(location)
+                    try:
+                        r.setex(cache_key, 300, json.dumps(data))
+                    except Exception:
+                        pass
+                return _finalize_weather(data), True
+        except Exception:
             pass
 
     # If force=True or cache miss, perform a foreground fetch
     data = fetch_weather(location)
+    data['forecast'] = fetch_forecast(location)
     last_updated = datetime.now(timezone.utc).isoformat()
     data['last_updated'] = last_updated
+    _finalize_weather(data)
     if r:
         try:
             r.setex(cache_key, 300, json.dumps(data))
-        except:
+        except Exception:
             pass
     return data, False
 
@@ -2093,6 +1980,7 @@ def get_user_weather(lat: float, lon: float, station_id: str = None, internal: b
     forecast = fetch_forecast(lat=lat, lon=lon)
     weather_data['forecast'] = forecast
     weather_data['last_updated'] = datetime.now(timezone.utc).isoformat()
+    _finalize_weather(weather_data)
 
     return weather_data
 
@@ -2105,28 +1993,579 @@ def get_all_weather(force: bool = False, internal: bool = False):
         increment_metric("cache_misses")
         return refresh_weather_internal()
 
-    locations = ['Starbase', 'Vandy', 'Cape', 'Hawthorne']
+    weather_payload = _load_weather_all(force=False)
+    locations = list(weather_payload.get("weather", {}).keys())
+    hit_count = sum(1 for loc in locations if weather_payload["weather"].get(loc, {}).get("last_updated"))
+    if locations and hit_count == len(locations):
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return weather_payload
+
+
+def _parse_net_dt(net_str):
+    """Parse a launch NET string into an aware UTC datetime."""
+    if not net_str:
+        return None
+    try:
+        text = str(net_str).strip()
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _resolve_tz(tz_name: str = None, location: str = None):
+    """Resolve a pytz timezone from an IANA name or dashboard location."""
+    if not tz_name and location and location in DASHBOARD_LOCATIONS:
+        tz_name = DASHBOARD_LOCATIONS[location]['timezone']
+    if tz_name:
+        try:
+            return pytz.timezone(tz_name)
+        except Exception:
+            pass
+    return pytz.UTC
+
+
+def is_launch_finished(status):
+    """True when a launch status indicates success/failure/complete."""
+    if not status:
+        return False
+    s = str(status).lower()
+    return any(keyword in s for keyword in ('success', 'failure', 'successful', 'complete'))
+
+
+def _slim_launch(launch, keep_trajectory=False):
+    if not isinstance(launch, dict):
+        return launch
+    skip = {'all_data'}
+    if not keep_trajectory:
+        skip.add('trajectory_data')
+    return {k: v for k, v in launch.items() if k not in skip}
+
+
+def _load_launch_payload(force=False):
+    cache_key = "launches_cache_v2"
+    if force:
+        data = refresh_launches_internal()
+    else:
+        data = get_cached_data(cache_key)
+    if not data:
+        return {"upcoming": [], "previous": [], "last_updated": None}
+    return data
+
+
+def _slim_launch_payload(data, keep_next_trajectory=True):
+    upcoming = data.get("upcoming", []) or []
+    previous = data.get("previous", []) or []
+    return {
+        "upcoming": [
+            _slim_launch(launch, keep_trajectory=(keep_next_trajectory and i == 0))
+            for i, launch in enumerate(upcoming)
+        ],
+        "previous": [_slim_launch(launch) for launch in previous],
+        "last_updated": data.get("last_updated"),
+    }
+
+
+def _load_narratives(force=False):
+    if force:
+        descriptions = refresh_narratives_internal() or []
+        return descriptions, datetime.now(timezone.utc).isoformat()
+    data = get_cached_data(CACHE_KEY)
+    time_str = get_cached_data(CACHE_TIME_KEY)
+    if data:
+        return data, time_str
+    cached_narratives = _local_cache.get("launch_narratives")
+    last_updated = _local_cache.get("last_updated")
+    if cached_narratives and last_updated:
+        stamp = last_updated.isoformat() if hasattr(last_updated, "isoformat") else last_updated
+        return cached_narratives, stamp
+    return [], None
+
+
+def _load_weather_all(force=False):
+    if force:
+        return refresh_weather_internal()
     weather_results = {}
     timestamps = []
-
-    hit_count = 0
-    for loc in locations:
-        res, is_hit = _get_weather_cached(loc, force)
+    for loc in WEATHER_LOCATIONS:
+        res, _is_hit = _get_weather_cached(loc, False)
         weather_results[loc] = res
-        if res.get('last_updated'):
-            timestamps.append(res.get('last_updated'))
-        if is_hit:
-            hit_count += 1
+        if res.get("last_updated"):
+            timestamps.append(res.get("last_updated"))
+    return {
+        "weather": weather_results,
+        "last_updated": min(timestamps) if timestamps else None,
+    }
 
-    if hit_count == len(locations):
+
+def get_next_launch_info(upcoming_launches, tz_obj):
+    """Find and format the next upcoming (or in-window T+) launch."""
+    current_time = datetime.now(timezone.utc)
+    future_launches = []
+    active_launches = []
+    for launch in upcoming_launches or []:
+        if launch.get("time") == "TBD":
+            continue
+        lt_utc = _parse_net_dt(launch.get("net"))
+        if not lt_utc:
+            continue
+        if lt_utc > current_time:
+            future_launches.append(launch)
+        elif not is_launch_finished(launch.get("status")):
+            elapsed = (current_time - lt_utc).total_seconds()
+            if elapsed <= T_PLUS_ACTIVE_WINDOW_SECONDS:
+                active_launches.append(launch)
+
+    valid_launches = future_launches if future_launches else active_launches
+    if not valid_launches:
+        return None
+
+    next_l = min(
+        valid_launches,
+        key=lambda x: _parse_net_dt(x.get("net")) or datetime.max.replace(tzinfo=timezone.utc),
+    )
+    launch = _slim_launch(next_l, keep_trajectory=True)
+    dt_utc = _parse_net_dt(next_l.get("net"))
+    if dt_utc:
+        local_dt = dt_utc.astimezone(tz_obj)
+        launch["local_date"] = local_dt.strftime("%Y-%m-%d")
+        launch["local_time"] = local_dt.strftime("%H:%M:%S")
+        launch["timezone"] = getattr(tz_obj, "zone", str(tz_obj))
+    return launch
+
+
+def get_upcoming_launches_list(upcoming_launches, tz_obj, limit=10):
+    """Sort and format upcoming launches for the dashboard list."""
+    current_time = datetime.now(timezone.utc)
+    valid_launches = []
+    for launch in upcoming_launches or []:
+        if launch.get("time") == "TBD":
+            continue
+        lt_utc = _parse_net_dt(launch.get("net"))
+        if not lt_utc:
+            continue
+        if lt_utc > current_time or not is_launch_finished(launch.get("status")):
+            valid_launches.append(launch)
+
+    launches = []
+    for launch in sorted(
+        valid_launches,
+        key=lambda x: _parse_net_dt(x.get("net")) or datetime.max.replace(tzinfo=timezone.utc),
+    )[:limit]:
+        item = _slim_launch(launch, keep_trajectory=False)
+        dt_utc = _parse_net_dt(launch.get("net"))
+        if dt_utc:
+            local_dt = dt_utc.astimezone(tz_obj)
+            item["local_date"] = local_dt.strftime("%Y-%m-%d")
+            item["local_time"] = local_dt.strftime("%H:%M:%S")
+        launches.append(item)
+    return launches
+
+
+def get_calendar_mapping(launch_data, tz_obj=None):
+    """Map YYYY-MM-DD (in tz_obj) to slim launch objects for the calendar view."""
+    mapping = {}
+    if not launch_data:
+        return mapping
+
+    def _append(launch, launch_type):
+        date_str = launch.get("date")
+        time_str = launch.get("time")
+        if tz_obj and launch.get("net"):
+            dt_utc = _parse_net_dt(launch.get("net"))
+            if dt_utc:
+                local_dt = dt_utc.astimezone(tz_obj)
+                date_str = local_dt.strftime("%Y-%m-%d")
+                time_str = local_dt.strftime("%H:%M:%S")
+        if not date_str:
+            return
+        typed = _slim_launch(launch, keep_trajectory=False)
+        typed["type"] = launch_type
+        typed["localDate"] = date_str
+        typed["localTime"] = f"{date_str} {time_str}" if time_str else date_str
+        mapping.setdefault(date_str, []).append(typed)
+
+    for launch in launch_data.get("previous", []) or []:
+        _append(launch, "past")
+    for launch in launch_data.get("upcoming", []) or []:
+        _append(launch, "upcoming")
+    return mapping
+
+
+def get_launch_trends_series(launches, chart_view_mode, current_year, current_month):
+    """Bucket launches by rocket family for the dashboard trends chart."""
+    rocket_types = ["Starship", "Falcon 9", "Falcon Heavy"]
+    if chart_view_mode == "cumulative":
+        all_months = [f"{current_year}-{m:02d}" for m in range(1, current_month + 1)]
+    else:
+        all_months = []
+        for i in range(11, -1, -1):
+            month = current_month - i
+            year = current_year
+            while month <= 0:
+                month += 12
+                year -= 1
+            all_months.append(f"{year}-{month:02d}")
+
+    counts = {month: {rocket: 0 for rocket in rocket_types} for month in all_months}
+    for launch in launches or []:
+        date_str = launch.get("date")
+        if not date_str or date_str == "TBD":
+            continue
+        try:
+            month_key = f"{int(date_str[:4]):04d}-{int(date_str[5:7]):02d}"
+        except (ValueError, IndexError):
+            continue
+        if month_key not in counts:
+            continue
+        rocket = launch.get("rocket", "Unknown")
+        matched = next((rt for rt in rocket_types if rt.lower() in str(rocket).lower()), None)
+        if matched:
+            counts[month_key][matched] += 1
+
+    series = []
+    for rocket in rocket_types:
+        values = []
+        cumulative = 0
+        for month in all_months:
+            val = counts[month][rocket]
+            if chart_view_mode == "cumulative":
+                cumulative += val
+                values.append(cumulative)
+            else:
+                values.append(val)
+        series.append({"label": rocket, "values": values})
+    return all_months, series
+
+
+def _parse_narratives(raw_list):
+    parsed = []
+    for item in raw_list or []:
+        if isinstance(item, dict):
+            narr = dict(item)
+            narr.setdefault("source_date", narr.get("date", ""))
+            narr.setdefault("source_text", narr.get("text", ""))
+            narr.setdefault(
+                "source_full",
+                narr.get("full")
+                or (
+                    f"{narr.get('source_date', '')}: {narr.get('source_text', '')}".strip(": ")
+                    if narr.get("source_date") or narr.get("source_text")
+                    else ""
+                ),
+            )
+            parsed.append(narr)
+            continue
+        if not isinstance(item, str):
+            continue
+        match = re.match(r"^(\d{1,2}/\d{1,2}\s+\d{4}):\s*(.*)", item)
+        if match:
+            parsed.append({
+                "date": match.group(1),
+                "text": match.group(2),
+                "full": item,
+                "source_date": match.group(1),
+                "source_text": match.group(2),
+                "source_full": item,
+            })
+        else:
+            parsed.append({
+                "date": "",
+                "text": item,
+                "full": item,
+                "source_date": "",
+                "source_text": item,
+                "source_full": item,
+            })
+    return parsed
+
+
+def prepare_narratives_for_display(narratives_list, launches=None, tz_obj=None):
+    """Attach launch metadata and rewrite narrative dates for the requested timezone."""
+    if not narratives_list:
+        return []
+    all_launches = []
+    if launches:
+        all_launches = (launches.get("upcoming", []) or []) + (launches.get("previous", []) or [])
+
+    prepared = []
+    for raw_narr in _parse_narratives(narratives_list):
+        narr = dict(raw_narr)
+        source_date = narr.get("source_date", "") or narr.get("date", "") or ""
+        source_text = narr.get("source_text", "") or narr.get("text", "") or ""
+        source_full = narr.get("source_full") or narr.get("full") or (f"{source_date}: {source_text}").strip(": ")
+        narr["source_date"] = source_date
+        narr["source_text"] = source_text
+        narr["source_full"] = source_full
+        narr["date"] = source_date
+        narr["text"] = source_text
+        narr["full"] = source_full
+        if not all_launches or not source_date:
+            prepared.append(narr)
+            continue
+        try:
+            parts = source_date.split(" ")
+            md = parts[0].split("/")
+            month = int(md[0])
+            day = int(md[1])
+            hour = -1
+            minute = -1
+            if len(parts) > 1 and len(parts[1]) == 4 and parts[1].isdigit():
+                hour = int(parts[1][:2])
+                minute = int(parts[1][2:])
+            best_match = None
+            best_match_dt = None
+            for launch in all_launches:
+                l_dt = _parse_net_dt(launch.get("net"))
+                if not l_dt:
+                    continue
+                if l_dt.month == month and l_dt.day == day:
+                    if hour != -1:
+                        if l_dt.hour == hour and abs(l_dt.minute - minute) <= 5:
+                            best_match = launch
+                            best_match_dt = l_dt
+                            break
+                    elif best_match is None:
+                        best_match = launch
+                        best_match_dt = l_dt
+            if best_match:
+                narr["status"] = best_match.get("status")
+                narr["landing_location"] = best_match.get("landing_location")
+                narr["landing_type"] = best_match.get("landing_type")
+                narr["orbit"] = best_match.get("orbit")
+                narr["rocket"] = best_match.get("rocket")
+                narr["pad"] = best_match.get("pad")
+                narr["mission"] = best_match.get("mission")
+                display_dt = best_match_dt.astimezone(tz_obj) if tz_obj else best_match_dt
+                display_date = f"{display_dt.month}/{display_dt.day} {display_dt.hour:02d}{display_dt.minute:02d}"
+                narr["date"] = f"{display_date} {display_dt.strftime('%Z')}".strip()
+                narr["day_of_week"] = display_dt.strftime("%a")
+                narr["timezone_abbrev"] = display_dt.strftime("%Z")
+                narr["full"] = f"{display_date}: {source_text}".strip() if source_text else display_date
+        except Exception:
+            pass
+        prepared.append(narr)
+    return prepared
+
+
+def get_closest_x_video_url(launch_data):
+    if not launch_data:
+        return ""
+    current_time = datetime.now(timezone.utc)
+    closest_url = ""
+    min_diff = float("inf")
+    for launch in (launch_data.get("previous", []) or []) + (launch_data.get("upcoming", []) or []):
+        x_url = launch.get("x_video_url")
+        if not x_url:
+            v_url = launch.get("video_url", "") or ""
+            if "x.com" in v_url.lower() or "twitter.com" in v_url.lower():
+                x_url = v_url
+        if not x_url:
+            continue
+        launch_net = _parse_net_dt(launch.get("net"))
+        if not launch_net:
+            continue
+        diff = abs((current_time - launch_net).total_seconds())
+        if diff < min_diff:
+            min_diff = diff
+            closest_url = x_url
+    return closest_url
+
+
+def _find_launch_by_id(launch_data, launch_id):
+    if not launch_data or not launch_id:
+        return None
+    for launch in (launch_data.get("upcoming", []) or []) + (launch_data.get("previous", []) or []):
+        if launch.get("id") == launch_id:
+            return launch
+    return None
+
+
+def _build_trends(launch_data, mode=None):
+    now = datetime.now(timezone.utc)
+    launches = (launch_data.get("previous", []) or []) + (launch_data.get("upcoming", []) or [])
+    if mode:
+        months, series = get_launch_trends_series(launches, mode, now.year, now.month)
+        return {"year": now.year, "month": now.month, "mode": mode, "months": months, "series": series}
+    cumulative_months, cumulative_series = get_launch_trends_series(
+        launches, "cumulative", now.year, now.month
+    )
+    rolling_months, rolling_series = get_launch_trends_series(
+        launches, "rolling", now.year, now.month
+    )
+    return {
+        "year": now.year,
+        "month": now.month,
+        "cumulative": {"months": cumulative_months, "series": cumulative_series},
+        "rolling": {"months": rolling_months, "series": rolling_series},
+    }
+
+
+@app.get("/locations")
+def get_dashboard_locations(internal: bool = False):
+    """Site metadata used by the kiosk (weather, Windy, timezone)."""
+    if not internal:
+        increment_metric("total_requests")
+        increment_metric("cache_hits")
+    return {"locations": DASHBOARD_LOCATIONS}
+
+
+@app.get("/next_launch")
+def get_next_launch(tz: str = None, location: str = None, force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
+    tz_obj = _resolve_tz(tz, location)
+    data = _load_launch_payload(force)
+    if data.get("upcoming") or data.get("previous"):
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return {
+        "next_launch": get_next_launch_info(data.get("upcoming", []), tz_obj),
+        "timezone": getattr(tz_obj, "zone", str(tz_obj)),
+        "last_updated": data.get("last_updated"),
+    }
+
+
+@app.get("/upcoming_launches")
+def get_upcoming_launches(
+    tz: str = None,
+    location: str = None,
+    limit: int = 10,
+    force: bool = False,
+    internal: bool = False,
+):
+    if not internal:
+        increment_metric("total_requests")
+    tz_obj = _resolve_tz(tz, location)
+    data = _load_launch_payload(force)
+    if data.get("upcoming") or data.get("previous"):
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return {
+        "upcoming": get_upcoming_launches_list(data.get("upcoming", []), tz_obj, limit=max(1, min(limit, 50))),
+        "timezone": getattr(tz_obj, "zone", str(tz_obj)),
+        "last_updated": data.get("last_updated"),
+    }
+
+
+@app.get("/calendar")
+def get_calendar(tz: str = None, location: str = None, force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
+    tz_obj = _resolve_tz(tz, location)
+    data = _load_launch_payload(force)
+    if data.get("upcoming") or data.get("previous"):
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return {
+        "calendar": get_calendar_mapping(data, tz_obj),
+        "timezone": getattr(tz_obj, "zone", str(tz_obj)),
+        "last_updated": data.get("last_updated"),
+    }
+
+
+@app.get("/launch_trends")
+def get_launch_trends(mode: str = None, force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
+    data = _load_launch_payload(force)
+    if data.get("upcoming") or data.get("previous"):
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    normalized = None
+    if mode:
+        mode_key = mode.strip().lower()
+        if mode_key in ("cumulative", "rolling", "monthly"):
+            normalized = "cumulative" if mode_key == "cumulative" else "rolling"
+    return {
+        "trends": _build_trends(data, normalized),
+        "last_updated": data.get("last_updated"),
+    }
+
+
+@app.get("/trajectory")
+@app.get("/trajectory/{launch_id}")
+def get_trajectory(launch_id: str = None, force: bool = False, internal: bool = False):
+    if not internal:
+        increment_metric("total_requests")
+    data = _load_launch_payload(force)
+    upcoming = data.get("upcoming", []) or []
+    previous = data.get("previous", []) or []
+    target = _find_launch_by_id(data, launch_id) if launch_id else (upcoming[0] if upcoming else (previous[0] if previous else None))
+    if not target:
+        increment_metric("cache_misses")
+        return {"trajectory": None, "error": "Launch not found"}
+    existing = target.get("trajectory_data")
+    if existing and isinstance(existing, dict) and not launch_id:
+        increment_metric("cache_hits")
+        return {"trajectory": existing, "launch_id": target.get("id"), "mission": target.get("mission")}
+    traj = get_launch_trajectory_data(target, previous)
+    if traj:
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return {"trajectory": traj, "launch_id": target.get("id"), "mission": target.get("mission")}
+
+
+@app.get("/dashboard")
+def get_dashboard(
+    tz: str = None,
+    location: str = None,
+    include_calendar: bool = True,
+    force: bool = False,
+    internal: bool = False,
+):
+    """Combined snapshot of all dashboard app data (not hardware/settings)."""
+    if not internal:
+        increment_metric("total_requests")
+    tz_obj = _resolve_tz(tz, location)
+    launch_data = _load_launch_payload(force)
+    weather_payload = _load_weather_all(force)
+    descriptions, narratives_updated = _load_narratives(force)
+    slim = _slim_launch_payload(launch_data, keep_next_trajectory=True)
+    next_launch = get_next_launch_info(launch_data.get("upcoming", []), tz_obj)
+    upcoming_list = get_upcoming_launches_list(launch_data.get("upcoming", []), tz_obj, limit=10)
+    if slim.get("upcoming") or slim.get("previous") or weather_payload.get("weather") or descriptions:
         increment_metric("cache_hits")
     else:
         increment_metric("cache_misses")
 
-    return {
-        "weather": weather_results,
-        "last_updated": min(timestamps) if timestamps else None
+    payload = {
+        "locations": DASHBOARD_LOCATIONS,
+        "launches": slim,
+        "weather": weather_payload.get("weather", {}),
+        "narratives": {
+            "descriptions": descriptions,
+            "prepared": prepare_narratives_for_display(descriptions, launch_data, tz_obj),
+            "last_updated": narratives_updated,
+        },
+        "next_launch": next_launch,
+        "upcoming": upcoming_list,
+        "trends": _build_trends(launch_data),
+        "trajectory": (next_launch or {}).get("trajectory_data")
+        or (slim.get("upcoming") or [{}])[0].get("trajectory_data"),
+        "closest_x_video_url": get_closest_x_video_url(launch_data),
+        "timezone": getattr(tz_obj, "zone", str(tz_obj)),
+        "location": location if location in DASHBOARD_LOCATIONS else None,
+        "last_updated": {
+            "launches": slim.get("last_updated"),
+            "weather": weather_payload.get("last_updated"),
+            "narratives": narratives_updated,
+        },
     }
+    if include_calendar:
+        payload["calendar"] = get_calendar_mapping(launch_data, tz_obj)
+    return payload
 
 
 @app.get("/launch_details/{launch_id}")
@@ -3354,7 +3793,7 @@ def dashboard(request: Request):
 
             // Show loaders
             container.innerHTML = '';
-            ['Starbase', 'Vandy', 'Cape', 'Hawthorne'].forEach(loc => {
+            ['Starbase', 'Vandy', 'Cape', 'Hawthorne', 'Bastrop'].forEach(loc => {
                 const card = document.createElement('div');
                 card.className = 'bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col gap-4';
                 card.innerHTML = `<div class="animate-pulse h-32 bg-slate-800 rounded"></div>`;
