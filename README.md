@@ -32,13 +32,16 @@ Returns a chronological list (newest first) of witty descriptions for recent Spa
 ```
 *   **Caching:** Results are cached for 1 hour. The API uses incremental generation to append new launches without changing existing witty descriptions.
 
-### 2. Get Detailed Launch Data
-Returns exhaustive structured data for both upcoming and previous SpaceX launches. This endpoint includes the full, raw response from the Launch Library v2.3.0 API in the `all_data` field for every launch.
+### 2. Get Launch Data (default slim)
+Returns structured upcoming and previous SpaceX launches. **Default payload is slim** (no `all_data`): the same convenience fields spacex-dashboard already keeps after `pop('all_data')` — `mission`, `net`, `pad`, `video_url`, next-launch `trajectory_data`, etc.
 
-**NOTE:** This endpoint can return payloads exceeding 85MB. For performance-critical applications or web dashboards, use `GET /launches_slim` instead.
+This is the production cutover: default `/launches` drops the ~19MB raw LL blobs. LaunchBuddy `fetchLaunchesFull` should call `GET /launches?full=true` (or use `/launch_details/{id}` / `/launch_raw/{id}` for one launch).
 
 *   **Endpoint:** `GET /launches`
-*   **Parameters:** `force=true` (optional)
+*   **Parameters:**
+    *   `force=true` (optional) — refresh the list cache
+    *   `full=true` / `include_raw=true` (optional) — restore the legacy giant payload with `all_data` on every launch
+    *   `slim=true` (optional) — explicit alias for the default slim shape
 *   **Response Format:** JSON
 *   **Fields:**
     *   `upcoming`: (array) List of upcoming launch objects.
@@ -47,6 +50,9 @@ Returns exhaustive structured data for both upcoming and previous SpaceX launche
 *   **Fields (Launch Object - Top Level):**
     *   `id`: (string) Unique UUID for the launch.
     *   `name`: (string) Full name of the mission.
+    *   `mission`: (string) Same as `name` (dashboard fast-path field).
+    *   `net`, `date`, `time`, `status`, `rocket`, `orbit`, `pad`
+    *   `video_url`, `x_video_url`
     *   `trajectory_data`: (object, optional) High-fidelity orbital trajectory data (usually present for the next upcoming launch). Accounts for Earth's rotation and realistic ascent profiles.
         *   `trajectory`: (array) List of `{lat, lon, r}` points for ascent (starts at surface, radius 1.0).
         *   `orbit_path`: (array) List of `{lat, lon, r}` points for the full orbit.
@@ -58,25 +64,25 @@ Returns exhaustive structured data for both upcoming and previous SpaceX launche
         *   `orbit`: (string) Normalized orbit type (LEO-Equatorial, LEO-Polar, GTO, etc.).
         *   `mission`: (string) Mission name.
         *   `pad`: (string) Full name of the launch pad.
-    *   `all_data`: (object) Complete recursive map of ALL fields returned by the source API.
-    *   *(See /launches_slim for other convenience fields)*
-*   **Caching:** 10 minutes.
+    *   `all_data` is **omitted by default**. Use `?full=true` or `GET /launch_details/{id}`.
+*   **Caching:** 10 minutes. List cache is slim; `all_data` is hydrated only for `?full=true` from `launch_raw_v2:{id}`.
 
-### 3. Get Optimized Launch Data (Recommended for Dashboards)
-A performance-optimized version of the launches endpoint that strips the heavy `all_data` field. This reduces the transfer size from ~85MB to less than 1MB.
+### 3. Get Optimized Launch Data (LaunchBuddy primary path)
+Same slim launch list as default `GET /launches`. Field names and Swift-safe values are unchanged.
 
 *   **Endpoint:** `GET /launches_slim`
 *   **Parameters:** `force=true` (optional)
 *   **Response Format:** JSON
-*   **Fields:** Same as `/launches`, but each launch object excludes `all_data`.
+*   **Fields:** Same as default `/launches` (no `all_data`; trajectory kept on the next launch).
 *   **Caching:** 10 minutes.
 
 ### 4. Get Raw Launch Details
-Returns the full, unpruned raw API response for a specific launch from the cache. Use this to get deep details for a single launch on-demand.
+Returns the full, unpruned Launch Library record for a specific launch from the side store, leftover cache, or a single-launch LL fetch.
 
 *   **Endpoint:** `GET /launch_raw/{launch_id}`
 *   **Response Format:** JSON
 *   **Sample Response:** (Large nested JSON object)
+*   **Also:** `GET /launch_details/{launch_id}` always fetches the current LL record.
 
 ### 5. Get Weather Data
 Returns parsed METAR weather data for SpaceX launch and development sites (Starbase, Vandy, Cape, Hawthorne, Bastrop), enhanced with high-frequency live wind data from the National Weather Service (NWS) API.
@@ -153,7 +159,7 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
   "last_updated": "2026-01-04T14:55:00Z"
 }
 ```
-*   **Caching:** 5 minutes.
+*   **Caching:** 5 minutes. Concurrent refreshes are single-flight + debounced (~20s) so `/weather_all`, `/dashboard`, and the background worker cannot stampede Open-Meteo/METAR.
 
 ### 6. Get User-Specific Weather Data
 Returns METAR and 7-day forecast data for any user-provided location.
@@ -258,7 +264,7 @@ These are the same fields as `/dashboard`, split out for clients that already ha
 
 ### 11. Utility Endpoints
 *   **Get Single Launch Details:** `GET /launch_details/{launch_id}`
-    *   Returns full raw API response for a specific launch from the LL API.
+    *   Returns the full raw Launch Library record for one launch (on-demand LL fetch). Default `GET /launches` is slim; use `?full=true` for the old list-wide `all_data` payload.
     *   **Sample Response:** (Large JSON object containing technical mission/rocket/pad details)
 *   **Get External Narratives:** `GET /external_narratives`
     *   Returns witty descriptions from a secondary narrative source.
