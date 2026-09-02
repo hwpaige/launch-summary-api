@@ -32,18 +32,16 @@ Returns a chronological list (newest first) of witty descriptions for recent Spa
 ```
 *   **Caching:** Results are cached for 1 hour. The API uses incremental generation to append new launches without changing existing witty descriptions.
 
-### 2. Get Launch Data (full, backward-compatible)
-Returns structured upcoming and previous SpaceX launches, including the raw Launch Library record in `all_data` on every launch. **This default shape is unchanged** for LaunchBuddy `fetchLaunchesFull` and any other in-field caller of `GET /launches`.
+### 2. Get Launch Data (default slim)
+Returns structured upcoming and previous SpaceX launches. **Default payload is slim** (no `all_data`): the same convenience fields spacex-dashboard already keeps after `pop('all_data')` — `mission`, `net`, `pad`, `video_url`, next-launch `trajectory_data`, etc.
 
-The ~19MB blob is **not** kept in the Redis list cache or in the `/launches_slim` / `/dashboard` hot path. Raw records live in a side store and are hydrated only when this full endpoint is served.
-
-**In-field clients should keep using `GET /launches_slim` (LaunchBuddy) and `GET /dashboard` (Pi).** Those shapes are unchanged.
+This is the production cutover: default `/launches` drops the ~19MB raw LL blobs. LaunchBuddy `fetchLaunchesFull` should call `GET /launches?full=true` (or use `/launch_details/{id}` / `/launch_raw/{id}` for one launch).
 
 *   **Endpoint:** `GET /launches`
 *   **Parameters:**
     *   `force=true` (optional) — refresh the list cache
-    *   `full=true` / `include_raw=true` (optional) — explicit alias for this same full payload
-    *   `slim=true` (optional) — same shape as `GET /launches_slim` (no `all_data`)
+    *   `full=true` / `include_raw=true` (optional) — restore the legacy giant payload with `all_data` on every launch
+    *   `slim=true` (optional) — explicit alias for the default slim shape
 *   **Response Format:** JSON
 *   **Fields:**
     *   `upcoming`: (array) List of upcoming launch objects.
@@ -52,6 +50,9 @@ The ~19MB blob is **not** kept in the Redis list cache or in the `/launches_slim
 *   **Fields (Launch Object - Top Level):**
     *   `id`: (string) Unique UUID for the launch.
     *   `name`: (string) Full name of the mission.
+    *   `mission`: (string) Same as `name` (dashboard fast-path field).
+    *   `net`, `date`, `time`, `status`, `rocket`, `orbit`, `pad`
+    *   `video_url`, `x_video_url`
     *   `trajectory_data`: (object, optional) High-fidelity orbital trajectory data (usually present for the next upcoming launch). Accounts for Earth's rotation and realistic ascent profiles.
         *   `trajectory`: (array) List of `{lat, lon, r}` points for ascent (starts at surface, radius 1.0).
         *   `orbit_path`: (array) List of `{lat, lon, r}` points for the full orbit.
@@ -63,17 +64,16 @@ The ~19MB blob is **not** kept in the Redis list cache or in the `/launches_slim
         *   `orbit`: (string) Normalized orbit type (LEO-Equatorial, LEO-Polar, GTO, etc.).
         *   `mission`: (string) Mission name.
         *   `pad`: (string) Full name of the launch pad.
-    *   `all_data`: (object) Complete recursive map of fields returned by the source API (minus redundant URL lists).
-    *   *(See /launches_slim for other convenience fields)*
-*   **Caching:** 10 minutes. List cache is slim; `all_data` is hydrated per full request from `launch_raw_v2:{id}` (or in-memory fallback when Redis is down).
+    *   `all_data` is **omitted by default**. Use `?full=true` or `GET /launch_details/{id}`.
+*   **Caching:** 10 minutes. List cache is slim; `all_data` is hydrated only for `?full=true` from `launch_raw_v2:{id}`.
 
-### 3. Get Optimized Launch Data (Recommended for Dashboards / LaunchBuddy)
-Performance-optimized launch list that strips `all_data`. Field names and Swift-safe values are unchanged.
+### 3. Get Optimized Launch Data (LaunchBuddy primary path)
+Same slim launch list as default `GET /launches`. Field names and Swift-safe values are unchanged.
 
 *   **Endpoint:** `GET /launches_slim`
 *   **Parameters:** `force=true` (optional)
 *   **Response Format:** JSON
-*   **Fields:** Same as `/launches`, but each launch object excludes `all_data`. Trajectory is kept on the next launch.
+*   **Fields:** Same as default `/launches` (no `all_data`; trajectory kept on the next launch).
 *   **Caching:** 10 minutes.
 
 ### 4. Get Raw Launch Details
@@ -264,7 +264,7 @@ These are the same fields as `/dashboard`, split out for clients that already ha
 
 ### 11. Utility Endpoints
 *   **Get Single Launch Details:** `GET /launch_details/{launch_id}`
-    *   Returns the full raw Launch Library record for one launch (the supported way to get former `/launches` `all_data`).
+    *   Returns the full raw Launch Library record for one launch (on-demand LL fetch). Default `GET /launches` is slim; use `?full=true` for the old list-wide `all_data` payload.
     *   **Sample Response:** (Large JSON object containing technical mission/rocket/pad details)
 *   **Get External Narratives:** `GET /external_narratives`
     *   Returns witty descriptions from a secondary narrative source.

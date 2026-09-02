@@ -2229,13 +2229,16 @@ def get_launches(
     slim: bool = False,
     internal: bool = False,
 ):
-    """Launch list. Default response stays backward-compatible (includes `all_data`).
+    """Launch list. Default payload is slim (no raw LL `all_data`).
 
-    Slim clients (LaunchBuddy / Pi) should keep using GET /launches_slim or
-    GET /dashboard. Pass `?slim=true` for the slim list on this path.
-    `?full=true` / `?include_raw=true` are explicit aliases for the legacy
-    full payload. Raw LL blobs are hydrated from a side store for this
-    response only — they are not kept in the Redis list cache.
+    Matches what spacex-dashboard already does client-side (pop all_data).
+    Convenience fields stay intact: mission, net, pad, video_url,
+    trajectory_data on the next launch, etc.
+
+    `?full=true` / `?include_raw=true` restore the legacy giant payload
+    (LaunchBuddy fetchLaunchesFull). Raw blobs are hydrated from a side
+    store for that response only — they are not kept in the list cache.
+    `?slim=true` is an explicit alias for the default slim shape.
     """
     if not internal:
         increment_metric("total_requests")
@@ -2244,8 +2247,7 @@ def get_launches(
         increment_metric("cache_hits" if not force else "cache_misses")
     else:
         increment_metric("cache_misses")
-    want_full = (full or include_raw) or not slim
-    if want_full:
+    if full or include_raw:
         return _hydrate_launch_payload(data)
     return _slim_launch_payload(data, keep_next_trajectory=True)
 
