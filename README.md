@@ -32,17 +32,18 @@ Returns a chronological list (newest first) of witty descriptions for recent Spa
 ```
 *   **Caching:** Results are cached for 1 hour. The API uses incremental generation to append new launches without changing existing witty descriptions.
 
-### 2. Get Launch Data
-Returns structured upcoming and previous SpaceX launches. The default payload is **slim**: convenience fields only, no raw Launch Library blobs (`all_data`), and globe `trajectory_data` only on the next launch.
+### 2. Get Launch Data (full, backward-compatible)
+Returns structured upcoming and previous SpaceX launches, including the raw Launch Library record in `all_data` on every launch. **This default shape is unchanged** for LaunchBuddy `fetchLaunchesFull` and any other in-field caller of `GET /launches`.
 
-Production list responses were previously ~19MB because every launch embedded the full LL v2.3.0 detailed record. That is no longer cached or returned on this endpoint.
+The ~19MB blob is **not** kept in the Redis list cache or in the `/launches_slim` / `/dashboard` hot path. Raw records live in a side store and are hydrated only when this full endpoint is served.
 
-**Prefer this endpoint or `GET /launches_slim` / `GET /dashboard` for LaunchBuddy and Pi clients.** For a single launch's full source record, use `GET /launch_details/{id}` (or `GET /launch_raw/{id}`).
+**In-field clients should keep using `GET /launches_slim` (LaunchBuddy) and `GET /dashboard` (Pi).** Those shapes are unchanged.
 
 *   **Endpoint:** `GET /launches`
 *   **Parameters:**
     *   `force=true` (optional) — refresh the list cache
-    *   `include_raw=true` / `full=true` (optional) — skip extra response slimming. These flags do **not** reconstruct raw LL payloads; use `/launch_details/{id}` for that.
+    *   `full=true` / `include_raw=true` (optional) — explicit alias for this same full payload
+    *   `slim=true` (optional) — same shape as `GET /launches_slim` (no `all_data`)
 *   **Response Format:** JSON
 *   **Fields:**
     *   `upcoming`: (array) List of upcoming launch objects.
@@ -62,21 +63,21 @@ Production list responses were previously ~19MB because every launch embedded th
         *   `orbit`: (string) Normalized orbit type (LEO-Equatorial, LEO-Polar, GTO, etc.).
         *   `mission`: (string) Mission name.
         *   `pad`: (string) Full name of the launch pad.
+    *   `all_data`: (object) Complete recursive map of fields returned by the source API (minus redundant URL lists).
     *   *(See /launches_slim for other convenience fields)*
-    *   `all_data` is **not** included. Fetch `GET /launch_details/{id}` for the raw LL record.
-*   **Caching:** 10 minutes. The Redis list cache stores the slim shape so `/launches`, `/launches_slim`, and `/dashboard` do not inflate a 19MB blob on every hit.
+*   **Caching:** 10 minutes. List cache is slim; `all_data` is hydrated per full request from `launch_raw_v2:{id}` (or in-memory fallback when Redis is down).
 
-### 3. Get Optimized Launch Data (Recommended for Dashboards)
-Same slim launch list as default `GET /launches` (`all_data` stripped; trajectory kept on the next launch). Kept for existing dashboard clients.
+### 3. Get Optimized Launch Data (Recommended for Dashboards / LaunchBuddy)
+Performance-optimized launch list that strips `all_data`. Field names and Swift-safe values are unchanged.
 
 *   **Endpoint:** `GET /launches_slim`
 *   **Parameters:** `force=true` (optional)
 *   **Response Format:** JSON
-*   **Fields:** Same as `/launches`.
+*   **Fields:** Same as `/launches`, but each launch object excludes `all_data`. Trajectory is kept on the next launch.
 *   **Caching:** 10 minutes.
 
 ### 4. Get Raw Launch Details
-Returns the full, unpruned Launch Library record for a specific launch. If a leftover `all_data` blob is still in cache it is returned; otherwise the single-launch LL endpoint is fetched on demand.
+Returns the full, unpruned Launch Library record for a specific launch from the side store, leftover cache, or a single-launch LL fetch.
 
 *   **Endpoint:** `GET /launch_raw/{launch_id}`
 *   **Response Format:** JSON

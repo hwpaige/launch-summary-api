@@ -60,7 +60,8 @@ class AppRegressionTests(unittest.TestCase):
         self.assertTrue(is_utc_iso8601(parsed["net"]))
         self.assertTrue(is_utc_iso8601(parsed["window_start"]))
         self.assertTrue(is_utc_iso8601(parsed["window_end"]))
-        self.assertNotIn("all_data", parsed)
+        self.assertIn("all_data", parsed)
+        self.assertEqual(parsed["all_data"]["id"], "launch-1")
 
     def test_generate_narratives_keeps_full_existing_history(self):
         fake_response = Mock()
@@ -144,7 +145,7 @@ class AppRegressionTests(unittest.TestCase):
         self.assertEqual(response["count"], 1)
         self.assertTrue(is_utc_iso8601(response["timestamp"]))
 
-    def test_launches_default_omits_all_data_and_extra_trajectory(self):
+    def test_launches_default_keeps_all_data_compat(self):
         payload = {
             "upcoming": [
                 _sample_launch("u1", "Next", with_traj=True),
@@ -163,18 +164,24 @@ class AppRegressionTests(unittest.TestCase):
              patch.object(app, "set_cached_data", side_effect=fake_persist), \
              patch.object(app, "r", None):
             result = app.get_launches(force=False, include_raw=False, internal=True)
+            slim = app.get_launches(slim=True, internal=True)
+            full = app.get_launches(full=True, internal=True)
 
-        self.assertNotIn("all_data", result["upcoming"][0])
-        self.assertNotIn("all_data", result["upcoming"][1])
-        self.assertNotIn("all_data", result["previous"][0])
+        self.assertIn("all_data", result["upcoming"][0])
+        self.assertEqual(result["upcoming"][0]["all_data"]["id"], "u1")
+        self.assertIn("all_data", result["previous"][0])
+        self.assertIn("all_data", full["upcoming"][0])
+        self.assertNotIn("all_data", slim["upcoming"][0])
+        self.assertNotIn("all_data", slim["previous"][0])
         self.assertIn("trajectory_data", result["upcoming"][0])
         self.assertNotIn("trajectory_data", result["upcoming"][1])
         self.assertNotIn("trajectory_data", result["previous"][0])
-        self.assertTrue(persisted)
-        slim_cache = persisted[0][1]
-        self.assertNotIn("all_data", slim_cache["upcoming"][0])
+        list_persists = [item for item in persisted if item[0] == app.LAUNCHES_CACHE_KEY]
+        self.assertTrue(list_persists)
+        self.assertNotIn("all_data", list_persists[0][1]["upcoming"][0])
+        self.assertIsNone(app._launches_mem["data"]["upcoming"][0].get("all_data"))
 
-    def test_launches_slim_matches_default_shape(self):
+    def test_launches_slim_omits_all_data(self):
         payload = {
             "upcoming": [_sample_launch("u1", "Next", with_traj=True)],
             "previous": [_sample_launch("p1", "Past")],
@@ -187,6 +194,7 @@ class AppRegressionTests(unittest.TestCase):
             slim = app.get_launches_slim(internal=True)
 
         self.assertEqual(default["upcoming"][0]["id"], slim["upcoming"][0]["id"])
+        self.assertIn("all_data", default["upcoming"][0])
         self.assertNotIn("all_data", slim["upcoming"][0])
         self.assertNotIn("all_data", slim["previous"][0])
 

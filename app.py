@@ -114,6 +114,7 @@ CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 LAUNCHES_CACHE_KEY = "launches_cache_v2"
+RAW_LAUNCH_KEY_PREFIX = "launch_raw_v2:"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
 LAUNCHES_MEM_TTL = 45  # seconds; avoid repeatedly inflating the Redis blob
 WEATHER_CACHE_TTL = 300
@@ -173,6 +174,7 @@ _narratives_flight = _SingleFlight()
 _weather_last_refresh_at = 0.0
 _weather_last_result = None
 _local_weather_store = {}
+_local_raw_launches = {}
 _launches_mem = {"data": None, "at": 0.0}
 
 
@@ -186,6 +188,7 @@ def _reset_cache_coordination_for_tests():
     _weather_last_refresh_at = 0.0
     _weather_last_result = None
     _local_weather_store.clear()
+    _local_raw_launches.clear()
     _launches_mem["data"] = None
     _launches_mem["at"] = 0.0
 
@@ -230,8 +233,29 @@ def _keep_list_trajectory(bucket, idx, upcoming_count):
     return False
 
 
+def _store_raw_launch(launch_id, raw):
+    """Persist one launch's raw LL blob outside the slim list cache."""
+    if not launch_id or raw is None:
+        return
+    if r:
+        set_cached_data(f"{RAW_LAUNCH_KEY_PREFIX}{launch_id}", raw)
+    else:
+        _local_raw_launches[str(launch_id)] = raw
+
+
+def _get_raw_launch(launch_id):
+    if not launch_id:
+        return None
+    key = str(launch_id)
+    if r:
+        cached = get_cached_data(f"{RAW_LAUNCH_KEY_PREFIX}{key}")
+        if cached is not None:
+            return cached
+    return _local_raw_launches.get(key)
+
+
 def _strip_heavy_launch_fields(data, persist_key=None):
-    """Drop raw LL blobs from cached launch lists. Returns True if anything changed."""
+    """Drop leftover raw LL blobs / extra trajectories from a list payload."""
     if not isinstance(data, dict):
         return False
     changed = False
@@ -251,6 +275,50 @@ def _strip_heavy_launch_fields(data, persist_key=None):
     if changed and persist_key:
         set_cached_data(persist_key, data)
     return changed
+
+
+def _sanitize_launch_list_cache(data, persist=False):
+    """Move inline all_data into the side store and keep the list cache slim."""
+    if not isinstance(data, dict):
+        return False
+    changed = False
+    for bucket in ("upcoming", "previous"):
+        for launch in data.get(bucket) or []:
+            if not isinstance(launch, dict):
+                continue
+            raw = launch.pop("all_data", None)
+            if raw is not None:
+                _store_raw_launch(launch.get("id"), raw)
+                changed = True
+    if _strip_heavy_launch_fields(data):
+        changed = True
+    if changed and persist:
+        set_cached_data(LAUNCHES_CACHE_KEY, data)
+    return changed
+
+
+def _hydrate_launch_payload(data):
+    """Copy a slim list and reattach all_data. Does not mutate the hot cache."""
+    if not isinstance(data, dict):
+        return {"upcoming": [], "previous": [], "last_updated": None}
+    out = {
+        "upcoming": [],
+        "previous": [],
+        "last_updated": data.get("last_updated"),
+    }
+    for bucket in ("upcoming", "previous"):
+        for launch in data.get(bucket) or []:
+            if not isinstance(launch, dict):
+                out[bucket].append(launch)
+                continue
+            item = dict(launch)
+            raw = item.get("all_data")
+            if raw is None:
+                raw = _get_raw_launch(item.get("id"))
+            if raw is not None:
+                item["all_data"] = raw
+            out[bucket].append(item)
+    return out
 
 
 def _remember_launches(data):
@@ -1461,8 +1529,10 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'probability': launch.get('probability'),
         'holdreason': launch.get('holdreason'),
         'failreason': launch.get('failreason'),
-        # Raw Launch Library blobs stay out of the list cache. Clients that need
-        # the full record should call GET /launch_details/{id}.
+        # Captured for GET /launches compatibility, then moved to a side store
+        # so the Redis list cache / slim / dashboard hot path stays small.
+        'all_data': {k: v for k, v in launch.items() if
+                     k not in ['vidURLs', 'infoURLs', 'vid_urls', 'info_urls', 'infographic']},
     }
 
 
@@ -1548,7 +1618,7 @@ def seed_historical_launches():
     existing_previous = []
     cached_data = get_cached_data(cache_key)
     if cached_data:
-        _strip_heavy_launch_fields(cached_data)
+        _sanitize_launch_list_cache(cached_data)
         existing_previous = cached_data.get('previous', [])
 
     # Sort to find the actual oldest launch
@@ -1589,7 +1659,7 @@ def seed_historical_launches():
         # This allows us to pick up any new launches added by the regular refresh
         cached_data = get_cached_data(cache_key)
         if cached_data:
-            _strip_heavy_launch_fields(cached_data)
+            _sanitize_launch_list_cache(cached_data)
             existing_previous = cached_data.get('previous', [])
             upcoming = cached_data.get('upcoming', [])
 
@@ -1665,7 +1735,7 @@ def seed_historical_launches():
                 "previous": combined_prev,
                 "last_updated": _utc_isoformat()
             }
-            _strip_heavy_launch_fields(result)
+            _sanitize_launch_list_cache(result)
             set_cached_data(cache_key, result)
             _remember_launches(result)
 
@@ -2011,7 +2081,7 @@ def _refresh_launches_uncached():
 
     cached_data = get_cached_data(LAUNCHES_CACHE_KEY)
     if cached_data:
-        _strip_heavy_launch_fields(cached_data)
+        _sanitize_launch_list_cache(cached_data)
         existing_previous = cached_data.get('previous')
         existing_upcoming = cached_data.get('upcoming')
 
@@ -2037,7 +2107,7 @@ def _refresh_launches_uncached():
             "previous": previous,
             "last_updated": last_updated
         }
-        _strip_heavy_launch_fields(result)
+        _sanitize_launch_list_cache(result)
         set_cached_data(LAUNCHES_CACHE_KEY, result)
         return _remember_launches(result)
     except Exception as e:
@@ -2052,7 +2122,7 @@ def refresh_launches_internal():
         if result is None:
             cached = get_cached_data(LAUNCHES_CACHE_KEY)
             if cached:
-                _strip_heavy_launch_fields(cached, persist_key=LAUNCHES_CACHE_KEY)
+                _sanitize_launch_list_cache(cached, persist=True)
                 return _remember_launches(cached)
         return result
 
@@ -2156,13 +2226,16 @@ def get_launches(
     force: bool = False,
     include_raw: bool = False,
     full: bool = False,
+    slim: bool = False,
     internal: bool = False,
 ):
-    """Launch list. Default payload is slim (no raw LL `all_data` blobs).
+    """Launch list. Default response stays backward-compatible (includes `all_data`).
 
-    Full source records: GET /launch_details/{id} or GET /launch_raw/{id}.
-    `include_raw=true` / `full=true` skip extra response slimming but do not
-    reconstruct raw Launch Library payloads (those are no longer cached).
+    Slim clients (LaunchBuddy / Pi) should keep using GET /launches_slim or
+    GET /dashboard. Pass `?slim=true` for the slim list on this path.
+    `?full=true` / `?include_raw=true` are explicit aliases for the legacy
+    full payload. Raw LL blobs are hydrated from a side store for this
+    response only — they are not kept in the Redis list cache.
     """
     if not internal:
         increment_metric("total_requests")
@@ -2171,8 +2244,9 @@ def get_launches(
         increment_metric("cache_hits" if not force else "cache_misses")
     else:
         increment_metric("cache_misses")
-    if include_raw or full:
-        return data
+    want_full = (full or include_raw) or not slim
+    if want_full:
+        return _hydrate_launch_payload(data)
     return _slim_launch_payload(data, keep_next_trajectory=True)
 
 
@@ -2198,6 +2272,10 @@ def get_launch_raw(launch_id: str, internal: bool = False):
     """
     if not internal:
         increment_metric("total_requests")
+    leftover = _get_raw_launch(launch_id)
+    if leftover:
+        increment_metric("cache_hits")
+        return leftover
     cached = _load_launch_payload(force=False)
     for l in (cached.get('upcoming', []) or []) + (cached.get('previous', []) or []):
         if l.get('id') == launch_id:
@@ -2337,7 +2415,7 @@ def _load_launch_payload(force=False):
     else:
         data = get_cached_data(LAUNCHES_CACHE_KEY)
         if data:
-            _strip_heavy_launch_fields(data, persist_key=LAUNCHES_CACHE_KEY)
+            _sanitize_launch_list_cache(data, persist=True)
     if not data:
         return {"upcoming": [], "previous": [], "last_updated": None}
     return _remember_launches(data)
