@@ -32,13 +32,17 @@ Returns a chronological list (newest first) of witty descriptions for recent Spa
 ```
 *   **Caching:** Results are cached for 1 hour. The API uses incremental generation to append new launches without changing existing witty descriptions.
 
-### 2. Get Detailed Launch Data
-Returns exhaustive structured data for both upcoming and previous SpaceX launches. This endpoint includes the full, raw response from the Launch Library v2.3.0 API in the `all_data` field for every launch.
+### 2. Get Launch Data
+Returns structured upcoming and previous SpaceX launches. The default payload is **slim**: convenience fields only, no raw Launch Library blobs (`all_data`), and globe `trajectory_data` only on the next launch.
 
-**NOTE:** This endpoint can return payloads exceeding 85MB. For performance-critical applications or web dashboards, use `GET /launches_slim` instead.
+Production list responses were previously ~19MB because every launch embedded the full LL v2.3.0 detailed record. That is no longer cached or returned on this endpoint.
+
+**Prefer this endpoint or `GET /launches_slim` / `GET /dashboard` for LaunchBuddy and Pi clients.** For a single launch's full source record, use `GET /launch_details/{id}` (or `GET /launch_raw/{id}`).
 
 *   **Endpoint:** `GET /launches`
-*   **Parameters:** `force=true` (optional)
+*   **Parameters:**
+    *   `force=true` (optional) — refresh the list cache
+    *   `include_raw=true` / `full=true` (optional) — skip extra response slimming. These flags do **not** reconstruct raw LL payloads; use `/launch_details/{id}` for that.
 *   **Response Format:** JSON
 *   **Fields:**
     *   `upcoming`: (array) List of upcoming launch objects.
@@ -58,25 +62,26 @@ Returns exhaustive structured data for both upcoming and previous SpaceX launche
         *   `orbit`: (string) Normalized orbit type (LEO-Equatorial, LEO-Polar, GTO, etc.).
         *   `mission`: (string) Mission name.
         *   `pad`: (string) Full name of the launch pad.
-    *   `all_data`: (object) Complete recursive map of ALL fields returned by the source API.
     *   *(See /launches_slim for other convenience fields)*
-*   **Caching:** 10 minutes.
+    *   `all_data` is **not** included. Fetch `GET /launch_details/{id}` for the raw LL record.
+*   **Caching:** 10 minutes. The Redis list cache stores the slim shape so `/launches`, `/launches_slim`, and `/dashboard` do not inflate a 19MB blob on every hit.
 
 ### 3. Get Optimized Launch Data (Recommended for Dashboards)
-A performance-optimized version of the launches endpoint that strips the heavy `all_data` field. This reduces the transfer size from ~85MB to less than 1MB.
+Same slim launch list as default `GET /launches` (`all_data` stripped; trajectory kept on the next launch). Kept for existing dashboard clients.
 
 *   **Endpoint:** `GET /launches_slim`
 *   **Parameters:** `force=true` (optional)
 *   **Response Format:** JSON
-*   **Fields:** Same as `/launches`, but each launch object excludes `all_data`.
+*   **Fields:** Same as `/launches`.
 *   **Caching:** 10 minutes.
 
 ### 4. Get Raw Launch Details
-Returns the full, unpruned raw API response for a specific launch from the cache. Use this to get deep details for a single launch on-demand.
+Returns the full, unpruned Launch Library record for a specific launch. If a leftover `all_data` blob is still in cache it is returned; otherwise the single-launch LL endpoint is fetched on demand.
 
 *   **Endpoint:** `GET /launch_raw/{launch_id}`
 *   **Response Format:** JSON
 *   **Sample Response:** (Large nested JSON object)
+*   **Also:** `GET /launch_details/{launch_id}` always fetches the current LL record.
 
 ### 5. Get Weather Data
 Returns parsed METAR weather data for SpaceX launch and development sites (Starbase, Vandy, Cape, Hawthorne, Bastrop), enhanced with high-frequency live wind data from the National Weather Service (NWS) API.
@@ -153,7 +158,7 @@ Returns parsed METAR weather data for SpaceX launch and development sites (Starb
   "last_updated": "2026-01-04T14:55:00Z"
 }
 ```
-*   **Caching:** 5 minutes.
+*   **Caching:** 5 minutes. Concurrent refreshes are single-flight + debounced (~20s) so `/weather_all`, `/dashboard`, and the background worker cannot stampede Open-Meteo/METAR.
 
 ### 6. Get User-Specific Weather Data
 Returns METAR and 7-day forecast data for any user-provided location.
@@ -258,7 +263,7 @@ These are the same fields as `/dashboard`, split out for clients that already ha
 
 ### 11. Utility Endpoints
 *   **Get Single Launch Details:** `GET /launch_details/{launch_id}`
-    *   Returns full raw API response for a specific launch from the LL API.
+    *   Returns the full raw Launch Library record for one launch (the supported way to get former `/launches` `all_data`).
     *   **Sample Response:** (Large JSON object containing technical mission/rocket/pad details)
 *   **Get External Narratives:** `GET /external_narratives`
     *   Returns witty descriptions from a secondary narrative source.

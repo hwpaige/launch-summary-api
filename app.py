@@ -113,10 +113,191 @@ CACHE_KEY = "launch_narratives_v2"
 CACHE_TIME_KEY = "last_updated_v2"
 METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
+LAUNCHES_CACHE_KEY = "launches_cache_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
+LAUNCHES_MEM_TTL = 45  # seconds; avoid repeatedly inflating the Redis blob
+WEATHER_CACHE_TTL = 300
+WEATHER_DEBOUNCE_SEC = 20.0
+REFRESH_LOCK_TTL = 90
+HEAVY_LAUNCH_FIELDS = ("all_data",)
 
 
 _UTC_NOW = object()
+
+
+class _SingleFlight:
+    """Coalesce concurrent callers so only one refresh function runs at a time."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._event = None
+        self._result = None
+        self._error = None
+
+    def do(self, fn):
+        leader = False
+        with self._lock:
+            if self._event is None:
+                self._event = threading.Event()
+                self._result = None
+                self._error = None
+                leader = True
+            event = self._event
+        if not leader:
+            event.wait(timeout=REFRESH_LOCK_TTL)
+            if self._error is not None:
+                raise self._error
+            return self._result
+        try:
+            self._result = fn()
+            return self._result
+        except Exception as exc:
+            self._error = exc
+            raise
+        finally:
+            event.set()
+            with self._lock:
+                if self._event is event:
+                    self._event = None
+
+    def reset(self):
+        with self._lock:
+            self._event = None
+            self._result = None
+            self._error = None
+
+
+_weather_flight = _SingleFlight()
+_launches_flight = _SingleFlight()
+_narratives_flight = _SingleFlight()
+_weather_last_refresh_at = 0.0
+_weather_last_result = None
+_local_weather_store = {}
+_launches_mem = {"data": None, "at": 0.0}
+
+
+def _reset_cache_coordination_for_tests():
+    """Reset single-flight / debounce state between unit tests."""
+    global _weather_last_refresh_at, _weather_last_result, _background_enabled
+    _background_enabled = False
+    _weather_flight.reset()
+    _launches_flight.reset()
+    _narratives_flight.reset()
+    _weather_last_refresh_at = 0.0
+    _weather_last_result = None
+    _local_weather_store.clear()
+    _launches_mem["data"] = None
+    _launches_mem["at"] = 0.0
+
+
+def _redis_single_flight(name, fn):
+    """Cross-process lock so multiple dyno workers don't stampede the same refresh."""
+    if not r:
+        return fn()
+    lock_key = f"refresh_lock_v1_{name}"
+    token = f"{time.time()}:{os.getpid()}:{threading.get_ident()}"
+    try:
+        acquired = r.set(lock_key, token, nx=True, ex=REFRESH_LOCK_TTL)
+    except Exception as e:
+        print(f"Redis lock error for {name}: {e}")
+        return fn()
+    if acquired:
+        try:
+            return fn()
+        finally:
+            try:
+                if r.get(lock_key) == token:
+                    r.delete(lock_key)
+            except Exception:
+                pass
+    deadline = time.time() + REFRESH_LOCK_TTL
+    while time.time() < deadline:
+        try:
+            if not r.exists(lock_key):
+                break
+        except Exception:
+            break
+        time.sleep(0.15)
+    return None
+
+
+def _keep_list_trajectory(bucket, idx, upcoming_count):
+    """Keep globe path on the next launch only (upcoming[0], or previous[0] if none)."""
+    if bucket == "upcoming" and idx == 0:
+        return True
+    if bucket == "previous" and idx == 0 and upcoming_count == 0:
+        return True
+    return False
+
+
+def _strip_heavy_launch_fields(data, persist_key=None):
+    """Drop raw LL blobs from cached launch lists. Returns True if anything changed."""
+    if not isinstance(data, dict):
+        return False
+    changed = False
+    upcoming_count = len(data.get("upcoming") or [])
+    for bucket in ("upcoming", "previous"):
+        launches = data.get(bucket) or []
+        for idx, launch in enumerate(launches):
+            if not isinstance(launch, dict):
+                continue
+            for field in HEAVY_LAUNCH_FIELDS:
+                if field in launch:
+                    launch.pop(field, None)
+                    changed = True
+            if launch.get("trajectory_data") and not _keep_list_trajectory(bucket, idx, upcoming_count):
+                launch.pop("trajectory_data", None)
+                changed = True
+    if changed and persist_key:
+        set_cached_data(persist_key, data)
+    return changed
+
+
+def _remember_launches(data):
+    _launches_mem["data"] = data
+    _launches_mem["at"] = time.time()
+    return data
+
+
+def _set_weather_loc(location, data, ttl=WEATHER_CACHE_TTL):
+    _local_weather_store[location] = (data, time.time() + ttl)
+    if r:
+        try:
+            r.setex(f"weather_cache_v2_{location}", ttl, json.dumps(data))
+        except Exception:
+            pass
+
+
+def _read_weather_loc(location):
+    if r:
+        try:
+            cached = r.get(f"weather_cache_v2_{location}")
+            if cached:
+                return _finalize_weather(json.loads(cached))
+        except Exception:
+            pass
+    entry = _local_weather_store.get(location)
+    if entry and entry[1] > time.time():
+        return entry[0]
+    return None
+
+
+def _assemble_weather_all():
+    weather_results = {}
+    timestamps = []
+    for loc in WEATHER_LOCATIONS:
+        data = _read_weather_loc(loc)
+        if not data:
+            continue
+        weather_results[loc] = data
+        if data.get("last_updated"):
+            timestamps.append(_utc_isoformat(data.get("last_updated")))
+    if not weather_results:
+        return None
+    return {
+        "weather": weather_results,
+        "last_updated": min(timestamps) if timestamps else None,
+    }
 
 
 def _utc_isoformat(value=_UTC_NOW):
@@ -1280,9 +1461,8 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'probability': launch.get('probability'),
         'holdreason': launch.get('holdreason'),
         'failreason': launch.get('failreason'),
-        # Ensure every field returned by the API is available, but prune redundant URLs to save space
-        'all_data': {k: v for k, v in launch.items() if
-                     k not in ['vidURLs', 'infoURLs', 'vid_urls', 'info_urls', 'infographic']}
+        # Raw Launch Library blobs stay out of the list cache. Clients that need
+        # the full record should call GET /launch_details/{id}.
     }
 
 
@@ -1362,12 +1542,13 @@ def fetch_launches(existing_previous=None, existing_upcoming=None):
 def seed_historical_launches():
     """Seed the historical launch cache by pulling increasingly older launches in batches of 5 until we hit the api limit."""
     print("Starting historical launch seeding...")
-    cache_key = "launches_cache_v2"
+    cache_key = LAUNCHES_CACHE_KEY
 
     # Get initial state
     existing_previous = []
     cached_data = get_cached_data(cache_key)
     if cached_data:
+        _strip_heavy_launch_fields(cached_data)
         existing_previous = cached_data.get('previous', [])
 
     # Sort to find the actual oldest launch
@@ -1408,6 +1589,7 @@ def seed_historical_launches():
         # This allows us to pick up any new launches added by the regular refresh
         cached_data = get_cached_data(cache_key)
         if cached_data:
+            _strip_heavy_launch_fields(cached_data)
             existing_previous = cached_data.get('previous', [])
             upcoming = cached_data.get('upcoming', [])
 
@@ -1483,7 +1665,9 @@ def seed_historical_launches():
                 "previous": combined_prev,
                 "last_updated": _utc_isoformat()
             }
+            _strip_heavy_launch_fields(result)
             set_cached_data(cache_key, result)
+            _remember_launches(result)
 
             total_so_far = len(combined_prev)
             oldest_so_far = combined_prev[-1].get('net')
@@ -1796,42 +1980,45 @@ def fetch_external_narratives():
 
 def refresh_narratives_internal():
     """Internal helper to refresh narratives cache."""
-    print("Refreshing narratives cache...")
-    cached_narratives = get_cached_data(CACHE_KEY)
-    if not cached_narratives:
-        cached_narratives = _local_cache["launch_narratives"]
+    def _do():
+        print("Refreshing narratives cache...")
+        cached_narratives = get_cached_data(CACHE_KEY)
+        if not cached_narratives:
+            cached_narratives = _local_cache["launch_narratives"]
 
-    try:
-        descriptions = generate_narratives(existing_narratives=cached_narratives)
-        current_time_dt = datetime.now(timezone.utc)
-        current_time = _utc_isoformat(current_time_dt)
-        set_cached_data(CACHE_KEY, descriptions)
-        set_cached_data(CACHE_TIME_KEY, current_time)
+        try:
+            descriptions = generate_narratives(existing_narratives=cached_narratives)
+            current_time_dt = datetime.now(timezone.utc)
+            current_time = _utc_isoformat(current_time_dt)
+            set_cached_data(CACHE_KEY, descriptions)
+            set_cached_data(CACHE_TIME_KEY, current_time)
 
-        _local_cache["launch_narratives"] = descriptions
-        _local_cache["last_updated"] = current_time_dt
-        return descriptions
-    except Exception as e:
-        print(f"Error in refresh_narratives_internal: {e}")
-        return cached_narratives
+            _local_cache["launch_narratives"] = descriptions
+            _local_cache["last_updated"] = current_time_dt
+            return descriptions
+        except Exception as e:
+            print(f"Error in refresh_narratives_internal: {e}")
+            return cached_narratives
+
+    return _narratives_flight.do(_do)
 
 
-def refresh_launches_internal():
-    """Internal helper to refresh launches cache."""
+def _refresh_launches_uncached():
+    """Fetch launches and write a slim cache. Not concurrency-safe on its own."""
     print("Refreshing launches cache...")
-    cache_key = "launches_cache_v2"
     existing_previous = None
     existing_upcoming = None
 
-    cached_data = get_cached_data(cache_key)
+    cached_data = get_cached_data(LAUNCHES_CACHE_KEY)
     if cached_data:
+        _strip_heavy_launch_fields(cached_data)
         existing_previous = cached_data.get('previous')
         existing_upcoming = cached_data.get('upcoming')
 
     try:
         data = fetch_launches(existing_previous=existing_previous, existing_upcoming=existing_upcoming)
 
-        # Add trajectory data to the first upcoming launch
+        # Add trajectory data to the first upcoming launch only
         upcoming = data.get("upcoming", [])
         previous = data.get("previous", [])
         if upcoming:
@@ -1850,11 +2037,26 @@ def refresh_launches_internal():
             "previous": previous,
             "last_updated": last_updated
         }
-        set_cached_data(cache_key, result)
-        return result
+        _strip_heavy_launch_fields(result)
+        set_cached_data(LAUNCHES_CACHE_KEY, result)
+        return _remember_launches(result)
     except Exception as e:
         print(f"Error in refresh_launches_internal: {e}")
         return None
+
+
+def refresh_launches_internal():
+    """Internal helper to refresh launches cache (single-flight)."""
+    def _do():
+        result = _redis_single_flight("launches", _refresh_launches_uncached)
+        if result is None:
+            cached = get_cached_data(LAUNCHES_CACHE_KEY)
+            if cached:
+                _strip_heavy_launch_fields(cached, persist_key=LAUNCHES_CACHE_KEY)
+                return _remember_launches(cached)
+        return result
+
+    return _launches_flight.do(_do)
 
 
 def _finalize_weather(data):
@@ -1883,8 +2085,8 @@ def _finalize_weather(data):
     return normalized
 
 
-def refresh_weather_internal():
-    """Internal helper to refresh all weather cache."""
+def _fetch_all_weather():
+    """Hit METAR / Open-Meteo for every dashboard site and write per-location cache."""
     print("Refreshing weather cache...")
     weather_results = {}
     timestamps = []
@@ -1898,37 +2100,80 @@ def refresh_weather_internal():
         data = _finalize_weather(data)
         weather_results[loc] = data
         timestamps.append(last_updated)
+        _set_weather_loc(loc, data)
 
-        # Update individual cache
-        if r:
-            try:
-                r.setex(f"weather_cache_v2_{loc}", 300, json.dumps(data))
-            except:
-                pass
-
-    return {
+    result = {
         "weather": weather_results,
         "last_updated": min(timestamps) if timestamps else _utc_isoformat()
     }
+    global _weather_last_refresh_at, _weather_last_result
+    _weather_last_refresh_at = time.time()
+    _weather_last_result = result
+    if r:
+        try:
+            r.setex("weather_refresh_done_at", 60, str(_weather_last_refresh_at))
+        except Exception:
+            pass
+    return result
+
+
+def _weather_is_fresh(force=False):
+    if force:
+        return False
+    now = time.time()
+    if _weather_last_result is not None and (now - _weather_last_refresh_at) < WEATHER_DEBOUNCE_SEC:
+        return True
+    if r:
+        try:
+            stamp = r.get("weather_refresh_done_at")
+            if stamp and (now - float(stamp)) < WEATHER_DEBOUNCE_SEC:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def refresh_weather_internal(force: bool = False):
+    """Refresh all weather caches with debounce + single-flight coalescing."""
+    def _do():
+        if _weather_is_fresh(force=force):
+            assembled = _weather_last_result or _assemble_weather_all()
+            if assembled and assembled.get("weather"):
+                return assembled
+        result = _redis_single_flight("weather", _fetch_all_weather)
+        if result is None:
+            return _weather_last_result or _assemble_weather_all() or {
+                "weather": {},
+                "last_updated": None,
+            }
+        return result
+
+    return _weather_flight.do(_do)
 
 
 @app.get("/launches")
-def get_launches(force: bool = False, internal: bool = False):
+def get_launches(
+    force: bool = False,
+    include_raw: bool = False,
+    full: bool = False,
+    internal: bool = False,
+):
+    """Launch list. Default payload is slim (no raw LL `all_data` blobs).
+
+    Full source records: GET /launch_details/{id} or GET /launch_raw/{id}.
+    `include_raw=true` / `full=true` skip extra response slimming but do not
+    reconstruct raw Launch Library payloads (those are no longer cached).
+    """
     if not internal:
         increment_metric("total_requests")
-    cache_key = "launches_cache_v2"
-    if force:
+    data = _load_launch_payload(force)
+    if data and (data.get("upcoming") or data.get("previous")):
+        increment_metric("cache_hits" if not force else "cache_misses")
+    else:
         increment_metric("cache_misses")
-        return refresh_launches_internal()
-
-    cached = get_cached_data(cache_key)
-    if cached:
-        increment_metric("cache_hits")
-        return cached
-
-    increment_metric("cache_misses")
-    # Return empty if not in cache and not forcing (timer will populate it)
-    return {"upcoming": [], "previous": [], "last_updated": None}
+    if include_raw or full:
+        return data
+    return _slim_launch_payload(data, keep_next_trajectory=True)
 
 
 @app.get("/launches_slim")
@@ -1936,84 +2181,55 @@ def get_launches_slim(force: bool = False, internal: bool = False):
     """Dashboard-optimized endpoint that strips 'all_data'."""
     if not internal:
         increment_metric("total_requests")
-    cache_key = "launches_cache_v2"
-
-    data = None
-    if force:
-        increment_metric("cache_misses")
-        data = refresh_launches_internal()
-    else:
-        cached = get_cached_data(cache_key)
-        if cached:
-            increment_metric("cache_hits")
-            data = cached
-        else:
-            increment_metric("cache_misses")
-            return {"upcoming": [], "previous": [], "last_updated": None}
-
-    if data:
-        def strip_bloat(l):
-            return {k: v for k, v in l.items() if k != 'all_data'}
-
-        return {
-            "upcoming": [strip_bloat(l) for l in data.get("upcoming", [])],
-            "previous": [strip_bloat(l) for l in data.get("previous", [])],
-            "last_updated": data.get("last_updated")
-        }
+    data = _load_launch_payload(force)
+    if data and (data.get("upcoming") or data.get("previous")):
+        increment_metric("cache_hits" if not force else "cache_misses")
+        return _slim_launch_payload(data, keep_next_trajectory=True)
+    increment_metric("cache_misses")
     return {"upcoming": [], "previous": [], "last_updated": None}
 
 
 @app.get("/launch_raw/{launch_id}")
 def get_launch_raw(launch_id: str, internal: bool = False):
-    """Fetch the raw 'all_data' for a specific launch from the cache."""
+    """Return the full Launch Library record for one launch.
+
+    Prefers leftover `all_data` in cache (legacy), otherwise fetches the
+    single-launch LL endpoint so list caches can stay slim.
+    """
     if not internal:
         increment_metric("total_requests")
-    cache_key = "launches_cache_v2"
-    cached = get_cached_data(cache_key)
-    if not cached:
-        return {"error": "Cache empty"}
-
-    # Search in both upcoming and previous
-    for l in cached.get('upcoming', []) + cached.get('previous', []):
+    cached = _load_launch_payload(force=False)
+    for l in (cached.get('upcoming', []) or []) + (cached.get('previous', []) or []):
         if l.get('id') == launch_id:
-            increment_metric("cache_hits")
-            return l.get('all_data', {})
+            leftover = l.get('all_data')
+            if leftover:
+                increment_metric("cache_hits")
+                return leftover
+            increment_metric("cache_misses")
+            details = fetch_launch_details(launch_id)
+            return details if details else {"error": "Launch not found"}
 
     increment_metric("cache_misses")
-    return {"error": "Launch not found"}
+    details = fetch_launch_details(launch_id)
+    return details if details else {"error": "Launch not found"}
 
 
 def _get_weather_cached(location: str, force: bool = False):
     """Internal helper to fetch weather with v2 caching metadata."""
-    cache_key = f"weather_cache_v2_{location}"
-    if r and not force:
-        try:
-            cached = r.get(cache_key)
-            if cached:
-                data = json.loads(cached)
-                if not data.get('forecast'):
-                    data['forecast'] = fetch_forecast(location)
-                    data = _finalize_weather(data)
-                    try:
-                        r.setex(cache_key, 300, json.dumps(data))
-                    except Exception:
-                        pass
-                return _finalize_weather(data), True
-        except Exception:
-            pass
+    if not force:
+        data = _read_weather_loc(location)
+        if data:
+            if not data.get('forecast'):
+                data['forecast'] = fetch_forecast(location)
+                data = _finalize_weather(data)
+                _set_weather_loc(location, data)
+            return data, True
 
-    # If force=True or cache miss, perform a foreground fetch
-    data = fetch_weather(location)
-    data['forecast'] = fetch_forecast(location)
-    last_updated = _utc_isoformat()
-    data['last_updated'] = last_updated
-    data = _finalize_weather(data)
-    if r:
-        try:
-            r.setex(cache_key, 300, json.dumps(data))
-        except Exception:
-            pass
-    return data, False
+    payload = refresh_weather_internal(force=force)
+    loc_data = (payload or {}).get("weather", {}).get(location)
+    if loc_data:
+        return loc_data, False
+    return {"error": f"Weather unavailable for {location}"}, False
 
 
 @app.get("/weather/{location}")
@@ -2055,7 +2271,7 @@ def get_all_weather(force: bool = False, internal: bool = False):
         increment_metric("total_requests")
     if force:
         increment_metric("cache_misses")
-        return refresh_weather_internal()
+        return refresh_weather_internal(force=True)
 
     weather_payload = _load_weather_all(force=False)
     locations = list(weather_payload.get("weather", {}).keys())
@@ -2113,14 +2329,18 @@ def _slim_launch(launch, keep_trajectory=False):
 
 
 def _load_launch_payload(force=False):
-    cache_key = "launches_cache_v2"
+    now = time.time()
+    if not force and _launches_mem["data"] is not None and (now - _launches_mem["at"]) < LAUNCHES_MEM_TTL:
+        return _launches_mem["data"]
     if force:
         data = refresh_launches_internal()
     else:
-        data = get_cached_data(cache_key)
+        data = get_cached_data(LAUNCHES_CACHE_KEY)
+        if data:
+            _strip_heavy_launch_fields(data, persist_key=LAUNCHES_CACHE_KEY)
     if not data:
         return {"upcoming": [], "previous": [], "last_updated": None}
-    return data
+    return _remember_launches(data)
 
 
 def _slim_launch_payload(data, keep_next_trajectory=True):
@@ -2131,7 +2351,13 @@ def _slim_launch_payload(data, keep_next_trajectory=True):
             _slim_launch(launch, keep_trajectory=(keep_next_trajectory and i == 0))
             for i, launch in enumerate(upcoming)
         ],
-        "previous": [_slim_launch(launch) for launch in previous],
+        "previous": [
+            _slim_launch(
+                launch,
+                keep_trajectory=(keep_next_trajectory and not upcoming and i == 0),
+            )
+            for i, launch in enumerate(previous)
+        ],
         "last_updated": data.get("last_updated"),
     }
 
@@ -2154,18 +2380,11 @@ def _load_narratives(force=False):
 
 def _load_weather_all(force=False):
     if force:
-        return refresh_weather_internal()
-    weather_results = {}
-    timestamps = []
-    for loc in WEATHER_LOCATIONS:
-        res, _is_hit = _get_weather_cached(loc, False)
-        weather_results[loc] = res
-        if res.get("last_updated"):
-            timestamps.append(_utc_isoformat(res.get("last_updated")))
-    return {
-        "weather": weather_results,
-        "last_updated": min(timestamps) if timestamps else None,
-    }
+        return refresh_weather_internal(force=True)
+    assembled = _assemble_weather_all()
+    if assembled and len(assembled.get("weather", {})) == len(WEATHER_LOCATIONS):
+        return assembled
+    return refresh_weather_internal(force=False)
 
 
 def get_next_launch_info(upcoming_launches, tz_obj):
@@ -2762,10 +2981,15 @@ def stop_seeding():
     return {"status": "Stop signal sent"}
 
 
+_background_enabled = True
+
+
 def start_background_worker():
     def run():
         # Wait a bit for the app to start
         time.sleep(5)
+        if not _background_enabled:
+            return
 
         # Initial bootstrap (populate empty caches)
         print("Starting background worker bootstrap...")
@@ -2784,7 +3008,7 @@ def start_background_worker():
             "weather": time.time()
         }
 
-        while True:
+        while _background_enabled:
             try:
                 now = time.time()
 

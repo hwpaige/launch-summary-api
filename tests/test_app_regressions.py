@@ -1,15 +1,36 @@
 import re
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
 import app
+
+app._background_enabled = False
 
 
 def is_utc_iso8601(value):
     return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value))
 
 
+def _sample_launch(launch_id, name, with_raw=True, with_traj=False):
+    launch = {
+        "id": launch_id,
+        "name": name,
+        "mission": name,
+        "net": "2026-09-02T14:21:21Z",
+    }
+    if with_raw:
+        launch["all_data"] = {"id": launch_id, "rocket": {"huge": "blob"}, "pad": {"more": "blob"}}
+    if with_traj:
+        launch["trajectory_data"] = {"orbit_path": [{"lat": 1, "lon": 2, "r": 1.1}] * 10}
+    return launch
+
+
 class AppRegressionTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
     def test_parse_launch_data_prefers_image_url_and_sets_name_fields(self):
         launch = {
             "id": "launch-1",
@@ -39,6 +60,7 @@ class AppRegressionTests(unittest.TestCase):
         self.assertTrue(is_utc_iso8601(parsed["net"]))
         self.assertTrue(is_utc_iso8601(parsed["window_start"]))
         self.assertTrue(is_utc_iso8601(parsed["window_end"]))
+        self.assertNotIn("all_data", parsed)
 
     def test_generate_narratives_keeps_full_existing_history(self):
         fake_response = Mock()
@@ -121,6 +143,135 @@ class AppRegressionTests(unittest.TestCase):
 
         self.assertEqual(response["count"], 1)
         self.assertTrue(is_utc_iso8601(response["timestamp"]))
+
+    def test_launches_default_omits_all_data_and_extra_trajectory(self):
+        payload = {
+            "upcoming": [
+                _sample_launch("u1", "Next", with_traj=True),
+                _sample_launch("u2", "Later", with_traj=True),
+            ],
+            "previous": [_sample_launch("p1", "Past", with_traj=True)],
+            "last_updated": "2026-09-02T14:21:21Z",
+        }
+        persisted = []
+
+        def fake_persist(key, data, ttl=None):
+            persisted.append((key, data))
+            return True
+
+        with patch.object(app, "get_cached_data", return_value=payload), \
+             patch.object(app, "set_cached_data", side_effect=fake_persist), \
+             patch.object(app, "r", None):
+            result = app.get_launches(force=False, include_raw=False, internal=True)
+
+        self.assertNotIn("all_data", result["upcoming"][0])
+        self.assertNotIn("all_data", result["upcoming"][1])
+        self.assertNotIn("all_data", result["previous"][0])
+        self.assertIn("trajectory_data", result["upcoming"][0])
+        self.assertNotIn("trajectory_data", result["upcoming"][1])
+        self.assertNotIn("trajectory_data", result["previous"][0])
+        self.assertTrue(persisted)
+        slim_cache = persisted[0][1]
+        self.assertNotIn("all_data", slim_cache["upcoming"][0])
+
+    def test_launches_slim_matches_default_shape(self):
+        payload = {
+            "upcoming": [_sample_launch("u1", "Next", with_traj=True)],
+            "previous": [_sample_launch("p1", "Past")],
+            "last_updated": "2026-09-02T14:21:21Z",
+        }
+        with patch.object(app, "get_cached_data", return_value=payload), \
+             patch.object(app, "set_cached_data", return_value=True), \
+             patch.object(app, "r", None):
+            default = app.get_launches(internal=True)
+            slim = app.get_launches_slim(internal=True)
+
+        self.assertEqual(default["upcoming"][0]["id"], slim["upcoming"][0]["id"])
+        self.assertNotIn("all_data", slim["upcoming"][0])
+        self.assertNotIn("all_data", slim["previous"][0])
+
+    def test_strip_heavy_fields_drops_raw_blobs(self):
+        data = {
+            "upcoming": [_sample_launch("u1", "Next", with_traj=True)],
+            "previous": [_sample_launch("p1", "Past", with_traj=True)],
+        }
+        changed = app._strip_heavy_launch_fields(data)
+        self.assertTrue(changed)
+        self.assertNotIn("all_data", data["upcoming"][0])
+        self.assertNotIn("all_data", data["previous"][0])
+        self.assertIn("trajectory_data", data["upcoming"][0])
+        self.assertNotIn("trajectory_data", data["previous"][0])
+
+    def test_single_flight_coalesces_concurrent_calls(self):
+        flight = app._SingleFlight()
+        calls = []
+        entered = threading.Barrier(5)
+
+        def work():
+            entered.wait(timeout=2)
+            return flight.do(_slow)
+
+        def _slow():
+            calls.append(1)
+            time.sleep(0.1)
+            return "ok"
+
+        results = []
+
+        def worker():
+            results.append(work())
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(results, ["ok"] * 5)
+
+    def test_weather_refresh_single_flight_and_debounce(self):
+        entered = threading.Barrier(3)
+        weather_calls = []
+
+        def fake_fetch(location=None, station_id=None, lat=None, lon=None):
+            weather_calls.append(location)
+            time.sleep(0.1)
+            return {
+                "temperature_c": 20,
+                "temperature_f": 68,
+                "humidity": 50,
+                "wind_speed_kts": 5,
+                "wind_gust_kts": 0,
+                "wind_direction": 90,
+            }
+
+        forecast = {"current_weather": {"temperature": 20, "windspeed": 5, "winddirection": 90}}
+        results = [None] * 3
+
+        def worker(idx):
+            entered.wait(timeout=2)
+            results[idx] = app.refresh_weather_internal()
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "WEATHER_LOCATIONS", ["Cape"]), \
+             patch.object(app, "fetch_weather", side_effect=fake_fetch), \
+             patch.object(app, "fetch_forecast", return_value=forecast):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            first_count = len(weather_calls)
+            app.refresh_weather_internal()
+            second_count = len(weather_calls)
+
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 1)
+        self.assertTrue(all(results))
+        self.assertEqual(results[0]["weather"]["Cape"]["temperature_c"], 20.0)
+        self.assertTrue(is_utc_iso8601(results[0]["weather"]["Cape"]["last_updated"]))
 
 
 if __name__ == "__main__":
