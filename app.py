@@ -115,6 +115,43 @@ METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
 
+
+_UTC_NOW = object()
+
+
+def _utc_isoformat(value=_UTC_NOW):
+    """Return a UTC ISO-8601 timestamp without fractional seconds."""
+    if value is _UTC_NOW:
+        dt = datetime.now(timezone.utc)
+    elif value is None:
+        return None
+    elif isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return value
+    else:
+        return value
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _coerce_weather_numbers(value):
+    """Recursively convert weather numeric values to floats for Swift decoding."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _coerce_weather_numbers(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_coerce_weather_numbers(v) for v in value]
+    return value
+
 # Canonical dashboard sites. Hardware/settings stay on-device; this API
 # serves weather, launches, narratives, and derived dashboard snapshots.
 DASHBOARD_LOCATIONS = {
@@ -845,7 +882,7 @@ def update_seeding_status(is_running, last_status, total_pulled=0, oldest_launch
         "last_status": last_status,
         "total_pulled": total_pulled,
         "oldest_launch": oldest_launch,
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "updated_at": _utc_isoformat()
     }
     _local_seeding_status = status
     if r:
@@ -895,7 +932,7 @@ def record_snapshot():
 
     current_metrics = get_metrics(include_history=False)
     snapshot = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": _utc_isoformat(),
         "data": current_metrics
     }
 
@@ -1169,14 +1206,11 @@ Output as a Python list assignment: launch_descriptions = [...]"""
         print(f"Successfully generated {len(new_descriptions)} new narratives.")
 
         if existing_narratives:
-            # Prepend new ones and limit the total list size to the 5 most recent
+            # Prepend new ones while preserving the full existing history.
             combined = new_descriptions + existing_narratives
-            # We assume they are mostly sorted, but we could do a final sort if needed.
-            # However, since we don't have the year in the string, a simple string sort is risky.
-            # Prepending preserves the newest-first order from the API.
-            return combined[:5]
+            return combined
 
-        return new_descriptions[:5]
+        return new_descriptions
     except Exception as e:
         raise ValueError(f"Failed to parse Grok response: {str(e)}")
 
@@ -1200,6 +1234,20 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
                 landing_location = landing.get('location', {}).get('name')
 
     mission_data = launch.get('mission') or {}
+    launch_name = launch.get('name', 'Unknown')
+    normalized_net = _utc_isoformat(launch.get('net'))
+
+    raw_image = launch.get('image')
+    image_url = ''
+    if isinstance(raw_image, str):
+        image_url = raw_image
+    elif isinstance(raw_image, dict):
+        image_url = (
+            raw_image.get('image_url')
+            or raw_image.get('url')
+            or raw_image.get('thumbnail_url')
+            or ''
+        )
 
     # API v2.3.0 uses vid_urls, while v2.0.0 uses vidURLs
     raw_vid_urls = launch.get('vid_urls') or launch.get('vidURLs') or []
@@ -1207,11 +1255,11 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
 
     return {
         'id': launch.get('id'),
-        'mission': launch.get('name', 'Unknown'),
-        'date': launch.get('net').split('T')[0] if launch.get('net') else 'TBD',
-        'time': launch.get('net').split('T')[1].split('Z')[0] if launch.get('net') and 'T' in launch.get(
-            'net') else 'TBD',
-        'net': launch.get('net'),
+        'name': launch_name,
+        'mission': launch_name,
+        'date': normalized_net.split('T')[0] if normalized_net else 'TBD',
+        'time': normalized_net.split('T')[1].split('Z')[0] if normalized_net and 'T' in normalized_net else 'TBD',
+        'net': normalized_net,
         'status': launch.get('status', {}).get('name', 'Unknown'),
         'status_id': launch.get('status', {}).get('id'),
         'rocket': launch.get('rocket', {}).get('configuration', {}).get('name', 'Unknown'),
@@ -1226,10 +1274,9 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'is_detailed': is_detailed,
         # New enriched fields for "ALL data" view
         'description': mission_data.get('description', ''),
-        'image': launch.get('image', '') if isinstance(launch.get('image'), str) else (
-            launch.get('image', {}).get('url', '') if isinstance(launch.get('image'), dict) else ''),
-        'window_start': launch.get('window_start'),
-        'window_end': launch.get('window_end'),
+        'image': image_url,
+        'window_start': _utc_isoformat(launch.get('window_start')),
+        'window_end': _utc_isoformat(launch.get('window_end')),
         'probability': launch.get('probability'),
         'holdreason': launch.get('holdreason'),
         'failreason': launch.get('failreason'),
@@ -1434,7 +1481,7 @@ def seed_historical_launches():
             result = {
                 "upcoming": upcoming,
                 "previous": combined_prev,
-                "last_updated": datetime.now(timezone.utc).isoformat()
+                "last_updated": _utc_isoformat()
             }
             set_cached_data(cache_key, result)
 
@@ -1756,12 +1803,13 @@ def refresh_narratives_internal():
 
     try:
         descriptions = generate_narratives(existing_narratives=cached_narratives)
-        current_time = datetime.now(timezone.utc)
+        current_time_dt = datetime.now(timezone.utc)
+        current_time = _utc_isoformat(current_time_dt)
         set_cached_data(CACHE_KEY, descriptions)
-        set_cached_data(CACHE_TIME_KEY, current_time.isoformat())
+        set_cached_data(CACHE_TIME_KEY, current_time)
 
         _local_cache["launch_narratives"] = descriptions
-        _local_cache["last_updated"] = current_time
+        _local_cache["last_updated"] = current_time_dt
         return descriptions
     except Exception as e:
         print(f"Error in refresh_narratives_internal: {e}")
@@ -1796,7 +1844,7 @@ def refresh_launches_internal():
             if traj:
                 previous[0]['trajectory_data'] = traj
 
-        last_updated = datetime.now(timezone.utc).isoformat()
+        last_updated = _utc_isoformat()
         result = {
             "upcoming": upcoming,
             "previous": previous,
@@ -1813,11 +1861,26 @@ def _finalize_weather(data):
     """Normalize weather objects for dashboard clients."""
     if not isinstance(data, dict):
         return data
-    if 'wind_gusts_kts' not in data:
-        gust = data.get('wind_gust_kts')
-        speed = data.get('wind_speed_kts') or 0
-        data['wind_gusts_kts'] = gust if gust not in (None, 0) else speed
-    return data
+    normalized = _coerce_weather_numbers(data)
+    def _normalize_timestamp_fields(obj):
+        if isinstance(obj, dict):
+            out = {}
+            for key, value in obj.items():
+                if key in ('last_updated', 'timestamp'):
+                    out[key] = _utc_isoformat(value)
+                else:
+                    out[key] = _normalize_timestamp_fields(value)
+            return out
+        if isinstance(obj, list):
+            return [_normalize_timestamp_fields(item) for item in obj]
+        return obj
+
+    normalized = _normalize_timestamp_fields(normalized)
+    if 'wind_gusts_kts' not in normalized:
+        gust = normalized.get('wind_gust_kts')
+        speed = normalized.get('wind_speed_kts') or 0
+        normalized['wind_gusts_kts'] = gust if gust not in (None, 0) else speed
+    return normalized
 
 
 def refresh_weather_internal():
@@ -1830,9 +1893,9 @@ def refresh_weather_internal():
         data = fetch_weather(loc)
         forecast = fetch_forecast(loc)
         data['forecast'] = forecast
-        last_updated = datetime.now(timezone.utc).isoformat()
+        last_updated = _utc_isoformat()
         data['last_updated'] = last_updated
-        _finalize_weather(data)
+        data = _finalize_weather(data)
         weather_results[loc] = data
         timestamps.append(last_updated)
 
@@ -1845,7 +1908,7 @@ def refresh_weather_internal():
 
     return {
         "weather": weather_results,
-        "last_updated": min(timestamps) if timestamps else datetime.now(timezone.utc).isoformat()
+        "last_updated": min(timestamps) if timestamps else _utc_isoformat()
     }
 
 
@@ -1930,6 +1993,7 @@ def _get_weather_cached(location: str, force: bool = False):
                 data = json.loads(cached)
                 if not data.get('forecast'):
                     data['forecast'] = fetch_forecast(location)
+                    data = _finalize_weather(data)
                     try:
                         r.setex(cache_key, 300, json.dumps(data))
                     except Exception:
@@ -1941,9 +2005,9 @@ def _get_weather_cached(location: str, force: bool = False):
     # If force=True or cache miss, perform a foreground fetch
     data = fetch_weather(location)
     data['forecast'] = fetch_forecast(location)
-    last_updated = datetime.now(timezone.utc).isoformat()
+    last_updated = _utc_isoformat()
     data['last_updated'] = last_updated
-    _finalize_weather(data)
+    data = _finalize_weather(data)
     if r:
         try:
             r.setex(cache_key, 300, json.dumps(data))
@@ -1979,8 +2043,8 @@ def get_user_weather(lat: float, lon: float, station_id: str = None, internal: b
     # Fetch forecast
     forecast = fetch_forecast(lat=lat, lon=lon)
     weather_data['forecast'] = forecast
-    weather_data['last_updated'] = datetime.now(timezone.utc).isoformat()
-    _finalize_weather(weather_data)
+    weather_data['last_updated'] = _utc_isoformat()
+    weather_data = _finalize_weather(weather_data)
 
     return weather_data
 
@@ -2075,15 +2139,15 @@ def _slim_launch_payload(data, keep_next_trajectory=True):
 def _load_narratives(force=False):
     if force:
         descriptions = refresh_narratives_internal() or []
-        return descriptions, datetime.now(timezone.utc).isoformat()
+        return descriptions, _utc_isoformat()
     data = get_cached_data(CACHE_KEY)
     time_str = get_cached_data(CACHE_TIME_KEY)
     if data:
-        return data, time_str
+        return data, _utc_isoformat(time_str) if time_str else None
     cached_narratives = _local_cache.get("launch_narratives")
     last_updated = _local_cache.get("last_updated")
     if cached_narratives and last_updated:
-        stamp = last_updated.isoformat() if hasattr(last_updated, "isoformat") else last_updated
+        stamp = _utc_isoformat(last_updated)
         return cached_narratives, stamp
     return [], None
 
@@ -2097,7 +2161,7 @@ def _load_weather_all(force=False):
         res, _is_hit = _get_weather_cached(loc, False)
         weather_results[loc] = res
         if res.get("last_updated"):
-            timestamps.append(res.get("last_updated"))
+            timestamps.append(_utc_isoformat(res.get("last_updated")))
     return {
         "weather": weather_results,
         "last_updated": min(timestamps) if timestamps else None,
@@ -2593,7 +2657,7 @@ def get_narratives(force: bool = False, internal: bool = False):
     if force:
         increment_metric("cache_misses")
         descriptions = refresh_narratives_internal()
-        return {"descriptions": descriptions, "last_updated": datetime.now(timezone.utc).isoformat()}
+        return {"descriptions": descriptions, "last_updated": _utc_isoformat()}
 
     # Try to get from Redis
     data = get_cached_data(CACHE_KEY)
@@ -2601,7 +2665,7 @@ def get_narratives(force: bool = False, internal: bool = False):
 
     if data and time_str:
         increment_metric("cache_hits")
-        return {"descriptions": data, "last_updated": time_str}
+        return {"descriptions": data, "last_updated": _utc_isoformat(time_str)}
 
     # Fallback to in-memory
     cached_narratives = _local_cache["launch_narratives"]
@@ -2609,7 +2673,7 @@ def get_narratives(force: bool = False, internal: bool = False):
 
     if cached_narratives and last_updated:
         increment_metric("cache_hits")
-        return {"descriptions": cached_narratives, "last_updated": last_updated.isoformat()}
+        return {"descriptions": cached_narratives, "last_updated": _utc_isoformat(last_updated)}
 
     increment_metric("cache_misses")
     return {"descriptions": [], "last_updated": None}
@@ -3964,7 +4028,7 @@ def refresh_cache():
     return {
         "status": "Cache refreshed",
         "count": count,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": _utc_isoformat()
     }
 
 
