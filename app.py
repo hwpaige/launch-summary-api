@@ -1,7 +1,9 @@
 import os
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Request
+from typing import Literal, Optional
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 import requests
 import ast
 import re
@@ -17,7 +19,33 @@ from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
 
-app = FastAPI()
+GROK_MODEL = "grok-4-1-fast-reasoning"
+GROK_API_URL = "https://api.x.ai/v1/chat/completions"
+NOTIFY_COPY_TTL = 3600  # 1 hour; reschedules should not thrash xAI
+NOTIFY_TITLE_MAX = 50
+NOTIFY_BODY_MAX = 150
+NOTIFY_COPY_CACHE_PREFIX = "notify_copy_v1"
+NotifyEvent = Literal["t1h", "t24h", "scrub"]
+
+app = FastAPI(
+    title="SpaceX Launch Summary API",
+    description=(
+        "Witty SpaceX launch narratives, upcoming-launch data, weather, and "
+        "Launch Buddy notification copy. Past-launch narratives and "
+        "`/notify/copy` both use the xAI Grok model "
+        f"`{GROK_MODEL}` via `XAI_API_KEY`."
+    ),
+    openapi_tags=[
+        {
+            "name": "Notifications",
+            "description": (
+                "Grok-powered push/local-notification title+body for Launch Buddy "
+                "upcoming-launch alerts (`t24h`, `t1h`, `scrub`). "
+                "Includes launch probability in the copy when provided."
+            ),
+        },
+    ],
+)
 
 
 # Redis Configuration for persistence across Heroku builds
@@ -101,6 +129,7 @@ _local_cache = {
     "launch_narratives": None,
     "last_updated": None
 }
+_local_notify_copy = {}
 _local_metrics = {
     "total_requests": 0,
     "cache_hits": 0,
@@ -189,6 +218,7 @@ def _reset_cache_coordination_for_tests():
     _weather_last_result = None
     _local_weather_store.clear()
     _local_raw_launches.clear()
+    _local_notify_copy.clear()
     _launches_mem["data"] = None
     _launches_mem["at"] = 0.0
 
@@ -1411,23 +1441,7 @@ Format each as: month/day HHMM: description
 Output as a Python list assignment: launch_descriptions = [...]"""
 
     try:
-        headers = {
-            "Authorization": f"Bearer {os.getenv('XAI_API_KEY')}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "grok-4-1-fast-reasoning",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-            "max_tokens": 4000
-        }
-        response = requests.post("https://api.x.ai/v1/chat/completions", headers=headers, json=payload)
-        if response.status_code != 200:
-            raise ValueError(f"Grok API call failed: {response.status_code} - {response.text}")
-
-        data = response.json()
-        generated_text = data['choices'][0]['message']['content']
-        print(f"DEBUG: Raw Grok response: {generated_text}")
+        generated_text = call_grok(prompt, temperature=0.7, max_tokens=4000)
     except Exception as e:
         raise ValueError(f"Grok API call failed: {str(e)}")
 
@@ -1462,6 +1476,359 @@ Output as a Python list assignment: launch_descriptions = [...]"""
         return new_descriptions
     except Exception as e:
         raise ValueError(f"Failed to parse Grok response: {str(e)}")
+
+
+def call_grok(prompt, temperature=0.7, max_tokens=4000):
+    """Shared xAI Grok chat-completions path used by narratives and notify copy."""
+    headers = {
+        "Authorization": f"Bearer {os.getenv('XAI_API_KEY')}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROK_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    response = requests.post(GROK_API_URL, headers=headers, json=payload)
+    if response.status_code != 200:
+        raise ValueError(f"Grok API call failed: {response.status_code} - {response.text}")
+
+    data = response.json()
+    generated_text = data["choices"][0]["message"]["content"]
+    print(f"DEBUG: Raw Grok response: {generated_text}")
+    return generated_text
+
+
+class NotifyCopyRequest(BaseModel):
+    """Launch Buddy upcoming-launch alert input for Grok notification copy."""
+
+    launch_id: str = Field(..., examples=["a7e1c2d4-1111-4b2a-9c33-0f1e2d3c4b5a"], description="Launch Library / Launch Buddy launch id")
+    event: NotifyEvent = Field(
+        ...,
+        description="Alert type: T-24 hours, T-1 hour, or scrub/delay/hold",
+        examples=["t1h"],
+    )
+    mission: Optional[str] = Field(default=None, examples=["Starlink Group 10-20"])
+    net: Optional[str] = Field(default=None, examples=["2026-09-06T02:15:00Z"], description="Launch NET as ISO8601")
+    status: Optional[str] = Field(default=None, examples=["Go"], description="Current launch status")
+    pad: Optional[str] = Field(default=None, examples=["SLC-40"])
+    rocket: Optional[str] = Field(default=None, examples=["Falcon 9"])
+    orbit: Optional[str] = Field(default=None, examples=["LEO"])
+    probability: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        examples=[70],
+        description="Launch probability 0-100, or omit/null when unknown",
+    )
+    previous_status: Optional[str] = Field(
+        default=None,
+        examples=["Go"],
+        description="Prior status, used for scrub/delay/hold context",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "launch_id": "a7e1c2d4-1111-4b2a-9c33-0f1e2d3c4b5a",
+                    "event": "t1h",
+                    "mission": "Starlink Group 10-20",
+                    "net": "2026-09-06T02:15:00Z",
+                    "status": "Go",
+                    "pad": "SLC-40",
+                    "rocket": "Falcon 9",
+                    "orbit": "LEO",
+                    "probability": 70,
+                },
+                {
+                    "launch_id": "a7e1c2d4-1111-4b2a-9c33-0f1e2d3c4b5a",
+                    "event": "t24h",
+                    "mission": "Starlink Group 10-20",
+                    "net": "2026-09-07T02:15:00Z",
+                    "status": "Go",
+                    "pad": "SLC-40",
+                    "rocket": "Falcon 9",
+                    "orbit": "LEO",
+                    "probability": 80,
+                },
+                {
+                    "launch_id": "a7e1c2d4-1111-4b2a-9c33-0f1e2d3c4b5a",
+                    "event": "scrub",
+                    "mission": "Starlink Group 10-20",
+                    "net": "2026-09-06T02:15:00Z",
+                    "status": "Hold",
+                    "previous_status": "Go",
+                    "pad": "SLC-40",
+                    "rocket": "Falcon 9",
+                    "orbit": "LEO",
+                    "probability": 40,
+                },
+            ]
+        }
+    }
+
+
+class NotifyCopyResponse(BaseModel):
+    title: str = Field(..., description="Push/local notification title, ≤50 characters", max_length=NOTIFY_TITLE_MAX)
+    body: str = Field(..., description="Push/local notification body, ≤150 characters", max_length=NOTIFY_BODY_MAX)
+    launch_id: str
+    event: NotifyEvent
+    cached: bool = Field(..., description="True when served from the Redis/local notify-copy cache")
+    model: str = Field(default=GROK_MODEL, examples=[GROK_MODEL])
+
+
+def _normalize_probability(value):
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    if number == int(number):
+        return int(number)
+    return number
+
+
+def _probability_token(probability):
+    normalized = _normalize_probability(probability)
+    if normalized is None:
+        return None
+    return f"{normalized}%"
+
+
+def _probability_phrase(probability):
+    """Short phrase for copy: '70% go' or 'weather 40%'."""
+    normalized = _normalize_probability(probability)
+    if normalized is None:
+        return None
+    token = _probability_token(normalized)
+    if normalized < 50:
+        return f"weather {token}"
+    return f"{token} go"
+
+
+def _probability_mentioned(text, probability):
+    token = _probability_token(probability)
+    if not token:
+        return True
+    if not text:
+        return False
+    number = re.escape(token[:-1])
+    return bool(re.search(rf"{number}\s*%|{number}\s*percent", text, flags=re.IGNORECASE))
+
+
+def _short_mission(mission):
+    if not mission or not str(mission).strip():
+        return "Upcoming launch"
+    name = str(mission).strip()
+    if "|" in name:
+        name = name.split("|")[-1].strip() or name
+    return name
+
+
+def _clip_notify_text(text, limit):
+    cleaned = re.sub(r"[*_`#]+", "", str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    clipped = cleaned[:limit].rsplit(" ", 1)[0].rstrip(".,;: ")
+    return clipped or cleaned[:limit]
+
+
+def _ensure_probability_in_copy(title, body, probability):
+    if _probability_mentioned(f"{title} {body}", probability):
+        return title, body
+    phrase = _probability_phrase(probability)
+    if not phrase:
+        return title, body
+    suffix = f" {phrase}."
+    if len(body) + len(suffix) <= NOTIFY_BODY_MAX:
+        return title, body + suffix
+    trimmed = _clip_notify_text(body, NOTIFY_BODY_MAX - len(suffix))
+    return title, trimmed + suffix
+
+
+def notify_copy_cache_key(launch_id, event, net, status, probability):
+    prob = _normalize_probability(probability)
+    prob_part = "" if prob is None else str(prob)
+    return (
+        f"{NOTIFY_COPY_CACHE_PREFIX}:"
+        f"{launch_id or ''}|{event or ''}|{net or ''}|{status or ''}|{prob_part}"
+    )
+
+
+def _get_notify_copy_cached(key):
+    cached = get_cached_data(key)
+    if isinstance(cached, dict) and cached.get("title") and cached.get("body"):
+        return cached
+    entry = _local_notify_copy.get(key)
+    if not entry:
+        return None
+    data, expires_at = entry
+    if time.time() >= expires_at:
+        _local_notify_copy.pop(key, None)
+        return None
+    if isinstance(data, dict) and data.get("title") and data.get("body"):
+        return data
+    return None
+
+
+def _set_notify_copy_cached(key, data):
+    set_cached_data(key, data, ttl=NOTIFY_COPY_TTL)
+    _local_notify_copy[key] = (data, time.time() + NOTIFY_COPY_TTL)
+
+
+def fallback_notify_copy(payload: NotifyCopyRequest):
+    """Template copy used when Grok is unavailable. Still includes probability."""
+    mission = _short_mission(payload.mission)
+    pad = (payload.pad or "").strip()
+    status = (payload.status or "").strip()
+    phrase = _probability_phrase(payload.probability)
+    prob_bit = f" {phrase}." if phrase else ""
+    pad_bit = f" from {pad}" if pad else ""
+
+    if payload.event == "t1h":
+        title = f"T-1h: {mission}"
+        body = f"{mission} T-1 hour{pad_bit}.{prob_bit}"
+    elif payload.event == "t24h":
+        title = f"T-24h: {mission}"
+        body = f"{mission} T-24 hours{pad_bit}.{prob_bit}"
+    else:
+        status_bit = status or "scrubbed / delayed"
+        title = f"Hold: {mission}"
+        body = f"{mission} {status_bit} — plans changed.{prob_bit}"
+
+    title = _clip_notify_text(title, NOTIFY_TITLE_MAX)
+    body = _clip_notify_text(body, NOTIFY_BODY_MAX)
+    return _ensure_probability_in_copy(title, body, payload.probability)
+
+
+def _event_prompt_instructions(event):
+    if event == "t1h":
+        return (
+            "t1h: convey T-1 hour urgency without sounding like spam. "
+            "Include the mission short name and a T-1h feel. Include the pad if it fits."
+        )
+    if event == "t24h":
+        return (
+            "t24h: this is a 24-hour heads-up, not last-call. "
+            "Include the mission short name and a T-24h feel. Include the pad if it fits."
+        )
+    return (
+        "scrub: make it clear plans changed (scrub / delay / hold). "
+        "Include the new status if given."
+    )
+
+
+def build_notify_copy_prompt(payload: NotifyCopyRequest):
+    prob = _normalize_probability(payload.probability)
+    if prob is None:
+        probability_line = "not provided — do not invent a percentage"
+    else:
+        probability_line = f"{prob} (ALWAYS mention this, e.g. '70% go' or 'weather 40%')"
+
+    return f"""Write a short push notification for an upcoming SpaceX launch alert.
+
+Event type: {payload.event}
+Mission: {payload.mission or "Unknown mission"}
+NET: {payload.net or "unknown"}
+Status: {payload.status or "unknown"}
+Previous status: {payload.previous_status or "n/a"}
+Pad: {payload.pad or "unknown"}
+Rocket: {payload.rocket or "unknown"}
+Orbit: {payload.orbit or "unknown"}
+Launch probability: {probability_line}
+
+Tone: witty but clear, spaceflight-nerd friendly — same spirit as Cities Skylines / Kerbal Space Program notifications, but SHORT enough for a phone banner.
+
+Rules:
+- Title ≤ {NOTIFY_TITLE_MAX} characters. Body ≤ {NOTIFY_BODY_MAX} characters.
+- No markdown, no hashtags, at most one emoji (zero is preferred).
+- ALWAYS mention launch probability when it is provided (e.g. "70% go" or "weather 40%").
+- {_event_prompt_instructions(payload.event)}
+- Return ONLY a JSON object: {{"title":"...","body":"..."}}
+
+Examples:
+- t24h: {{"title":"T-24h: Starlink 10-20","body":"Falcon 9 is on the 24-hour clock at SLC-40. Weather 80% go."}}
+- t1h: {{"title":"T-1h: Starlink 10-20","body":"T-1 hour at SLC-40. 70% go — last coffee before liftoff."}}
+- scrub: {{"title":"Hold: Starlink 10-20","body":"Go became Hold at SLC-40. Plans changed; weather 40%."}}
+"""
+
+
+def _parse_notify_copy_response(generated_text):
+    text = (generated_text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    candidates = [text]
+    match = re.search(r"\{[^{}]*\"title\"[^{}]*\"body\"[^{}]*\}", text, flags=re.DOTALL)
+    if match:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("title") and data.get("body"):
+            return str(data["title"]), str(data["body"])
+    raise ValueError("No valid notify copy JSON found in Grok response")
+
+
+def generate_notify_copy(payload: NotifyCopyRequest, increment_metrics: bool = False):
+    """Generate cached Grok (or fallback) notification title+body for an alert event."""
+    cache_key = notify_copy_cache_key(
+        payload.launch_id,
+        payload.event,
+        payload.net,
+        payload.status,
+        payload.probability,
+    )
+    cached = _get_notify_copy_cached(cache_key)
+    if cached:
+        if increment_metrics:
+            increment_metric("cache_hits")
+        return {
+            "title": _clip_notify_text(cached["title"], NOTIFY_TITLE_MAX),
+            "body": _clip_notify_text(cached["body"], NOTIFY_BODY_MAX),
+            "launch_id": payload.launch_id,
+            "event": payload.event,
+            "cached": True,
+            "model": GROK_MODEL,
+        }
+
+    if increment_metrics:
+        increment_metric("cache_misses")
+
+    try:
+        if increment_metrics:
+            increment_metric("api_calls")
+        generated_text = call_grok(
+            build_notify_copy_prompt(payload),
+            temperature=0.7,
+            max_tokens=250,
+        )
+        title, body = _parse_notify_copy_response(generated_text)
+        title = _clip_notify_text(title, NOTIFY_TITLE_MAX)
+        body = _clip_notify_text(body, NOTIFY_BODY_MAX)
+        title, body = _ensure_probability_in_copy(title, body, payload.probability)
+    except Exception as exc:
+        print(f"Notify copy Grok fallback: {exc}")
+        title, body = fallback_notify_copy(payload)
+
+    result = {
+        "title": title,
+        "body": body,
+        "launch_id": payload.launch_id,
+        "event": payload.event,
+        "cached": False,
+        "model": GROK_MODEL,
+    }
+    _set_notify_copy_cached(cache_key, {"title": title, "body": body})
+    return result
 
 
 # --- Ported Fetch Functions from functions.py ---
@@ -2976,6 +3343,94 @@ def get_narratives(force: bool = False, internal: bool = False):
 
     increment_metric("cache_misses")
     return {"descriptions": [], "last_updated": None}
+
+
+def _notify_copy_from_params(
+    launch_id: str,
+    event: NotifyEvent,
+    mission: Optional[str] = None,
+    net: Optional[str] = None,
+    status: Optional[str] = None,
+    pad: Optional[str] = None,
+    rocket: Optional[str] = None,
+    orbit: Optional[str] = None,
+    probability: Optional[float] = None,
+    previous_status: Optional[str] = None,
+):
+    increment_metric("total_requests")
+    payload = NotifyCopyRequest(
+        launch_id=launch_id,
+        event=event,
+        mission=mission,
+        net=net,
+        status=status,
+        pad=pad,
+        rocket=rocket,
+        orbit=orbit,
+        probability=probability,
+        previous_status=previous_status,
+    )
+    return generate_notify_copy(payload, increment_metrics=True)
+
+
+@app.post(
+    "/notify/copy",
+    response_model=NotifyCopyResponse,
+    tags=["Notifications"],
+    summary="Generate Grok notification copy",
+    response_description="Short title+body for a Launch Buddy push/local notification",
+)
+def post_notify_copy(payload: NotifyCopyRequest):
+    """Generate short push/local-notification title+body for an upcoming launch.
+
+    Uses the same xAI Grok model as past-launch narratives
+    (`grok-4-1-fast-reasoning` via `XAI_API_KEY`). Cached in Redis for ~1 hour
+    keyed by `(launch_id, event, net, status, probability)`.
+
+    Supported `event` values:
+    - **t24h** — 24 hours before NET
+    - **t1h** — one hour before NET
+    - **scrub** — launch scrubbed / delayed / hold (status change)
+
+    Always mentions `probability` when provided (e.g. `70% go` or `weather 40%`).
+    Falls back to a template if Grok fails.
+    """
+    increment_metric("total_requests")
+    return generate_notify_copy(payload, increment_metrics=True)
+
+
+@app.get(
+    "/notify/copy",
+    response_model=NotifyCopyResponse,
+    tags=["Notifications"],
+    summary="Generate Grok notification copy (query params)",
+    response_description="Short title+body for a Launch Buddy push/local notification",
+)
+def get_notify_copy(
+    launch_id: str = Query(..., examples=["a7e1c2d4-1111-4b2a-9c33-0f1e2d3c4b5a"], description="Launch Library / Launch Buddy launch id"),
+    event: NotifyEvent = Query(..., examples=["t24h"], description="t24h | t1h | scrub"),
+    mission: Optional[str] = Query(default=None, examples=["Starlink Group 10-20"]),
+    net: Optional[str] = Query(default=None, examples=["2026-09-07T02:15:00Z"], description="Launch NET as ISO8601"),
+    status: Optional[str] = Query(default=None, examples=["Go"]),
+    pad: Optional[str] = Query(default=None, examples=["SLC-40"]),
+    rocket: Optional[str] = Query(default=None, examples=["Falcon 9"]),
+    orbit: Optional[str] = Query(default=None, examples=["LEO"]),
+    probability: Optional[float] = Query(default=None, ge=0, le=100, examples=[80], description="Launch probability 0-100"),
+    previous_status: Optional[str] = Query(default=None, examples=["Go"], description="Prior status for scrub context"),
+):
+    """GET variant of `/notify/copy` for easy client testing. Same shape as POST."""
+    return _notify_copy_from_params(
+        launch_id=launch_id,
+        event=event,
+        mission=mission,
+        net=net,
+        status=status,
+        pad=pad,
+        rocket=rocket,
+        orbit=orbit,
+        probability=probability,
+        previous_status=previous_status,
+    )
 
 
 @app.get("/metrics")

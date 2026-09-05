@@ -1,3 +1,4 @@
+import json
 import re
 import threading
 import time
@@ -286,6 +287,148 @@ class AppRegressionTests(unittest.TestCase):
         self.assertTrue(all(results))
         self.assertEqual(results[0]["weather"]["Cape"]["temperature_c"], 20.0)
         self.assertTrue(is_utc_iso8601(results[0]["weather"]["Cape"]["last_updated"]))
+
+
+class NotifyCopyTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def _payload(self, **overrides):
+        data = {
+            "launch_id": "launch-notify-1",
+            "event": "t1h",
+            "mission": "Starlink Group 10-20",
+            "net": "2026-09-06T02:15:00Z",
+            "status": "Go",
+            "pad": "SLC-40",
+            "rocket": "Falcon 9",
+            "orbit": "LEO",
+            "probability": 70,
+        }
+        data.update(overrides)
+        return app.NotifyCopyRequest(**data)
+
+    def test_fallback_includes_probability_for_t1h_t24h_scrub(self):
+        t1h_title, t1h_body = app.fallback_notify_copy(self._payload(event="t1h", probability=70))
+        t24h_title, t24h_body = app.fallback_notify_copy(self._payload(event="t24h", probability=80))
+        scrub_title, scrub_body = app.fallback_notify_copy(
+            self._payload(event="scrub", status="Hold", previous_status="Go", probability=40)
+        )
+
+        self.assertIn("T-1h", t1h_title)
+        self.assertIn("70%", f"{t1h_title} {t1h_body}")
+        self.assertLessEqual(len(t1h_title), app.NOTIFY_TITLE_MAX)
+        self.assertLessEqual(len(t1h_body), app.NOTIFY_BODY_MAX)
+
+        self.assertIn("T-24h", t24h_title)
+        self.assertIn("80%", f"{t24h_title} {t24h_body}")
+        self.assertIn("Starlink", t24h_body)
+
+        self.assertIn("Hold", f"{scrub_title} {scrub_body}")
+        self.assertIn("plans changed", scrub_body.lower())
+        self.assertIn("40%", f"{scrub_title} {scrub_body}")
+
+    def test_generate_notify_copy_uses_shared_grok_path_and_caches(self):
+        calls = []
+
+        def fake_grok(prompt, temperature=0.7, max_tokens=4000):
+            calls.append(prompt)
+            self.assertIn("t1h", prompt)
+            self.assertIn("70", prompt)
+            return '{"title":"T-1h: Starlink 10-20","body":"T-1 hour at SLC-40. 70% go."}'
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "call_grok", side_effect=fake_grok):
+            first = app.generate_notify_copy(self._payload())
+            second = app.generate_notify_copy(self._payload())
+            rescheduled = app.generate_notify_copy(self._payload(net="2026-09-06T04:15:00Z"))
+            different_prob = app.generate_notify_copy(self._payload(probability=40))
+
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(first["title"], second["title"])
+        self.assertEqual(first["model"], app.GROK_MODEL)
+        self.assertFalse(rescheduled["cached"])
+        self.assertFalse(different_prob["cached"])
+        self.assertEqual(len(calls), 3)
+        self.assertIn("70%", first["body"])
+
+    def test_generate_notify_copy_falls_back_when_grok_fails(self):
+        with patch.object(app, "r", None), \
+             patch.object(app, "call_grok", side_effect=ValueError("Grok down")):
+            result = app.generate_notify_copy(self._payload(event="t24h", probability=55))
+
+        self.assertFalse(result["cached"])
+        self.assertEqual(result["event"], "t24h")
+        self.assertIn("T-24h", result["title"])
+        self.assertIn("55%", f"{result['title']} {result['body']}")
+        self.assertEqual(result["model"], app.GROK_MODEL)
+
+    def test_probability_injected_when_grok_omits_it(self):
+        with patch.object(app, "r", None), \
+             patch.object(app, "call_grok", return_value='{"title":"T-1h: Starlink","body":"T-1 hour at SLC-40. Stack is hot."}'):
+            result = app.generate_notify_copy(self._payload(probability=70))
+
+        self.assertIn("70%", f"{result['title']} {result['body']}")
+
+    def test_http_get_and_post_notify_copy(self):
+        from fastapi.testclient import TestClient
+
+        grok_json = '{"title":"T-24h: Starlink 10-20","body":"24-hour clock at SLC-40. 80% go."}'
+        with patch.object(app, "r", None), \
+             patch.object(app, "call_grok", return_value=grok_json), \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            get_resp = client.get(
+                "/notify/copy",
+                params={
+                    "launch_id": "launch-notify-1",
+                    "event": "t24h",
+                    "mission": "Starlink Group 10-20",
+                    "pad": "SLC-40",
+                    "probability": 80,
+                },
+            )
+            post_resp = client.post(
+                "/notify/copy",
+                json={
+                    "launch_id": "launch-notify-2",
+                    "event": "scrub",
+                    "mission": "Starlink Group 10-20",
+                    "status": "Hold",
+                    "previous_status": "Go",
+                    "probability": 40,
+                },
+            )
+            bad_event = client.get("/notify/copy", params={"launch_id": "x", "event": "liftoff"})
+
+        self.assertEqual(get_resp.status_code, 200)
+        get_body = get_resp.json()
+        self.assertEqual(get_body["event"], "t24h")
+        self.assertIn("80%", f"{get_body['title']} {get_body['body']}")
+        self.assertEqual(get_body["model"], app.GROK_MODEL)
+
+        self.assertEqual(post_resp.status_code, 200)
+        post_body = post_resp.json()
+        self.assertEqual(post_body["event"], "scrub")
+        self.assertIn("40%", f"{post_body['title']} {post_body['body']}")
+        self.assertLessEqual(len(post_body["title"]), 50)
+        self.assertLessEqual(len(post_body["body"]), 150)
+
+        self.assertEqual(bad_event.status_code, 422)
+
+    def test_openapi_documents_notify_copy_events(self):
+        schema = app.app.openapi()
+        paths = schema["paths"]
+        self.assertIn("/notify/copy", paths)
+        self.assertIn("get", paths["/notify/copy"])
+        self.assertIn("post", paths["/notify/copy"])
+        dumped = json.dumps(schema)
+        self.assertIn("t1h", dumped)
+        self.assertIn("t24h", dumped)
+        self.assertIn("scrub", dumped)
+        self.assertIn("Notifications", dumped)
+        self.assertIn(app.GROK_MODEL, dumped)
 
 
 if __name__ == "__main__":
