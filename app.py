@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -2766,13 +2766,15 @@ def get_launches_slim(force: bool = False, internal: bool = False):
 @app.get("/launch_raw/{launch_id}")
 def get_launch_raw(
     launch_id: str,
-    hot: bool = Query(
-        False,
-        description=(
-            "If true, refresh the current/next launch from Launch Library on a "
-            "~20s stale-while-revalidate TTL. Ignored for any other launch id."
+    hot: Annotated[
+        bool,
+        Query(
+            description=(
+                "If true, refresh the current/next launch from Launch Library on a "
+                "~20s stale-while-revalidate TTL. Ignored for any other launch id."
+            )
         ),
-    ),
+    ] = False,
     internal: bool = False,
 ):
     """Return the full Launch Library record for one launch.
