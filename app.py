@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -144,7 +144,9 @@ METRICS_KEY = "app_metrics_v2"
 METRICS_HISTORY_KEY = "app_metrics_history_v2"
 LAUNCHES_CACHE_KEY = "launches_cache_v2"
 RAW_LAUNCH_KEY_PREFIX = "launch_raw_v2:"
+HOT_RAW_KEY_PREFIX = "launch_raw_hot_v1:"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
+HOT_RAW_TTL = int(os.getenv("HOT_RAW_TTL", "20"))  # 20–30s stale-while-revalidate for ?hot=1
 LAUNCHES_MEM_TTL = 45  # seconds; avoid repeatedly inflating the Redis blob
 WEATHER_CACHE_TTL = 300
 WEATHER_DEBOUNCE_SEC = 20.0
@@ -200,10 +202,13 @@ class _SingleFlight:
 _weather_flight = _SingleFlight()
 _launches_flight = _SingleFlight()
 _narratives_flight = _SingleFlight()
+_hot_raw_flights = {}
+_hot_raw_flights_lock = threading.Lock()
 _weather_last_refresh_at = 0.0
 _weather_last_result = None
 _local_weather_store = {}
 _local_raw_launches = {}
+_local_hot_raw = {}
 _launches_mem = {"data": None, "at": 0.0}
 
 
@@ -214,10 +219,15 @@ def _reset_cache_coordination_for_tests():
     _weather_flight.reset()
     _launches_flight.reset()
     _narratives_flight.reset()
+    with _hot_raw_flights_lock:
+        for flight in _hot_raw_flights.values():
+            flight.reset()
+        _hot_raw_flights.clear()
     _weather_last_refresh_at = 0.0
     _weather_last_result = None
     _local_weather_store.clear()
     _local_raw_launches.clear()
+    _local_hot_raw.clear()
     _local_notify_copy.clear()
     _launches_mem["data"] = None
     _launches_mem["at"] = 0.0
@@ -282,6 +292,122 @@ def _get_raw_launch(launch_id):
         if cached is not None:
             return cached
     return _local_raw_launches.get(key)
+
+
+def _hot_flight(launch_id):
+    key = str(launch_id)
+    with _hot_raw_flights_lock:
+        flight = _hot_raw_flights.get(key)
+        if flight is None:
+            flight = _SingleFlight()
+            _hot_raw_flights[key] = flight
+        return flight
+
+
+def _read_hot_raw(launch_id):
+    """Return the short-TTL hot blob if it is still fresh."""
+    key = str(launch_id)
+    if r:
+        return get_cached_data(f"{HOT_RAW_KEY_PREFIX}{key}")
+    entry = _local_hot_raw.get(key)
+    if entry and entry[1] > time.time():
+        return entry[0]
+    return None
+
+
+def _write_hot_raw(launch_id, raw):
+    """Store hot raw on a short TTL; also refresh the long-lived side store."""
+    if not launch_id or raw is None:
+        return
+    key = str(launch_id)
+    _local_hot_raw[key] = (raw, time.time() + HOT_RAW_TTL)
+    if r:
+        set_cached_data(f"{HOT_RAW_KEY_PREFIX}{key}", raw, ttl=HOT_RAW_TTL)
+    _store_raw_launch(key, raw)
+
+
+def _current_next_launch_ids(data=None):
+    """IDs of the next upcoming launch, plus previous[0] if nothing is upcoming."""
+    if data is None:
+        data = _load_launch_payload(force=False)
+    if not isinstance(data, dict):
+        return set()
+    ids = set()
+    upcoming = [l for l in (data.get("upcoming") or []) if isinstance(l, dict)]
+    previous = [l for l in (data.get("previous") or []) if isinstance(l, dict)]
+    if upcoming and upcoming[0].get("id"):
+        ids.add(str(upcoming[0]["id"]))
+    next_l = get_next_launch_info(upcoming, pytz.UTC) if upcoming else None
+    if next_l and next_l.get("id"):
+        ids.add(str(next_l["id"]))
+    if not upcoming and previous and previous[0].get("id"):
+        ids.add(str(previous[0]["id"]))
+    return ids
+
+
+def _is_current_or_next_launch(launch_id):
+    if not launch_id:
+        return False
+    return str(launch_id) in _current_next_launch_ids()
+
+
+def _fetch_and_store_hot_raw(launch_id):
+    details = fetch_launch_details(launch_id)
+    if details:
+        _write_hot_raw(launch_id, details)
+        return details
+    stale = _get_raw_launch(launch_id)
+    if stale:
+        # Failed LL2 GET: keep serving leftover and cooldown the hot key.
+        _write_hot_raw(launch_id, stale)
+        return stale
+    return None
+
+
+def _refresh_hot_launch_raw(launch_id):
+    """Single-flight (in-process + Redis) so concurrent ?hot=1 polls share one LL2 GET."""
+    def _do():
+        cached = _read_hot_raw(launch_id)
+        if cached is not None:
+            return cached
+        result = _redis_single_flight(f"hot_raw_{launch_id}", lambda: _fetch_and_store_hot_raw(launch_id))
+        if result is None:
+            return _read_hot_raw(launch_id) or _get_raw_launch(launch_id)
+        return result
+
+    return _hot_flight(launch_id).do(_do)
+
+
+def _get_hot_launch_raw(launch_id):
+    """Stale-while-revalidate: serve fresh ~20s cache, else one LL2 GET.
+
+    Returns (payload, cache_hit).
+    """
+    cached = _read_hot_raw(launch_id)
+    if cached is not None:
+        return cached, True
+    refreshed = _refresh_hot_launch_raw(launch_id)
+    if refreshed is not None:
+        return refreshed, False
+    leftover = _get_raw_launch(launch_id)
+    return leftover, leftover is not None
+
+
+def _serve_cached_or_live_raw(launch_id):
+    """Existing /launch_raw behavior: side store, leftover list blob, or live GET."""
+    leftover = _get_raw_launch(launch_id)
+    if leftover:
+        return leftover, True
+    cached = _load_launch_payload(force=False)
+    for launch in (cached.get("upcoming", []) or []) + (cached.get("previous", []) or []):
+        if launch.get("id") == launch_id:
+            leftover = launch.get("all_data")
+            if leftover:
+                return leftover, True
+            details = fetch_launch_details(launch_id)
+            return details, False
+    details = fetch_launch_details(launch_id)
+    return details, False
 
 
 def _strip_heavy_launch_fields(data, persist_key=None):
@@ -1836,6 +1962,11 @@ def generate_notify_copy(payload: NotifyCopyRequest, increment_metrics: bool = F
 LL_API_KEY = os.getenv("LL_API_KEY", "9b91363961799d7f79aabe547ed0f7be914664dd")
 
 
+def _ll_request_headers():
+    """Same Launch Library token used by the 10-min list fetch."""
+    return {"Authorization": f"Token {LL_API_KEY}"} if LL_API_KEY else {}
+
+
 def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
     """Helper to parse raw API launch data into the dashboard's internal format."""
     launcher_stage = launch.get('rocket', {}).get('launcher_stage', [])
@@ -1904,19 +2035,19 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
 
 
 def fetch_launch_details(launch_id: str):
-    """Fetch detailed information for a single launch to get vidURLs."""
+    """Fetch one launch from Launch Library using the same auth token as list fetch."""
     if not launch_id:
         return None
     increment_metric("api_calls")
-    # Use v2.3.0 for detailed fetch
     url = f"https://ll.thespacedevs.com/2.3.0/launches/{launch_id}/"
+    headers = _ll_request_headers()
     print(f"Fetching details for launch {launch_id}")
     try:
         try:
-            response = requests.get(url, timeout=10, verify=True)
+            response = requests.get(url, headers=headers, timeout=10, verify=True)
         except Exception:
             # Fallback for SSL issues
-            response = requests.get(url, timeout=10, verify=False)
+            response = requests.get(url, headers=headers, timeout=10, verify=False)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -1926,7 +2057,7 @@ def fetch_launch_details(launch_id: str):
 
 def fetch_launches(existing_previous=None, existing_upcoming=None):
     """Fetch SpaceX launch data (v2.3.0) using detailed mode to get all fields."""
-    headers = {'Authorization': f'Token {LL_API_KEY}'}
+    headers = _ll_request_headers()
 
     combined_prev = existing_previous or []
     combined_up = existing_upcoming or []
@@ -2633,31 +2764,35 @@ def get_launches_slim(force: bool = False, internal: bool = False):
 
 
 @app.get("/launch_raw/{launch_id}")
-def get_launch_raw(launch_id: str, internal: bool = False):
+def get_launch_raw(
+    launch_id: str,
+    hot: Annotated[
+        bool,
+        Query(
+            description=(
+                "If true, refresh the current/next launch from Launch Library on a "
+                "~20s stale-while-revalidate TTL. Ignored for any other launch id."
+            )
+        ),
+    ] = False,
+    internal: bool = False,
+):
     """Return the full Launch Library record for one launch.
 
-    Prefers leftover `all_data` in cache (legacy), otherwise fetches the
-    single-launch LL endpoint so list caches can stay slim.
+    Default (no `hot`): leftover side-store / list blob, else one live LL GET.
+    `?hot=1` on the current/next launch only: serve a ~20s hot cache, or one
+    single-flight LL2 GET when that cache is stale. Other ids ignore `hot`.
     """
     if not internal:
         increment_metric("total_requests")
-    leftover = _get_raw_launch(launch_id)
-    if leftover:
+    if hot and _is_current_or_next_launch(launch_id):
+        details, hit = _get_hot_launch_raw(launch_id)
+    else:
+        details, hit = _serve_cached_or_live_raw(launch_id)
+    if hit:
         increment_metric("cache_hits")
-        return leftover
-    cached = _load_launch_payload(force=False)
-    for l in (cached.get('upcoming', []) or []) + (cached.get('previous', []) or []):
-        if l.get('id') == launch_id:
-            leftover = l.get('all_data')
-            if leftover:
-                increment_metric("cache_hits")
-                return leftover
-            increment_metric("cache_misses")
-            details = fetch_launch_details(launch_id)
-            return details if details else {"error": "Launch not found"}
-
-    increment_metric("cache_misses")
-    details = fetch_launch_details(launch_id)
+    else:
+        increment_metric("cache_misses")
     return details if details else {"error": "Launch not found"}
 
 

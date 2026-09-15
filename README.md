@@ -80,9 +80,11 @@ Same slim launch list as default `GET /launches`. Field names and Swift-safe val
 Returns the full, unpruned Launch Library record for a specific launch from the side store, leftover cache, or a single-launch LL fetch.
 
 *   **Endpoint:** `GET /launch_raw/{launch_id}`
+*   **Parameters:**
+    *   `hot=1` (optional) — for the **current/next launch only**, serve a short-lived (~20s) stale-while-revalidate cache or one single-flight Launch Library GET. Other launch ids ignore `hot` and use the normal side store. Without `hot`, behavior is unchanged (side-store leftover, which can be as stale as the 10-minute list refresh).
 *   **Response Format:** JSON
 *   **Sample Response:** (Large nested JSON object)
-*   **Also:** `GET /launch_details/{launch_id}` always fetches the current LL record.
+*   **Also:** `GET /launch_details/{launch_id}` always fetches the current LL record (authenticated with the same LL token as the list fetch).
 
 ### 5. Get Weather Data
 Returns parsed METAR weather data for SpaceX launch and development sites (Starbase, Vandy, Cape, Hawthorne, Bastrop), enhanced with high-frequency live wind data from the National Weather Service (NWS) API.
@@ -324,9 +326,10 @@ for launch in launches:
 
 ## Data Refresh Policy
 The API utilizes a **Timer-Based Refresh Strategy** to ensure stability and speed:
-1.  **Background Refresh:** A dedicated worker thread in the backend automatically refreshes the cache for Narratives (15m), Launches (10m), and Weather (2m for high-frequency wind).
-2.  **Manual Force:** Users can trigger an immediate refresh via the dashboard buttons or by appending `?force=true` to API requests.
-3.  **Incremental History:** Previous launch data is never fully replaced; new launches are appended to the existing historical cache to preserve a continuous record.
+1.  **Background Refresh:** A dedicated worker thread in the backend automatically refreshes the cache for Narratives (15m), Launches (10m), and Weather (2m for high-frequency wind). `/launches` and `/launches_slim` stay on this 10-minute list cadence.
+2.  **Hot raw (opt-in):** `GET /launch_raw/{id}?hot=1` refreshes **only the current/next launch** from Launch Library on a ~20s stale-while-revalidate TTL (single-flight per id). This is not a full-list refresh. Other ids, and `/launch_raw/{id}` without `hot`, keep the long-lived side store.
+3.  **Manual Force:** Users can trigger an immediate refresh via the dashboard buttons or by appending `?force=true` to API requests.
+4.  **Incremental History:** Previous launch data is never fully replaced; new launches are appended to the existing historical cache to preserve a continuous record.
 
 ---
 

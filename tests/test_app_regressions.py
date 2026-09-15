@@ -431,5 +431,201 @@ class NotifyCopyTests(unittest.TestCase):
         self.assertIn(app.GROK_MODEL, dumped)
 
 
+class HotLaunchRawTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def _list_payload(self, next_id="next-1", extra_id="later-2", net="2026-09-15T16:00:00Z"):
+        return {
+            "upcoming": [
+                {
+                    "id": next_id,
+                    "name": "Next",
+                    "mission": "Next",
+                    "net": net,
+                    "status": "Go",
+                    "status_id": 1,
+                },
+                {
+                    "id": extra_id,
+                    "name": "Later",
+                    "mission": "Later",
+                    "net": "2026-09-20T16:00:00Z",
+                    "status": "Go",
+                    "status_id": 1,
+                },
+            ],
+            "previous": [
+                {
+                    "id": "past-9",
+                    "name": "Past",
+                    "net": "2026-09-01T12:00:00Z",
+                    "status": "Success",
+                    "status_id": 3,
+                }
+            ],
+            "last_updated": "2026-09-15T15:50:00Z",
+        }
+
+    def _remember(self, payload):
+        app._remember_launches(payload)
+
+    def test_default_launch_raw_returns_side_store_without_ll_fetch(self):
+        stale = {"id": "next-1", "stale": True, "status": {"id": 1, "name": "Go"}}
+        fresh = {"id": "next-1", "stale": False}
+        self._remember(self._list_payload())
+        app._local_raw_launches["next-1"] = stale
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "fetch_launch_details", return_value=fresh) as fetch:
+            result = app.get_launch_raw("next-1", internal=True)
+
+        self.assertEqual(result["stale"], True)
+        fetch.assert_not_called()
+
+    def test_hot_query_refreshes_current_next_then_serves_short_ttl(self):
+        stale = {"id": "next-1", "stale": True}
+        fresh = {"id": "next-1", "stale": False, "status": {"id": 1, "name": "Go"}}
+        self._remember(self._list_payload())
+        app._local_raw_launches["next-1"] = stale
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "fetch_launch_details", return_value=fresh) as fetch:
+            first = app.get_launch_raw("next-1", hot=True, internal=True)
+            second = app.get_launch_raw("next-1", hot=True, internal=True)
+
+        self.assertEqual(first["stale"], False)
+        self.assertEqual(second["stale"], False)
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_hot_cache_expires_and_refetches(self):
+        fresh_a = {"id": "next-1", "rev": 1}
+        fresh_b = {"id": "next-1", "rev": 2}
+        self._remember(self._list_payload())
+        app._local_raw_launches["next-1"] = {"id": "next-1", "rev": 0}
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "fetch_launch_details", side_effect=[fresh_a, fresh_b]) as fetch:
+            first = app.get_launch_raw("next-1", hot=True, internal=True)
+            data, _expires = app._local_hot_raw["next-1"]
+            app._local_hot_raw["next-1"] = (data, time.time() - 1)
+            second = app.get_launch_raw("next-1", hot=True, internal=True)
+
+        self.assertEqual(first["rev"], 1)
+        self.assertEqual(second["rev"], 2)
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_hot_is_noop_for_non_current_ids(self):
+        stale = {"id": "later-2", "stale": True}
+        self._remember(self._list_payload())
+        app._local_raw_launches["later-2"] = stale
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "fetch_launch_details", return_value={"stale": False}) as fetch:
+            result = app.get_launch_raw("later-2", hot=True, internal=True)
+
+        self.assertEqual(result["stale"], True)
+        fetch.assert_not_called()
+
+    def test_hot_single_flight_coalesces_concurrent_ll_gets(self):
+        self._remember(self._list_payload())
+        entered = threading.Barrier(4)
+        calls = []
+
+        def fake_fetch(launch_id):
+            calls.append(launch_id)
+            time.sleep(0.08)
+            return {"id": launch_id, "live": True}
+
+        results = [None] * 4
+
+        def worker(idx):
+            entered.wait(timeout=2)
+            results[idx] = app.get_launch_raw("next-1", hot=True, internal=True)
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "fetch_launch_details", side_effect=fake_fetch):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertEqual(calls, ["next-1"])
+        self.assertTrue(all(item and item.get("live") for item in results))
+
+    def test_launches_slim_does_not_hit_hot_raw_or_ll_details(self):
+        payload = self._list_payload()
+        with patch.object(app, "r", None), \
+             patch.object(app, "get_cached_data", return_value=payload), \
+             patch.object(app, "set_cached_data", return_value=True), \
+             patch.object(app, "fetch_launch_details") as fetch, \
+             patch.object(app, "fetch_launches") as list_fetch:
+            slim = app.get_launches_slim(internal=True)
+
+        self.assertEqual(slim["upcoming"][0]["id"], "next-1")
+        self.assertNotIn("all_data", slim["upcoming"][0])
+        fetch.assert_not_called()
+        list_fetch.assert_not_called()
+
+    def test_fetch_launch_details_sends_ll_auth_token(self):
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"id": "next-1", "ok": True}
+
+        def fake_get(url, headers=None, timeout=10, verify=True):
+            captured["url"] = url
+            captured["headers"] = headers
+            return FakeResponse()
+
+        with patch.object(app.requests, "get", side_effect=fake_get):
+            result = app.fetch_launch_details("next-1")
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(
+            captured["headers"],
+            {"Authorization": f"Token {app.LL_API_KEY}"},
+        )
+        self.assertEqual(captured["headers"], app._ll_request_headers())
+
+    def test_http_hot_query_param_and_default_compat(self):
+        from fastapi.testclient import TestClient
+
+        stale = {"id": "next-1", "source": "side"}
+        live = {"id": "next-1", "source": "ll2"}
+        self._remember(self._list_payload())
+        app._local_raw_launches["next-1"] = stale
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "fetch_launch_details", return_value=live) as fetch, \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            default_resp = client.get("/launch_raw/next-1")
+            hot_resp = client.get("/launch_raw/next-1", params={"hot": 1})
+
+        self.assertEqual(default_resp.status_code, 200)
+        self.assertEqual(default_resp.json()["source"], "side")
+        self.assertEqual(hot_resp.status_code, 200)
+        self.assertEqual(hot_resp.json()["source"], "ll2")
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_hot_uses_redis_single_flight_name(self):
+        self._remember(self._list_payload())
+        live = {"id": "next-1", "live": True}
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "fetch_launch_details", return_value=live), \
+             patch.object(app, "_redis_single_flight", side_effect=lambda name, fn: fn()) as lock:
+            app.get_launch_raw("next-1", hot=True, internal=True)
+
+        lock.assert_called()
+        self.assertEqual(lock.call_args[0][0], "hot_raw_next-1")
+
+
 if __name__ == "__main__":
     unittest.main()
