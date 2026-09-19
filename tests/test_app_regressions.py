@@ -435,7 +435,7 @@ class HotLaunchRawTests(unittest.TestCase):
     def setUp(self):
         app._reset_cache_coordination_for_tests()
 
-    def _list_payload(self, next_id="next-1", extra_id="later-2", net="2026-09-15T16:00:00Z"):
+    def _list_payload(self, next_id="next-1", extra_id="later-2", net="2027-09-15T16:00:00Z"):
         return {
             "upcoming": [
                 {
@@ -450,7 +450,7 @@ class HotLaunchRawTests(unittest.TestCase):
                     "id": extra_id,
                     "name": "Later",
                     "mission": "Later",
-                    "net": "2026-09-20T16:00:00Z",
+                    "net": "2027-09-20T16:00:00Z",
                     "status": "Go",
                     "status_id": 1,
                 },
@@ -464,7 +464,7 @@ class HotLaunchRawTests(unittest.TestCase):
                     "status_id": 3,
                 }
             ],
-            "last_updated": "2026-09-15T15:50:00Z",
+            "last_updated": "2027-09-15T15:50:00Z",
         }
 
     def _remember(self, payload):

@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import requests
@@ -30,7 +30,8 @@ NotifyEvent = Literal["t1h", "t24h", "scrub"]
 app = FastAPI(
     title="SpaceX Launch Summary API",
     description=(
-        "Witty SpaceX launch narratives, upcoming-launch data, weather, and "
+        "Witty SpaceX launch narratives, upcoming-launch data, weather, "
+        "cached CelesTrak satellite GP/TLE for the dashboard globe, and "
         "Launch Buddy notification copy. Past-launch narratives and "
         "`/notify/copy` both use the xAI Grok model "
         f"`{GROK_MODEL}` via `XAI_API_KEY`."
@@ -42,6 +43,14 @@ app = FastAPI(
                 "Grok-powered push/local-notification title+body for Launch Buddy "
                 "upcoming-launch alerts (`t24h`, `t1h`, `scrub`). "
                 "Includes launch probability in the copy when provided."
+            ),
+        },
+        {
+            "name": "Satellites",
+            "description": (
+                "Cached CelesTrak GP/OMM element sets (Starlink, stations, and a "
+                "small allowlist). Clients should propagate with SGP4 "
+                "(e.g. satellite.js); this is not live telemetry."
             ),
         },
     ],
@@ -153,6 +162,45 @@ WEATHER_DEBOUNCE_SEC = 20.0
 REFRESH_LOCK_TTL = 90
 HEAVY_LAUNCH_FIELDS = ("all_data",)
 
+# CelesTrak GP / OMM — 1h freshness, keep a longer stale copy so Pi clients
+# are not sent to celestrak.org (CORS + rate limits) when upstream blips.
+CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
+CELESTRAK_HEADERS = {
+    "User-Agent": (
+        "launch-summary-api/satellites "
+        "(https://github.com/hwpaige/launch-summary-api; SpaceX dashboard GP cache)"
+    ),
+    "Accept": "application/json",
+}
+SATELLITE_GROUPS = ("starlink", "stations", "visual", "oneweb", "gps-ops", "weather")
+SATELLITES_CACHE_PREFIX = "satellites_gp_v1:"
+SATELLITES_CACHE_TTL = 3600  # serve fresh for 1 hour
+SATELLITES_STALE_TTL = 48 * 3600  # Redis retains stale GP for fallback
+SATELLITES_FETCH_TIMEOUT = 45
+OMM_PROP_FIELDS = (
+    "OBJECT_NAME",
+    "OBJECT_ID",
+    "NORAD_CAT_ID",
+    "EPOCH",
+    "MEAN_MOTION",
+    "ECCENTRICITY",
+    "INCLINATION",
+    "RA_OF_ASC_NODE",
+    "ARG_OF_PERICENTER",
+    "MEAN_ANOMALY",
+    "BSTAR",
+    "MEAN_MOTION_DOT",
+    "MEAN_MOTION_DDOT",
+    "EPHEMERIS_TYPE",
+    "CLASSIFICATION_TYPE",
+    "ELEMENT_SET_NO",
+    "REV_AT_EPOCH",
+)
+SATELLITE_NOTE = (
+    "Positions are SGP4 predictions from GP/TLE element sets, not live telemetry."
+)
+_TLE_ALPHA5 = "ABCDEFGHJKLMNPQRSTUVWXYZ"  # I and O omitted (Space-Track alpha-5)
+
 
 _UTC_NOW = object()
 
@@ -210,6 +258,9 @@ _local_weather_store = {}
 _local_raw_launches = {}
 _local_hot_raw = {}
 _launches_mem = {"data": None, "at": 0.0}
+_local_satellites = {}
+_satellite_flights = {}
+_satellite_flights_lock = threading.Lock()
 
 
 def _reset_cache_coordination_for_tests():
@@ -231,6 +282,11 @@ def _reset_cache_coordination_for_tests():
     _local_notify_copy.clear()
     _launches_mem["data"] = None
     _launches_mem["at"] = 0.0
+    _local_satellites.clear()
+    with _satellite_flights_lock:
+        for flight in _satellite_flights.values():
+            flight.reset()
+        _satellite_flights.clear()
 
 
 def _redis_single_flight(name, fn):
@@ -2719,6 +2775,311 @@ def refresh_weather_internal(force: bool = False):
     return _weather_flight.do(_do)
 
 
+def _normalize_satellite_group(group: str) -> str:
+    """Allowlisted CelesTrak GROUP values only (prevents unbounded upstream fetches)."""
+    normalized = (group or "").strip().lower()
+    if normalized not in SATELLITE_GROUPS:
+        allowed = ", ".join(SATELLITE_GROUPS)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported satellite group '{group}'. Allowed: {allowed}",
+        )
+    return normalized
+
+
+def _satellite_cache_key(group: str) -> str:
+    return f"{SATELLITES_CACHE_PREFIX}{group}"
+
+
+def _get_satellite_flight(group: str) -> _SingleFlight:
+    with _satellite_flights_lock:
+        flight = _satellite_flights.get(group)
+        if flight is None:
+            flight = _SingleFlight()
+            _satellite_flights[group] = flight
+        return flight
+
+
+def _tle_checksum(line: str) -> str:
+    total = 0
+    for ch in line[:68]:
+        if ch.isdigit():
+            total += int(ch)
+        elif ch == "-":
+            total += 1
+    return str(total % 10)
+
+
+def _tle_norad5(norad_id) -> str:
+    """5-char NORAD field; Space-Track alpha-5 for catalog numbers >= 100000."""
+    try:
+        n = int(norad_id)
+    except (TypeError, ValueError):
+        return "00000"
+    if n < 0:
+        n = 0
+    if n < 100000:
+        return f"{n:05d}"
+    letter_idx = (n // 10000) - 10
+    if 0 <= letter_idx < len(_TLE_ALPHA5):
+        return f"{_TLE_ALPHA5[letter_idx]}{n % 10000:04d}"
+    return f"{n:05d}"[-5:]
+
+
+def _tle_intl_designator(object_id) -> str:
+    if not object_id or "-" not in str(object_id):
+        return " " * 8
+    year, rest = str(object_id).split("-", 1)
+    yy = year[-2:] if len(year) >= 2 and year[-2:].isdigit() else "  "
+    return f"{yy}{rest:<6}"[:8]
+
+
+def _tle_exp_field(value) -> str:
+    """8-char TLE scientific notation with implied leading decimal (BSTAR / n_ddot)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    if number == 0.0:
+        return " 00000+0"
+    sign = "-" if number < 0 else " "
+    abs_val = abs(number)
+    exp = 0
+    while abs_val >= 1.0:
+        abs_val /= 10.0
+        exp += 1
+    while abs_val < 0.1:
+        abs_val *= 10.0
+        exp -= 1
+    mantissa = int(round(abs_val * 1e5))
+    if mantissa >= 100000:
+        mantissa = 10000
+        exp += 1
+    exp_sign = "+" if exp >= 0 else "-"
+    return f"{sign}{mantissa:05d}{exp_sign}{abs(exp)}"
+
+
+def _tle_n_dot_field(value) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    sign = "-" if number < 0 else " "
+    return f"{sign}{abs(number):.8f}"[0] + f"{abs(number):.8f}"[1:]
+
+
+def _epoch_year_and_day(epoch) -> tuple:
+    text = str(epoch).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    year2 = dt.year % 100
+    seconds = dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+    epoch_day = dt.timetuple().tm_yday + seconds / 86400.0
+    return year2, epoch_day
+
+
+def omm_to_tle_lines(omm: dict):
+    """Build TLE line 1/2 from a CelesTrak GP/OMM JSON object."""
+    if not isinstance(omm, dict) or omm.get("NORAD_CAT_ID") is None or not omm.get("EPOCH"):
+        return None, None
+    try:
+        norad5 = _tle_norad5(omm.get("NORAD_CAT_ID"))
+        classification = str(omm.get("CLASSIFICATION_TYPE") or "U")[:1] or "U"
+        intl = _tle_intl_designator(omm.get("OBJECT_ID"))
+        year2, epoch_day = _epoch_year_and_day(omm.get("EPOCH"))
+        n_dot = _tle_n_dot_field(omm.get("MEAN_MOTION_DOT") or 0)
+        n_ddot = _tle_exp_field(omm.get("MEAN_MOTION_DDOT") or 0)
+        bstar = _tle_exp_field(omm.get("BSTAR") or 0)
+        eph_type = int(omm.get("EPHEMERIS_TYPE") or 0)
+        elset = int(omm.get("ELEMENT_SET_NO") or 999) % 10000
+        line1 = (
+            f"1 {norad5}{classification} {intl} {year2:02d}{epoch_day:012.8f} "
+            f"{n_dot} {n_ddot} {bstar} {eph_type} {elset:4d}"
+        )
+        if len(line1) < 68:
+            line1 = line1.ljust(68)
+        line1 = line1[:68] + _tle_checksum(line1)
+
+        inclination = float(omm["INCLINATION"])
+        raan = float(omm["RA_OF_ASC_NODE"])
+        eccentricity = float(omm["ECCENTRICITY"])
+        argp = float(omm["ARG_OF_PERICENTER"])
+        mean_anomaly = float(omm["MEAN_ANOMALY"])
+        mean_motion = float(omm["MEAN_MOTION"])
+        rev = int(omm.get("REV_AT_EPOCH") or 0) % 100000
+        ecc_digits = f"{int(round(abs(eccentricity) * 1e7)):07d}"[:7]
+        line2 = (
+            f"2 {norad5} {inclination:8.4f} {raan:8.4f} {ecc_digits} "
+            f"{argp:8.4f} {mean_anomaly:8.4f} {mean_motion:11.8f}{rev:05d}"
+        )
+        if len(line2) < 68:
+            line2 = line2.ljust(68)
+        line2 = line2[:68] + _tle_checksum(line2)
+        return line1, line2
+    except (TypeError, ValueError, KeyError, OverflowError):
+        return None, None
+
+
+def slim_gp_record(omm: dict) -> dict:
+    """Compact satellite.js record: name + norad + TLE, with slim OMM fallback."""
+    name = omm.get("OBJECT_NAME") or ""
+    norad = omm.get("NORAD_CAT_ID")
+    record = {"name": name, "norad_id": norad}
+    line1, line2 = omm_to_tle_lines(omm)
+    if line1 and line2:
+        record["tle_line1"] = line1
+        record["tle_line2"] = line2
+        return record
+    for key in OMM_PROP_FIELDS:
+        if key in omm:
+            record[key] = omm[key]
+    return record
+
+
+def _satellite_fetched_dt(payload):
+    raw = (payload or {}).get("fetched_at")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def satellite_age_seconds(payload):
+    dt = _satellite_fetched_dt(payload)
+    if dt is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+
+def satellite_cache_is_fresh(payload, ttl=SATELLITES_CACHE_TTL) -> bool:
+    age = satellite_age_seconds(payload)
+    return age is not None and age < ttl
+
+
+def _read_satellite_cache(group: str):
+    local = _local_satellites.get(group)
+    if isinstance(local, dict) and local.get("satellites") is not None:
+        return local
+    cached = get_cached_data(_satellite_cache_key(group))
+    if isinstance(cached, dict) and cached.get("satellites") is not None:
+        _local_satellites[group] = cached
+        return cached
+    return None
+
+
+def _write_satellite_cache(group: str, payload: dict):
+    _local_satellites[group] = payload
+    set_cached_data(_satellite_cache_key(group), payload, ttl=SATELLITES_STALE_TTL)
+
+
+def _satellite_payload(group: str, satellites: list, stale: bool = False) -> dict:
+    return {
+        "group": group,
+        "fetched_at": _utc_isoformat(),
+        "ttl_seconds": SATELLITES_CACHE_TTL,
+        "count": len(satellites),
+        "stale": stale,
+        "source": "celestrak",
+        "note": SATELLITE_NOTE,
+        "satellites": satellites,
+    }
+
+
+def fetch_celestrak_gp(group: str) -> list:
+    """Fetch GP/OMM JSON for an allowlisted CelesTrak group and slim it."""
+    increment_metric("api_calls")
+    params = {"GROUP": group, "FORMAT": "JSON"}
+    response = requests.get(
+        CELESTRAK_GP_URL,
+        params=params,
+        headers=CELESTRAK_HEADERS,
+        timeout=SATELLITES_FETCH_TIMEOUT,
+    )
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError("CelesTrak returned non-JSON GP data") from exc
+    if not isinstance(data, list):
+        raise ValueError("CelesTrak GP JSON was not a list")
+    satellites = []
+    for item in data:
+        if not isinstance(item, dict) or item.get("NORAD_CAT_ID") is None:
+            continue
+        satellites.append(slim_gp_record(item))
+    if not satellites:
+        raise ValueError(f"CelesTrak returned no GP records for group={group}")
+    return satellites
+
+
+def _refresh_satellites_uncached(group: str, force: bool = False):
+    cached = _read_satellite_cache(group)
+    if not force and cached and satellite_cache_is_fresh(cached):
+        cached["stale"] = False
+        cached["ttl_seconds"] = SATELLITES_CACHE_TTL
+        return cached
+
+    try:
+        satellites = fetch_celestrak_gp(group)
+        payload = _satellite_payload(group, satellites, stale=False)
+        _write_satellite_cache(group, payload)
+        return payload
+    except Exception as exc:
+        print(f"Error fetching CelesTrak GP for {group}: {exc}")
+        if cached and cached.get("satellites") is not None:
+            stale = dict(cached)
+            stale["stale"] = True
+            stale["ttl_seconds"] = SATELLITES_CACHE_TTL
+            _local_satellites[group] = stale
+            return stale
+        raise
+
+
+def refresh_satellites_internal(group: str = "starlink", force: bool = False):
+    """Load cached GP or refresh from CelesTrak (single-flight per group)."""
+    group = _normalize_satellite_group(group)
+
+    def _do():
+        return _redis_single_flight(
+            f"satellites_{group}",
+            lambda: _refresh_satellites_uncached(group, force=force),
+        )
+
+    return _get_satellite_flight(group).do(_do)
+
+
+def _satellite_meta_from_payload(group: str, payload):
+    age = satellite_age_seconds(payload) if payload else None
+    count = 0
+    fetched_at = None
+    stale = True
+    if payload:
+        fetched_at = payload.get("fetched_at")
+        count = payload.get("count")
+        if count is None:
+            count = len(payload.get("satellites") or [])
+        stale = not satellite_cache_is_fresh(payload)
+    return {
+        "group": group,
+        "fetched_at": fetched_at,
+        "count": count,
+        "ttl_seconds": SATELLITES_CACHE_TTL,
+        "age_seconds": None if age is None else int(age),
+        "stale": stale,
+        "source": "celestrak",
+        "note": SATELLITE_NOTE,
+        "allowed_groups": list(SATELLITE_GROUPS),
+    }
+
+
 @app.get("/launches")
 def get_launches(
     force: bool = False,
@@ -2863,6 +3224,73 @@ def get_all_weather(force: bool = False, internal: bool = False):
     else:
         increment_metric("cache_misses")
     return weather_payload
+
+
+@app.get(
+    "/satellites/gp",
+    tags=["Satellites"],
+    summary="Cached CelesTrak GP / TLE for an allowlisted group",
+)
+def get_satellites_gp(
+    group: str = Query("starlink", description="CelesTrak GROUP (allowlisted)"),
+    force: bool = False,
+    internal: bool = False,
+):
+    """Return slim GP records for satellite.js / SGP4 (not live telemetry).
+
+    Default `group=starlink`. Cached ~1 hour in Redis (in-memory fallback).
+    On CelesTrak failure, a stale copy is served when one exists.
+    """
+    if not internal:
+        increment_metric("total_requests")
+    group = _normalize_satellite_group(group)
+    cached = None if force else _read_satellite_cache(group)
+    serving_fresh = bool(cached and satellite_cache_is_fresh(cached))
+    try:
+        payload = refresh_satellites_internal(group, force=force)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Satellite GP unavailable for group '{group}': {exc}",
+        )
+    if serving_fresh:
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return payload
+
+
+@app.get(
+    "/satellites/starlink",
+    tags=["Satellites"],
+    summary="Cached Starlink GP / TLE (alias for /satellites/gp?group=starlink)",
+)
+def get_satellites_starlink(force: bool = False, internal: bool = False):
+    """Convenience alias for the Starlink CelesTrak group."""
+    return get_satellites_gp(group="starlink", force=force, internal=internal)
+
+
+@app.get(
+    "/satellites/meta",
+    tags=["Satellites"],
+    summary="Cache metadata for a satellite GP group",
+)
+def get_satellites_meta(
+    group: str = Query("starlink", description="CelesTrak GROUP (allowlisted)"),
+    internal: bool = False,
+):
+    """fetched_at / count / ttl without pulling the full GP list from CelesTrak."""
+    if not internal:
+        increment_metric("total_requests")
+    group = _normalize_satellite_group(group)
+    payload = _read_satellite_cache(group)
+    if payload:
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return _satellite_meta_from_payload(group, payload)
 
 
 def _parse_net_dt(net_str):
@@ -3672,10 +4100,17 @@ def start_background_worker():
         except Exception as e:
             print(f"Bootstrap error: {e}")
 
+        try:
+            refresh_satellites_internal("starlink")
+            refresh_satellites_internal("stations")
+        except Exception as e:
+            print(f"Satellite GP bootstrap error: {e}")
+
         last_run = {
             "narratives": time.time(),
             "launches": time.time(),
-            "weather": time.time()
+            "weather": time.time(),
+            "satellites": time.time(),
         }
 
         while _background_enabled:
@@ -3699,6 +4134,12 @@ def start_background_worker():
                 if now - last_run["weather"] >= 120:
                     refresh_weather_internal()
                     last_run["weather"] = now
+
+                # Starlink / stations GP (hourly; CelesTrak asks not to hammer)
+                if now - last_run["satellites"] >= SATELLITES_CACHE_TTL:
+                    refresh_satellites_internal("starlink")
+                    refresh_satellites_internal("stations")
+                    last_run["satellites"] = now
 
             except Exception as e:
                 print(f"Background worker error: {e}")

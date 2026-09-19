@@ -282,6 +282,42 @@ These are the same fields as `/dashboard`, split out for clients that already ha
 }
 ```
 
+### 12. Satellite GP / TLE (Starlink globe)
+Cached CelesTrak General Perturbations (GP / OMM) for the SpaceX dashboard Three.js globe. **Pi clients should poll these endpoints** so they never hit CelesTrak directly (avoids CORS and CelesTrak rate limits).
+
+**These are SGP4 predictions from GP/TLE element sets, not live telemetry.** Propagate on the client with [satellite.js](https://github.com/shashwatak/satellite-js) (`twoline2satrec`) or an equivalent SGP4 library. CelesTrak asks not to hammer their GP API; this service caches for ~1 hour and keeps a longer stale copy if upstream fails.
+
+*   **List:** `GET /satellites/gp?group=starlink`
+    *   **Parameters:**
+        *   `group` (optional, default `starlink`) — allowlisted CelesTrak `GROUP`: `starlink`, `stations` (ISS / CSS), `visual`, `oneweb`, `gps-ops`, `weather`
+        *   `force=true` (optional) — bypass the fresh cache and refetch
+    *   **Caching:** Fresh for 1 hour (Redis via `set_cached_data` / `get_cached_data`, in-memory fallback). Stale copies are kept ~48 hours and served if CelesTrak is down. Starlink + stations are warmed on startup and refreshed hourly by the background worker.
+    *   **Response fields:**
+        *   `group`, `fetched_at`, `ttl_seconds`, `count`, `stale`, `source`, `note`
+        *   `satellites`: compact `{name, norad_id, tle_line1, tle_line2}` (unused OMM keywords omitted so ~6–10k Starlinks stay small)
+*   **Starlink alias:** `GET /satellites/starlink` — same payload as `/satellites/gp?group=starlink`
+*   **Metadata only:** `GET /satellites/meta?group=starlink` — `fetched_at`, `count`, `group`, `ttl_seconds`, `age_seconds`, `stale`, `allowed_groups` (does not call CelesTrak)
+*   **Sample Response (`GET /satellites/gp?group=stations`):**
+```json
+{
+  "group": "stations",
+  "fetched_at": "2026-09-19T23:00:00Z",
+  "ttl_seconds": 3600,
+  "count": 1,
+  "stale": false,
+  "source": "celestrak",
+  "note": "Positions are SGP4 predictions from GP/TLE element sets, not live telemetry.",
+  "satellites": [
+    {
+      "name": "ISS (ZARYA)",
+      "norad_id": 25544,
+      "tle_line1": "1 25544U 98067A   26262.30395647  .00006211  00000+0  12007-3 0  9997",
+      "tle_line2": "2 25544  51.6308 194.2901 0004815 157.3949 202.7252 15.49175317586346"
+    }
+  ]
+}
+```
+
 ---
 
 ## Interactive Dashboard
@@ -326,10 +362,11 @@ for launch in launches:
 
 ## Data Refresh Policy
 The API utilizes a **Timer-Based Refresh Strategy** to ensure stability and speed:
-1.  **Background Refresh:** A dedicated worker thread in the backend automatically refreshes the cache for Narratives (15m), Launches (10m), and Weather (2m for high-frequency wind). `/launches` and `/launches_slim` stay on this 10-minute list cadence.
+1.  **Background Refresh:** A dedicated worker thread in the backend automatically refreshes the cache for Narratives (15m), Launches (10m), Weather (2m for high-frequency wind), and Starlink / stations GP (1h). `/launches` and `/launches_slim` stay on this 10-minute list cadence.
 2.  **Hot raw (opt-in):** `GET /launch_raw/{id}?hot=1` refreshes **only the current/next launch** from Launch Library on a ~20s stale-while-revalidate TTL (single-flight per id). This is not a full-list refresh. Other ids, and `/launch_raw/{id}` without `hot`, keep the long-lived side store.
 3.  **Manual Force:** Users can trigger an immediate refresh via the dashboard buttons or by appending `?force=true` to API requests.
 4.  **Incremental History:** Previous launch data is never fully replaced; new launches are appended to the existing historical cache to preserve a continuous record.
+5.  **Satellite GP:** `/satellites/*` is a CelesTrak proxy with a 1-hour freshness window. Element sets are GP/TLE; globe dots are SGP4 predictions, not live positions.
 
 ---
 
