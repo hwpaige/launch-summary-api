@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import threading
 import time
@@ -625,6 +626,198 @@ class HotLaunchRawTests(unittest.TestCase):
 
         lock.assert_called()
         self.assertEqual(lock.call_args[0][0], "hot_raw_next-1")
+
+
+class LaunchSiteTrajectoryTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def tearDown(self):
+        cache_path = app.TRAJECTORY_CACHE_FILE
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+
+    def test_olp2_and_boca_chica_aliases_resolve_to_starbase(self):
+        for pad in (
+            "Orbital Launch Pad 2",
+            "OLP-2",
+            "OLP 2",
+            "OLM-2",
+            "Boca Chica",
+            "Starbase",
+            "Orbital Launch Mount 2",
+        ):
+            site, _key = app.resolve_launch_site(pad)
+            self.assertIsNotNone(site, pad)
+            self.assertIn("Starbase", site["name"])
+            self.assertAlmostEqual(site["lat"], app.STARBASE_LAUNCH_SITE["lat"], places=5)
+            self.assertAlmostEqual(site["lon"], app.STARBASE_LAUNCH_SITE["lon"], places=5)
+            self.assertGreater(abs(site["lat"] - 28.6084), 1.0)
+
+    def test_unknown_pad_is_not_lc39a(self):
+        site, key = app.resolve_launch_site("Some Future Pad")
+        self.assertIsNone(site)
+        self.assertIsNone(key)
+        site, key = app.resolve_launch_site("")
+        self.assertIsNone(site)
+        self.assertIsNone(key)
+
+    def test_known_cape_and_vandenberg_pads_still_resolve(self):
+        cape, _key = app.resolve_launch_site("Launch Complex 39A")
+        self.assertEqual(cape["name"], "Cape Canaveral, FL")
+        self.assertAlmostEqual(cape["lat"], 28.6084, places=4)
+        slc40, _key = app.resolve_launch_site("Space Launch Complex 40")
+        self.assertEqual(slc40["name"], "Cape Canaveral, FL")
+        self.assertAlmostEqual(slc40["lat"], 28.5619, places=4)
+        vandy, _key = app.resolve_launch_site("Space Launch Complex 4E")
+        self.assertIn("Vandenberg", vandy["name"])
+        self.assertAlmostEqual(vandy["lon"], -120.6107, places=4)
+
+    def test_upstream_pad_coordinates_override_hardcoded_defaults(self):
+        site, _key = app.resolve_launch_site(
+            "Orbital Launch Pad 2",
+            latitude="25.99677",
+            longitude="-97.15799",
+            location_name="SpaceX Starbase, TX, USA",
+        )
+        self.assertAlmostEqual(site["lat"], 25.99677, places=5)
+        self.assertAlmostEqual(site["lon"], -97.15799, places=5)
+        self.assertIn("Starbase", site["name"])
+
+        # Pad name used to miss every alias and fall through to LC-39A.
+        site, _key = app.resolve_launch_site(
+            "Unlisted Starbase Pad",
+            latitude=25.99677,
+            longitude=-97.15799,
+        )
+        self.assertAlmostEqual(site["lat"], 25.99677, places=5)
+        self.assertAlmostEqual(site["lon"], -97.15799, places=5)
+        self.assertIn("Starbase", site["name"])
+
+        cape, _key = app.resolve_launch_site(
+            "Launch Complex 39A",
+            latitude=28.608389,
+            longitude=-80.604333,
+        )
+        self.assertAlmostEqual(cape["lat"], 28.608389, places=6)
+        self.assertAlmostEqual(cape["lon"], -80.604333, places=6)
+        self.assertEqual(cape["name"], "Cape Canaveral, FL")
+
+    def test_parse_launch_data_keeps_pad_coordinates(self):
+        parsed = app.parse_launch_data({
+            "id": "7d1afb26-6f9c-429b-9ccf-29012fd1e519",
+            "name": "Starship Flight 14",
+            "net": "2026-10-01T00:00:00Z",
+            "status": {"name": "Go", "id": 1},
+            "rocket": {"configuration": {"name": "Starship"}, "launcher_stage": []},
+            "mission": {"orbit": {"name": "LEO"}},
+            "pad": {
+                "name": "Orbital Launch Pad 2",
+                "latitude": 25.99677,
+                "longitude": -97.15799,
+                "location": {"name": "SpaceX Starbase, TX, USA"},
+            },
+        })
+        self.assertEqual(parsed["pad"], "Orbital Launch Pad 2")
+        self.assertEqual(parsed["pad_latitude"], 25.99677)
+        self.assertEqual(parsed["pad_longitude"], -97.15799)
+        self.assertIn("Starbase", parsed["pad_location"])
+
+    def test_flight14_trajectory_starts_at_starbase(self):
+        launch = {
+            "id": "7d1afb26-6f9c-429b-9ccf-29012fd1e519",
+            "mission": "Starship | Starlink Group 31-1 (Starship Flight 14)",
+            "pad": "Orbital Launch Pad 2",
+            "pad_latitude": 25.99677,
+            "pad_longitude": -97.15799,
+            "pad_location": "SpaceX Starbase, TX, USA",
+            "orbit": "Low Earth Orbit",
+        }
+        with patch.object(app, "save_cache_to_file"), patch.object(app, "r", None):
+            traj = app.get_launch_trajectory_data(launch)
+        site = traj["launch_site"]
+        origin = traj["trajectory"][0]
+        self.assertIn("Starbase", site["name"])
+        self.assertAlmostEqual(site["lat"], 25.99677, places=4)
+        self.assertAlmostEqual(site["lon"], -97.15799, places=4)
+        self.assertAlmostEqual(origin["lat"], site["lat"], places=2)
+        self.assertAlmostEqual(origin["lon"], site["lon"], places=2)
+        self.assertGreater(abs(origin["lat"] - 28.6084), 1.0)
+        self.assertGreater(abs(origin["lon"] - (-80.6043)), 1.0)
+
+    def test_slim_regenerates_cached_cape_trajectory_for_olp2(self):
+        payload = {
+            "upcoming": [{
+                "id": "7d1afb26-6f9c-429b-9ccf-29012fd1e519",
+                "mission": "Starship Flight 14",
+                "name": "Starship Flight 14",
+                "pad": "Orbital Launch Pad 2",
+                "orbit": "LEO",
+                "net": "2026-10-01T00:00:00Z",
+                "trajectory_data": {
+                    "launch_site": {
+                        "lat": 28.6084,
+                        "lon": -80.6043,
+                        "name": "Cape Canaveral, FL",
+                    },
+                    "trajectory": [{"lat": 28.6084, "lon": -80.6043, "r": 1.0}],
+                },
+            }],
+            "previous": [],
+            "last_updated": "2026-09-28T00:00:00Z",
+        }
+        persisted = []
+
+        def fake_persist(key, data, ttl=None):
+            persisted.append((key, data))
+            return True
+
+        with patch.object(app, "get_cached_data", return_value=payload), \
+             patch.object(app, "set_cached_data", side_effect=fake_persist), \
+             patch.object(app, "save_cache_to_file"), \
+             patch.object(app, "r", None):
+            slim = app.get_launches_slim(internal=True)
+
+        site = slim["upcoming"][0]["trajectory_data"]["launch_site"]
+        origin = slim["upcoming"][0]["trajectory_data"]["trajectory"][0]
+        self.assertIn("Starbase", site["name"])
+        self.assertAlmostEqual(site["lat"], app.STARBASE_LAUNCH_SITE["lat"], places=3)
+        self.assertAlmostEqual(site["lon"], app.STARBASE_LAUNCH_SITE["lon"], places=3)
+        self.assertLess(abs(origin["lat"] - site["lat"]), 0.05)
+        self.assertLess(abs(origin["lon"] - site["lon"]), 0.05)
+        self.assertGreater(abs(origin["lat"] - 28.6084), 1.0)
+        self.assertTrue(any(item[0] == app.LAUNCHES_CACHE_KEY for item in persisted))
+
+    def test_matching_cape_trajectory_is_not_regenerated(self):
+        payload = {
+            "upcoming": [{
+                "id": "cape-1",
+                "mission": "Falcon",
+                "pad": "Launch Complex 39A",
+                "orbit": "LEO",
+                "trajectory_data": {
+                    "launch_site": {
+                        "lat": 28.6084,
+                        "lon": -80.6043,
+                        "name": "Cape Canaveral, FL",
+                    },
+                    "trajectory": [{"lat": 28.6084, "lon": -80.6043, "r": 1.0}],
+                },
+            }],
+            "previous": [],
+            "last_updated": "2026-09-28T00:00:00Z",
+        }
+        with patch.object(app, "get_cached_data", return_value=payload), \
+             patch.object(app, "set_cached_data", return_value=True), \
+             patch.object(app, "get_launch_trajectory_data") as generate, \
+             patch.object(app, "r", None):
+            slim = app.get_launches_slim(internal=True)
+
+        generate.assert_not_called()
+        self.assertEqual(
+            slim["upcoming"][0]["trajectory_data"]["launch_site"]["name"],
+            "Cape Canaveral, FL",
+        )
 
 
 if __name__ == "__main__":

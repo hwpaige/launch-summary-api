@@ -265,8 +265,9 @@ _satellite_flights_lock = threading.Lock()
 
 def _reset_cache_coordination_for_tests():
     """Reset single-flight / debounce state between unit tests."""
-    global _weather_last_refresh_at, _weather_last_result, _background_enabled
+    global _weather_last_refresh_at, _weather_last_result, _background_enabled, _TRAJECTORY_DATA_CACHE
     _background_enabled = False
+    _TRAJECTORY_DATA_CACHE = {}
     _weather_flight.reset()
     _launches_flight.reset()
     _narratives_flight.reset()
@@ -896,6 +897,191 @@ def generate_ground_track(start_point, inclination_deg, num_points=2000, descend
     return points
 
 
+# Surveyed Launch Library coordinates for Starbase OLP-2 (Boca Chica).
+# Unknown pad names must not fall through to LC-39A.
+STARBASE_LAUNCH_SITE = {'lat': 25.99677, 'lon': -97.15799, 'name': 'Starbase, TX'}
+_LC39A_LAUNCH_SITE = {'lat': 28.6084, 'lon': -80.6043, 'name': 'Cape Canaveral, FL'}
+_LC40_LAUNCH_SITE = {'lat': 28.5619, 'lon': -80.5773, 'name': 'Cape Canaveral, FL'}
+_SLC4E_LAUNCH_SITE = {'lat': 34.6321, 'lon': -120.6107, 'name': 'Vandenberg, CA'}
+
+# Case-insensitive substrings. Starbase aliases are first so OLP-2 / Boca Chica
+# never match a later Cape key. Longer phrases sit beside the shorter prefixes.
+_PAD_SITE_ALIASES = (
+    (
+        (
+            'orbital launch pad 2',
+            'orbital launch pad',
+            'orbital launch mount',
+            'olp-2',
+            'olp 2',
+            'olp-',
+            'olp ',
+            'olm-2',
+            'olm 2',
+            'olm-',
+            'olm ',
+            'boca chica',
+            'starbase',
+        ),
+        STARBASE_LAUNCH_SITE,
+    ),
+    (
+        ('launch complex 39a', 'lc-39a', 'pad 39a'),
+        _LC39A_LAUNCH_SITE,
+    ),
+    (
+        ('launch complex 40', 'slc-40', 'lc-40'),
+        _LC40_LAUNCH_SITE,
+    ),
+    (
+        ('space launch complex 4e', 'launch complex 4e', 'slc-4e'),
+        _SLC4E_LAUNCH_SITE,
+    ),
+)
+
+_SITE_MISMATCH_DEG = 0.2
+
+
+def _finite_coord(value):
+    """Parse a pad coordinate from LL (float or string). Invalid values are None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
+
+
+def _usable_pad_coords(lat, lon):
+    if lat is None or lon is None:
+        return False
+    if abs(lat) > 90 or abs(lon) > 180:
+        return False
+    # Launch Library uses 0,0 when a pad has not been surveyed.
+    if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+        return False
+    return True
+
+
+def _name_from_coords(lat, lon):
+    """Canonical site name when coordinates fall on a known SpaceX complex."""
+    if 25.8 <= lat <= 26.3 and -97.5 <= lon <= -96.8:
+        return STARBASE_LAUNCH_SITE['name']
+    if 28.3 <= lat <= 28.8 and -80.9 <= lon <= -80.4:
+        return _LC39A_LAUNCH_SITE['name']
+    if 34.4 <= lat <= 34.9 and -120.9 <= lon <= -120.4:
+        return _SLC4E_LAUNCH_SITE['name']
+    return None
+
+
+def _match_known_pad(text):
+    lowered = (text or '').lower()
+    if not lowered.strip():
+        return None
+    for aliases, site in _PAD_SITE_ALIASES:
+        if any(alias in lowered for alias in aliases):
+            return site
+    return None
+
+
+def _site_cache_key(site):
+    return f"{site['name']}:{float(site['lat']):.5f}:{float(site['lon']):.5f}"
+
+
+def resolve_launch_site(pad, latitude=None, longitude=None, location_name=None):
+    """Resolve a launch site from a pad name and optional upstream coordinates.
+
+    Real pad latitude/longitude win over hardcoded defaults. OLP-2,
+    "Orbital Launch Pad 2", and Boca Chica aliases map to Starbase, TX.
+    An unknown pad is left unresolved instead of being treated as LC-39A.
+    """
+    pad_name = ''
+    if isinstance(pad, dict):
+        pad_name = pad.get('name') or ''
+        if latitude is None:
+            latitude = pad.get('latitude')
+        if longitude is None:
+            longitude = pad.get('longitude')
+        loc = pad.get('location')
+        if location_name is None and isinstance(loc, dict):
+            location_name = loc.get('name')
+    elif pad:
+        pad_name = str(pad)
+
+    known = _match_known_pad(f"{pad_name} {location_name or ''}")
+    lat = _finite_coord(latitude)
+    lon = _finite_coord(longitude)
+    if _usable_pad_coords(lat, lon):
+        prox_name = _name_from_coords(lat, lon)
+        if known and (prox_name is None or prox_name == known['name']):
+            name = known['name']
+        elif prox_name:
+            name = prox_name
+        elif location_name:
+            name = location_name
+        elif known:
+            name = known['name']
+        else:
+            name = 'Unknown'
+        site = {'lat': lat, 'lon': lon, 'name': name}
+        return site, _site_cache_key(site)
+
+    if known:
+        site = {'lat': known['lat'], 'lon': known['lon'], 'name': known['name']}
+        return site, _site_cache_key(site)
+
+    logger.info(f"Unknown pad {pad_name!r}; not defaulting to LC-39A")
+    return None, None
+
+
+def _pad_fields_from_launch(launch):
+    """Pad name plus coordinates, preferring fields kept on the slim launch."""
+    if not isinstance(launch, dict):
+        return '', None, None, None
+    pad = launch.get('pad') or ''
+    if isinstance(pad, dict):
+        pad_name = pad.get('name') or ''
+        latitude = pad.get('latitude')
+        longitude = pad.get('longitude')
+        loc = pad.get('location')
+        location_name = loc.get('name') if isinstance(loc, dict) else None
+    else:
+        pad_name = str(pad) if pad else ''
+        latitude = launch.get('pad_latitude')
+        longitude = launch.get('pad_longitude')
+        location_name = launch.get('pad_location')
+    raw = launch.get('all_data')
+    raw_pad = raw.get('pad') if isinstance(raw, dict) else None
+    if isinstance(raw_pad, dict):
+        if not pad_name:
+            pad_name = raw_pad.get('name') or ''
+        if latitude is None:
+            latitude = raw_pad.get('latitude')
+        if longitude is None:
+            longitude = raw_pad.get('longitude')
+        if not location_name and isinstance(raw_pad.get('location'), dict):
+            location_name = raw_pad['location'].get('name')
+    return pad_name, latitude, longitude, location_name
+
+
+def _coords_far(point, expected):
+    if not isinstance(point, dict) or not isinstance(expected, dict):
+        return False
+    try:
+        dlat = abs(float(point.get('lat')) - float(expected.get('lat')))
+        dlon = abs(float(point.get('lon')) - float(expected.get('lon')))
+    except (TypeError, ValueError):
+        return False
+    return dlat > _SITE_MISMATCH_DEG or dlon > _SITE_MISMATCH_DEG
+
+
 def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     """
     Get trajectory data for the next upcoming launch or a specific launch.
@@ -934,34 +1120,20 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
 
     next_launch = display_launches[0]
     mission_name = next_launch.get('mission', 'Unknown')
-    pad = next_launch.get('pad', '')
+    pad, pad_latitude, pad_longitude, pad_location = _pad_fields_from_launch(next_launch)
     orbit = next_launch.get('orbit', '')
     logger.info(f"Next launch: {mission_name} from {pad}")
 
-    # Launch site coordinates
-    launch_sites = {
-        'LC-39A': {'lat': 28.6084, 'lon': -80.6043, 'name': 'Cape Canaveral, FL'},
-        'LC-40': {'lat': 28.5619, 'lon': -80.5773, 'name': 'Cape Canaveral, FL'},
-        'SLC-4E': {'lat': 34.6321, 'lon': -120.6107, 'name': 'Vandenberg, CA'},
-        'Starbase': {'lat': 25.9975, 'lon': -97.1566, 'name': 'Starbase, TX'},
-        'Launch Complex 39A': {'lat': 28.6084, 'lon': -80.6043, 'name': 'Cape Canaveral, FL'},
-        'Launch Complex 40': {'lat': 28.5619, 'lon': -80.5773, 'name': 'Cape Canaveral, FL'},
-        'Space Launch Complex 4E': {'lat': 34.6321, 'lon': -120.6107, 'name': 'Vandenberg, CA'}
-    }
-
-    # Find launch site coordinates
-    launch_site = None
-    matched_site_key = None
-    for site_key, site_data in launch_sites.items():
-        if site_key in pad:
-            launch_site = site_data
-            matched_site_key = site_key
-            break
-
+    # Upstream LL pad coordinates win. OLP-2 / Boca Chica map to Starbase.
+    # Unknown pads are not assigned LC-39A.
+    launch_site, matched_site_key = resolve_launch_site(
+        pad,
+        latitude=pad_latitude,
+        longitude=pad_longitude,
+        location_name=pad_location,
+    )
     if not launch_site:
-        launch_site = launch_sites['LC-39A']
-        matched_site_key = 'LC-39A'
-        logger.info(f"Using default launch site: {launch_site}")
+        return None
 
     def _normalize_orbit(orbit_label: str, site_name: str) -> str:
         try:
@@ -1062,7 +1234,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         launch_site.get('lat', 0.0)
     )
 
-    ORBIT_CACHE_VERSION = 'v260-orbital-mechanics'
+    ORBIT_CACHE_VERSION = 'v261-pad-coords'
     landing_type = next_launch.get('landing_type')
     landing_loc = next_launch.get('landing_location')
     cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl, 1)}:{landing_type}:{landing_loc}"
@@ -2040,6 +2212,24 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
     launch_name = launch.get('name', 'Unknown')
     normalized_net = _utc_isoformat(launch.get('net'))
 
+    raw_pad = launch.get('pad')
+    if isinstance(raw_pad, dict):
+        pad_name = raw_pad.get('name') or 'Unknown'
+        pad_latitude = _finite_coord(raw_pad.get('latitude'))
+        pad_longitude = _finite_coord(raw_pad.get('longitude'))
+        pad_location_obj = raw_pad.get('location')
+        pad_location = pad_location_obj.get('name') if isinstance(pad_location_obj, dict) else None
+    elif raw_pad:
+        pad_name = str(raw_pad)
+        pad_latitude = None
+        pad_longitude = None
+        pad_location = None
+    else:
+        pad_name = 'Unknown'
+        pad_latitude = None
+        pad_longitude = None
+        pad_location = None
+
     raw_image = launch.get('image')
     image_url = ''
     if isinstance(raw_image, str):
@@ -2067,7 +2257,10 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'status_id': launch.get('status', {}).get('id'),
         'rocket': launch.get('rocket', {}).get('configuration', {}).get('name', 'Unknown'),
         'orbit': mission_data.get('orbit', {}).get('name', 'Unknown'),
-        'pad': launch.get('pad', {}).get('name', 'Unknown'),
+        'pad': pad_name,
+        'pad_latitude': pad_latitude,
+        'pad_longitude': pad_longitude,
+        'pad_location': pad_location,
         'video_url': vid_urls[0].get('url', '') if vid_urls else '',
         'x_video_url': next((v['url'] for v in vid_urls if
                              v.get('url') and ('x.com' in v['url'].lower() or 'twitter.com' in v['url'].lower())),
@@ -3338,6 +3531,48 @@ def _slim_launch(launch, keep_trajectory=False):
     return {k: v for k, v in launch.items() if k not in skip}
 
 
+def _repair_mismatched_trajectory(data):
+    """Regenerate a cached trajectory whose origin does not match the pad.
+
+    Flight 14 was stored with an LC-39A launch site while its pad is OLP-2.
+    Slim responses serve that blob until the next launch refresh, so correct
+    it on read and persist the Starbase track.
+    """
+    if not isinstance(data, dict):
+        return False
+    upcoming = data.get('upcoming') if isinstance(data.get('upcoming'), list) else []
+    previous = data.get('previous') if isinstance(data.get('previous'), list) else []
+    bucket = upcoming or previous
+    if not bucket or not isinstance(bucket[0], dict):
+        return False
+    launch = bucket[0]
+    traj = launch.get('trajectory_data')
+    if not isinstance(traj, dict):
+        return False
+    pad, lat, lon, loc = _pad_fields_from_launch(launch)
+    expected, _key = resolve_launch_site(
+        pad, latitude=lat, longitude=lon, location_name=loc
+    )
+    if not expected:
+        return False
+    current = traj.get('launch_site') if isinstance(traj.get('launch_site'), dict) else None
+    origin = None
+    points = traj.get('trajectory')
+    if isinstance(points, list) and points and isinstance(points[0], dict):
+        origin = points[0]
+    if not _coords_far(current, expected) and not _coords_far(origin, expected):
+        return False
+    new_traj = get_launch_trajectory_data(launch, previous)
+    if not new_traj:
+        return False
+    launch['trajectory_data'] = new_traj
+    logger.info(
+        f"Regenerated trajectory for {launch.get('mission') or launch.get('id')} "
+        f"at {new_traj.get('launch_site')}"
+    )
+    return True
+
+
 def _load_launch_payload(force=False):
     now = time.time()
     if not force and _launches_mem["data"] is not None and (now - _launches_mem["at"]) < LAUNCHES_MEM_TTL:
@@ -3350,6 +3585,8 @@ def _load_launch_payload(force=False):
             _sanitize_launch_list_cache(data, persist=True)
     if not data:
         return {"upcoming": [], "previous": [], "last_updated": None}
+    if _repair_mismatched_trajectory(data):
+        set_cached_data(LAUNCHES_CACHE_KEY, data)
     return _remember_launches(data)
 
 
