@@ -49,8 +49,9 @@ app = FastAPI(
             "name": "Satellites",
             "description": (
                 "Cached CelesTrak GP/OMM element sets (Starlink, stations, and a "
-                "small allowlist). Clients should propagate with SGP4 "
-                "(e.g. satellite.js); this is not live telemetry."
+                "small allowlist) plus SATCAT-backed deployed Starlink TLEs for "
+                "the recent Starship V3 flight. Clients should propagate with "
+                "SGP4 (e.g. satellite.js); this is not live telemetry."
             ),
         },
     ],
@@ -199,6 +200,17 @@ OMM_PROP_FIELDS = (
 SATELLITE_NOTE = (
     "Positions are SGP4 predictions from GP/TLE element sets, not live telemetry."
 )
+# SATCAT has no LAUNCH_DATE query. GROUP=starlink is filtered locally; only the
+# slim recent-date index is cached (the raw catalog is ~4MB and is not stored).
+CELESTRAK_SATCAT_URL = "https://celestrak.org/satcat/records.php"
+CELESTRAK_SUP_GP_URL = "https://celestrak.org/NORAD/elements/supplemental/sup-gp.php"
+DEPLOYED_CACHE_PREFIX = "satellites_deployed_v1:"
+SATCAT_RECENT_CACHE_KEY = "satellites_satcat_starlink_recent_v1"
+SATCAT_RECENT_DAYS = 45
+DEPLOYED_SAT_CAP = 128  # matches the globe Points-shell append cap
+DEPLOYED_INTDES_CAP = 4
+DEPLOYED_SOURCE = "celestrak-satcat"
+_INTDES_RE = re.compile(r"^(\d{4}-\d{3})")
 _TLE_ALPHA5 = "ABCDEFGHJKLMNPQRSTUVWXYZ"  # I and O omitted (Space-Track alpha-5)
 
 
@@ -261,11 +273,17 @@ _launches_mem = {"data": None, "at": 0.0}
 _local_satellites = {}
 _satellite_flights = {}
 _satellite_flights_lock = threading.Lock()
+_local_deployed = {}
+_local_satcat_index = None
+_deployed_flights = {}
+_deployed_flights_lock = threading.Lock()
+_satcat_flight = _SingleFlight()
 
 
 def _reset_cache_coordination_for_tests():
     """Reset single-flight / debounce state between unit tests."""
     global _weather_last_refresh_at, _weather_last_result, _background_enabled, _TRAJECTORY_DATA_CACHE
+    global _local_satcat_index
     _background_enabled = False
     _TRAJECTORY_DATA_CACHE = {}
     _weather_flight.reset()
@@ -288,6 +306,13 @@ def _reset_cache_coordination_for_tests():
         for flight in _satellite_flights.values():
             flight.reset()
         _satellite_flights.clear()
+    _local_deployed.clear()
+    _local_satcat_index = None
+    _satcat_flight.reset()
+    with _deployed_flights_lock:
+        for flight in _deployed_flights.values():
+            flight.reset()
+        _deployed_flights.clear()
 
 
 def _redis_single_flight(name, fn):
@@ -3486,6 +3511,627 @@ def get_satellites_meta(
     return _satellite_meta_from_payload(group, payload)
 
 
+def deployed_generation(text) -> Optional[str]:
+    """`v3` when launch text contains `v3` or `group 31-` (Flight 14 / Group 31-1)."""
+    blob = str(text or "").lower()
+    if "v3" in blob or "group 31-" in blob:
+        return "v3"
+    return None
+
+
+def _launch_blob(launch) -> str:
+    if not isinstance(launch, dict):
+        return ""
+    return " ".join(
+        str(launch.get(key) or "")
+        for key in ("rocket", "mission", "name", "description")
+    ).lower()
+
+
+def _is_starship_launch_row(launch) -> bool:
+    return "starship" in _launch_blob(launch)
+
+
+def select_v3_starship(upcoming, previous=None, now=None):
+    """Starship whose text marks V3 / Group 31, closest to ``now``.
+
+    Upcoming and previous copies of the same flight are both eligible.
+    A Starship that is not a V3 / Group 31 Starlink deployment is ignored
+    so an older flight cannot select a Falcon launch date.
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    best = None
+    best_delta = None
+    for launch in list(upcoming or []) + list(previous or []):
+        if not _is_starship_launch_row(launch):
+            continue
+        if deployed_generation(_launch_blob(launch)) != "v3":
+            continue
+        net = _parse_net_dt(launch.get("net"))
+        if net is None:
+            continue
+        delta = abs((net - now_utc).total_seconds())
+        if best is None or delta < best_delta:
+            best = launch
+            best_delta = delta
+    return best
+
+
+def _parse_launch_date_param(value) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 10:
+        text = text[:10]
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="launch_date must be YYYY-MM-DD",
+        )
+    return text
+
+
+def _norad_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _object_intdes(object_id):
+    match = _INTDES_RE.match(str(object_id or "").strip())
+    return match.group(1) if match else None
+
+
+def _satcat_decayed(row) -> bool:
+    return bool(str((row or {}).get("DECAY_DATE") or "").strip())
+
+
+def slim_satcat_index(rows, *, now=None, extra_dates=()):
+    """Keep non-decayed Starlink payloads, keyed by LAUNCH_DATE.
+
+    Decayed objects, rocket bodies, and debris are dropped. Dates older than
+    ``SATCAT_RECENT_DAYS`` are dropped unless listed in ``extra_dates`` (those
+    keys are always present, even when empty, so a miss is not refetched).
+    """
+    if not isinstance(rows, list):
+        raise ValueError("CelesTrak SATCAT JSON was not a list")
+    now_utc = now or datetime.now(timezone.utc)
+    cutoff = (now_utc.date() - timedelta(days=SATCAT_RECENT_DAYS)).isoformat()
+    extras = {str(item)[:10] for item in extra_dates if item}
+    dates = {extra: [] for extra in extras}
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        norad = _norad_int(row.get("NORAD_CAT_ID"))
+        if norad is None:
+            continue
+        launch_date = str(row.get("LAUNCH_DATE") or "")[:10]
+        if len(launch_date) != 10:
+            continue
+        if launch_date < cutoff and launch_date not in extras:
+            continue
+        if _satcat_decayed(row):
+            continue
+        obj_type = str(row.get("OBJECT_TYPE") or "").upper()
+        if obj_type in ("R/B", "DEB"):
+            continue
+        name = str(row.get("OBJECT_NAME") or "").strip()
+        if not name.upper().startswith("STARLINK"):
+            continue
+        key = (launch_date, norad)
+        if key in seen:
+            continue
+        seen.add(key)
+        dates.setdefault(launch_date, []).append({
+            "name": name,
+            "norad_id": norad,
+            "object_id": str(row.get("OBJECT_ID") or ""),
+        })
+    for launch_date, items in dates.items():
+        items.sort(key=lambda item: item.get("norad_id") or 0)
+    return {"cutoff": cutoff, "dates": dates}
+
+
+def _satcat_index_covers(index, launch_date) -> bool:
+    if not isinstance(index, dict):
+        return False
+    cutoff = index.get("cutoff")
+    dates = index.get("dates")
+    if not cutoff or not isinstance(dates, dict):
+        return False
+    return launch_date >= cutoff or launch_date in dates
+
+
+def _read_satcat_index():
+    global _local_satcat_index
+    local = _local_satcat_index
+    if isinstance(local, dict) and isinstance(local.get("dates"), dict):
+        return local
+    cached = get_cached_data(SATCAT_RECENT_CACHE_KEY)
+    if isinstance(cached, dict) and isinstance(cached.get("dates"), dict):
+        _local_satcat_index = cached
+        return cached
+    return None
+
+
+def _write_satcat_index(payload: dict):
+    global _local_satcat_index
+    _local_satcat_index = payload
+    set_cached_data(SATCAT_RECENT_CACHE_KEY, payload, ttl=SATELLITES_STALE_TTL)
+
+
+def fetch_starlink_satcat_rows() -> list:
+    """Download CelesTrak SATCAT GROUP=starlink (JSON list)."""
+    increment_metric("api_calls")
+    response = requests.get(
+        CELESTRAK_SATCAT_URL,
+        params={"GROUP": "starlink", "FORMAT": "JSON"},
+        headers=CELESTRAK_HEADERS,
+        timeout=SATELLITES_FETCH_TIMEOUT,
+    )
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError("CelesTrak returned non-JSON SATCAT data") from exc
+    if not isinstance(data, list):
+        raise ValueError("CelesTrak SATCAT JSON was not a list")
+    return data
+
+
+def _load_or_fetch_satcat_index(wanted_date: str, force: bool = False):
+    """Return ``(index, index_is_stale)``. Raise if SATCAT is unreachable and uncached."""
+    cached = None if force else _read_satcat_index()
+    if (
+        cached
+        and satellite_cache_is_fresh(cached)
+        and _satcat_index_covers(cached, wanted_date)
+    ):
+        return cached, False
+    try:
+        rows = fetch_starlink_satcat_rows()
+        slim = slim_satcat_index(rows, extra_dates=[wanted_date])
+        payload = {
+            "fetched_at": _utc_isoformat(),
+            "cutoff": slim["cutoff"],
+            "dates": slim["dates"],
+        }
+        _write_satcat_index(payload)
+        return payload, False
+    except Exception as exc:
+        print(f"Error fetching CelesTrak SATCAT: {exc}")
+        fallback = cached or _read_satcat_index()
+        if fallback and _satcat_index_covers(fallback, wanted_date):
+            return fallback, True
+        raise
+
+
+def _get_satcat_index(wanted_date: str, force: bool = False):
+    if not force:
+        cached = _read_satcat_index()
+        if (
+            cached
+            and satellite_cache_is_fresh(cached)
+            and _satcat_index_covers(cached, wanted_date)
+        ):
+            return cached, False
+
+    def _do():
+        result = _redis_single_flight(
+            "satellites_satcat_starlink",
+            lambda: _load_or_fetch_satcat_index(wanted_date, force=force),
+        )
+        if result is None:
+            fallback = _read_satcat_index()
+            if fallback and _satcat_index_covers(fallback, wanted_date):
+                return fallback, True
+            raise RuntimeError("CelesTrak SATCAT unavailable")
+        return result
+
+    return _satcat_flight.do(_do)
+
+
+def _catalog_rows_for_date(index, launch_date) -> list:
+    dates = (index or {}).get("dates") or {}
+    rows = list(dates.get(launch_date) or [])
+    rows.sort(key=lambda row: _norad_int(row.get("norad_id")) or 0)
+    return rows
+
+
+def _cached_starlink_tle_index() -> dict:
+    """NORAD → compact TLE record from the existing Starlink GP cache, if any."""
+    payload = _read_satellite_cache("starlink")
+    index = {}
+    for sat in (payload or {}).get("satellites") or []:
+        if not isinstance(sat, dict):
+            continue
+        norad = _norad_int(sat.get("norad_id"))
+        if norad is None or not sat.get("tle_line1") or not sat.get("tle_line2"):
+            continue
+        index[norad] = {
+            "name": sat.get("name") or "",
+            "norad_id": norad,
+            "tle_line1": sat["tle_line1"],
+            "tle_line2": sat["tle_line2"],
+        }
+    return index
+
+
+def _fetch_gp_omm_list(url: str, params: dict) -> list:
+    increment_metric("api_calls")
+    response = requests.get(
+        url,
+        params=params,
+        headers=CELESTRAK_HEADERS,
+        timeout=SATELLITES_FETCH_TIMEOUT,
+    )
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError("CelesTrak returned non-JSON GP data") from exc
+    if not isinstance(data, list):
+        raise ValueError("CelesTrak GP JSON was not a list")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def fetch_gp_by_intdes(intdes: str, needed_norads) -> dict:
+    """Best OMM per NORAD for one launch designator.
+
+    Main GP is enough when it already covers ``needed_norads``. Supplemental
+    GP is only fetched for catalog numbers the main set does not have.
+    """
+    needed = {n for n in (_norad_int(item) for item in needed_norads) if n is not None}
+    best = {}
+    for url in (CELESTRAK_GP_URL, CELESTRAK_SUP_GP_URL):
+        if needed and needed <= set(best):
+            break
+        try:
+            rows = _fetch_gp_omm_list(url, {"INTDES": intdes, "FORMAT": "JSON"})
+        except Exception as exc:
+            print(f"CelesTrak GP INTDES {intdes} failed for {url}: {exc}")
+            continue
+        for omm in rows:
+            norad = _norad_int(omm.get("NORAD_CAT_ID"))
+            if norad is None:
+                continue
+            prev = best.get(norad)
+            if prev is None or str(omm.get("EPOCH") or "") > str(prev.get("EPOCH") or ""):
+                best[norad] = omm
+    return best
+
+
+def _join_deployed_tles(catalog_rows, generation) -> list:
+    """Real GP TLEs for SATCAT rows only. Catalog misses stay unmatched."""
+    index = _cached_starlink_tle_index()
+    missing_by_intdes = {}
+    for row in catalog_rows:
+        norad = _norad_int(row.get("norad_id"))
+        if norad is None:
+            continue
+        if norad in index:
+            continue
+        intdes = _object_intdes(row.get("object_id"))
+        if not intdes:
+            continue
+        missing_by_intdes.setdefault(intdes, []).append(norad)
+
+    ordered = sorted(missing_by_intdes.items(), key=lambda item: len(item[1]), reverse=True)
+    for intdes, norads in ordered[:DEPLOYED_INTDES_CAP]:
+        found = fetch_gp_by_intdes(intdes, norads)
+        allowed = set(norads)
+        for norad, omm in found.items():
+            if norad not in allowed or norad in index:
+                continue
+            slim = slim_gp_record(omm)
+            if slim.get("tle_line1") and slim.get("tle_line2"):
+                index[norad] = slim
+
+    satellites = []
+    for row in catalog_rows:
+        norad = _norad_int(row.get("norad_id"))
+        sat = index.get(norad) if norad is not None else None
+        if not sat or not sat.get("tle_line1") or not sat.get("tle_line2"):
+            continue
+        record = {
+            "name": sat.get("name") or row.get("name") or "",
+            "norad_id": norad,
+            "tle_line1": sat["tle_line1"],
+            "tle_line2": sat["tle_line2"],
+        }
+        if generation:
+            record["generation"] = generation
+        satellites.append(record)
+        if len(satellites) >= DEPLOYED_SAT_CAP:
+            break
+    return satellites
+
+
+def _deployed_note_empty(launch_date: str) -> str:
+    return (
+        f"No Starlink SATCAT objects with LAUNCH_DATE {launch_date} yet. "
+        + SATELLITE_NOTE
+    )
+
+
+def _deployed_note_no_tle(launch_date: str, catalog_count: int) -> str:
+    return (
+        f"SATCAT lists {catalog_count} Starlink objects for LAUNCH_DATE {launch_date} "
+        "but no GP TLE is available yet. "
+        + SATELLITE_NOTE
+    )
+
+
+def _deployed_note_ready(launch_date: str) -> str:
+    return (
+        f"Starlink SATCAT objects with LAUNCH_DATE {launch_date}, joined to CelesTrak GP TLEs. "
+        + SATELLITE_NOTE
+    )
+
+
+def _deployed_note_unavailable() -> str:
+    return "CelesTrak SATCAT unavailable. " + SATELLITE_NOTE
+
+
+def _no_v3_launch_payload() -> dict:
+    return {
+        "launch_date": None,
+        "generation": None,
+        "mission": None,
+        "fetched_at": _utc_isoformat(),
+        "ttl_seconds": SATELLITES_CACHE_TTL,
+        "count": 0,
+        "catalog_count": 0,
+        "stale": False,
+        "empty": True,
+        "source": DEPLOYED_SOURCE,
+        "note": (
+            "No Starship V3 or Group 31 launch is in the launch cache, "
+            "so no SATCAT launch date was queried. "
+            + SATELLITE_NOTE
+        ),
+        "satellites": [],
+    }
+
+
+def _deployed_payload(target, catalog_rows, satellites, *, stale: bool, note: str) -> dict:
+    sats = list(satellites or [])
+    return {
+        "launch_date": target.get("launch_date"),
+        "generation": target.get("generation"),
+        "mission": target.get("mission"),
+        "fetched_at": _utc_isoformat(),
+        "ttl_seconds": SATELLITES_CACHE_TTL,
+        "count": len(sats),
+        "catalog_count": len(catalog_rows or []),
+        "stale": bool(stale),
+        "empty": len(sats) == 0,
+        "source": DEPLOYED_SOURCE,
+        "note": note,
+        "satellites": sats,
+    }
+
+
+def _mark_deployed_cached(payload: dict, *, stale: bool) -> dict:
+    body = dict(payload)
+    body["stale"] = stale
+    body["empty"] = not body.get("satellites")
+    body["ttl_seconds"] = SATELLITES_CACHE_TTL
+    body["count"] = len(body.get("satellites") or [])
+    if body.get("catalog_count") is None:
+        body["catalog_count"] = body["count"]
+    body["source"] = body.get("source") or DEPLOYED_SOURCE
+    return body
+
+
+def _deployed_cache_key(launch_date: str) -> str:
+    return f"{DEPLOYED_CACHE_PREFIX}{launch_date}"
+
+
+def _read_deployed_cache(launch_date: str):
+    local = _local_deployed.get(launch_date)
+    if isinstance(local, dict) and local.get("satellites") is not None:
+        return local
+    cached = get_cached_data(_deployed_cache_key(launch_date))
+    if isinstance(cached, dict) and cached.get("satellites") is not None:
+        _local_deployed[launch_date] = cached
+        return cached
+    return None
+
+
+def _write_deployed_cache(launch_date: str, payload: dict):
+    _local_deployed[launch_date] = payload
+    set_cached_data(_deployed_cache_key(launch_date), payload, ttl=SATELLITES_STALE_TTL)
+
+
+def _get_deployed_flight(launch_date: str) -> _SingleFlight:
+    with _deployed_flights_lock:
+        flight = _deployed_flights.get(launch_date)
+        if flight is None:
+            flight = _SingleFlight()
+            _deployed_flights[launch_date] = flight
+        return flight
+
+
+def _resolve_deployed_target(launch_date_param):
+    """Date, generation, and mission for this request. ``query`` is false when no V3 flight is known."""
+    explicit = _parse_launch_date_param(launch_date_param) if launch_date_param else None
+    data = _load_launch_payload(False) or {}
+    upcoming = data.get("upcoming") or []
+    previous = data.get("previous") or []
+    if explicit:
+        mission = None
+        generation = None
+        for launch in list(upcoming) + list(previous):
+            if not isinstance(launch, dict) or not _is_starship_launch_row(launch):
+                continue
+            net = _parse_net_dt(launch.get("net"))
+            if net is None or net.date().isoformat() != explicit:
+                continue
+            gen = deployed_generation(_launch_blob(launch))
+            mission = launch.get("mission") or launch.get("name")
+            generation = gen
+            if gen == "v3":
+                break
+        return {
+            "launch_date": explicit,
+            "generation": generation,
+            "mission": mission,
+            "query": True,
+        }
+    chosen = select_v3_starship(upcoming, previous)
+    if chosen is None:
+        return {
+            "launch_date": None,
+            "generation": None,
+            "mission": None,
+            "query": False,
+        }
+    net = _parse_net_dt(chosen.get("net"))
+    return {
+        "launch_date": net.date().isoformat() if net else None,
+        "generation": "v3",
+        "mission": chosen.get("mission") or chosen.get("name"),
+        "query": net is not None,
+    }
+
+
+def _refresh_deployed_uncached(target: dict, force: bool = False):
+    launch_date = target["launch_date"]
+    cached = _read_deployed_cache(launch_date)
+    if not force and cached and satellite_cache_is_fresh(cached):
+        return _mark_deployed_cached(cached, stale=False)
+
+    try:
+        index, index_stale = _get_satcat_index(launch_date, force=force)
+    except Exception as exc:
+        print(f"Deployed SATCAT refresh failed for {launch_date}: {exc}")
+        if cached:
+            return _mark_deployed_cached(cached, stale=True)
+        return _deployed_payload(
+            target,
+            [],
+            [],
+            stale=True,
+            note=_deployed_note_unavailable(),
+        )
+
+    # A failed SATCAT refresh must not rebuild (and drop) TLEs we already stored.
+    if index_stale and cached:
+        return _mark_deployed_cached(cached, stale=True)
+
+    catalog_rows = _catalog_rows_for_date(index, launch_date)
+    satellites = _join_deployed_tles(catalog_rows, target.get("generation"))
+    if not catalog_rows:
+        note = _deployed_note_empty(launch_date)
+    elif not satellites:
+        note = _deployed_note_no_tle(launch_date, len(catalog_rows))
+    else:
+        note = _deployed_note_ready(launch_date)
+    payload = _deployed_payload(
+        target,
+        catalog_rows,
+        satellites,
+        stale=index_stale,
+        note=note,
+    )
+    if index_stale:
+        payload["fetched_at"] = index.get("fetched_at") or payload["fetched_at"]
+        payload["stale"] = True
+        _local_deployed[launch_date] = payload
+        return payload
+    _write_deployed_cache(launch_date, payload)
+    return payload
+
+
+def refresh_deployed_satellites_internal(launch_date: str = None, force: bool = False):
+    """Load the deployed-sat feed for the V3 Starship date (single-flight)."""
+    target = _resolve_deployed_target(launch_date)
+    if not target.get("query") or not target.get("launch_date"):
+        return _no_v3_launch_payload()
+    date = target["launch_date"]
+
+    def _do():
+        result = _redis_single_flight(
+            f"satellites_deployed_{date}",
+            lambda: _refresh_deployed_uncached(target, force=force),
+        )
+        if result is None:
+            cached = _read_deployed_cache(date)
+            if cached:
+                return _mark_deployed_cached(cached, stale=not satellite_cache_is_fresh(cached))
+            return _deployed_payload(target, [], [], stale=True, note=_deployed_note_unavailable())
+        return result
+
+    return _get_deployed_flight(date).do(_do)
+
+
+@app.get(
+    "/satellites/deployed",
+    tags=["Satellites"],
+    summary="Starlink sats deployed by the recent Starship V3 flight",
+)
+def get_satellites_deployed(
+    launch_date: Optional[str] = Query(
+        None,
+        description=(
+            "UTC calendar date YYYY-MM-DD. Omit to use the Starship V3 / "
+            "Group 31 NET date from the launch cache."
+        ),
+    ),
+    force: bool = False,
+    internal: bool = False,
+):
+    """Deployed Starlink TLEs for the globe's red V3 vertices.
+
+    spacex-dashboard ``ingestDeployedPayload`` reads:
+
+    - ``satellites[]``: ``name``, ``norad_id``, ``tle_line1``, ``tle_line2``
+      (satellite.js). Rows without both TLE lines are ignored.
+    - ``catalog_count``: non-decayed Starlink SATCAT rows for ``launch_date``
+      before the GP join. Greater than zero with an empty ``satellites`` list
+      means the catalog matched and no TLE was available.
+    - ``note``: contains ``unavailable`` only when CelesTrak SATCAT could not
+      be fetched and no cached catalog exists.
+    - ``source``: ``celestrak-satcat``.
+    - ``empty`` / ``stale``: honest empty catalog vs. a stale cached copy.
+
+    The default date is the UTC NET date of the Starship launch whose mission
+    text contains ``v3`` or ``group 31-``. Same-day Starlink SATCAT rows are
+    included. Decayed objects are not. Positions are never invented: if SATCAT
+    has no rows for that date, ``satellites`` is ``[]``.
+    """
+    if not internal:
+        increment_metric("total_requests")
+    # Direct calls (tests, the background worker) pass None. A FastAPI Query
+    # default object is not a date string.
+    if not isinstance(launch_date, str) or not launch_date.strip():
+        launch_date = None
+    cached_before = None
+    try:
+        target = _resolve_deployed_target(launch_date)
+        if target.get("query") and target.get("launch_date") and not force:
+            cached_before = _read_deployed_cache(target["launch_date"])
+        payload = refresh_deployed_satellites_internal(launch_date, force=force)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Deployed satellite feed failed: {exc}",
+        )
+    serving_fresh = bool(
+        cached_before and satellite_cache_is_fresh(cached_before) and not force
+    )
+    if serving_fresh:
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    return payload
+
+
 def _parse_net_dt(net_str):
     """Parse a launch NET string into an aware UTC datetime."""
     if not net_str:
@@ -4342,6 +4988,10 @@ def start_background_worker():
             refresh_satellites_internal("stations")
         except Exception as e:
             print(f"Satellite GP bootstrap error: {e}")
+        try:
+            refresh_deployed_satellites_internal()
+        except Exception as e:
+            print(f"Deployed satellite bootstrap error: {e}")
 
         last_run = {
             "narratives": time.time(),
@@ -4372,10 +5022,18 @@ def start_background_worker():
                     refresh_weather_internal()
                     last_run["weather"] = now
 
-                # Starlink / stations GP (hourly; CelesTrak asks not to hammer)
+                # Starlink / stations GP and the V3 deployed feed (hourly;
+                # CelesTrak asks not to hammer).
                 if now - last_run["satellites"] >= SATELLITES_CACHE_TTL:
-                    refresh_satellites_internal("starlink")
-                    refresh_satellites_internal("stations")
+                    try:
+                        refresh_satellites_internal("starlink")
+                        refresh_satellites_internal("stations")
+                    except Exception as e:
+                        print(f"Satellite GP refresh error: {e}")
+                    try:
+                        refresh_deployed_satellites_internal()
+                    except Exception as e:
+                        print(f"Deployed satellite refresh error: {e}")
                     last_run["satellites"] = now
 
             except Exception as e:

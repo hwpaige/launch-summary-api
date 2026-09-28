@@ -297,6 +297,36 @@ Cached CelesTrak General Perturbations (GP / OMM) for the SpaceX dashboard Three
         *   `satellites`: compact `{name, norad_id, tle_line1, tle_line2}` (unused OMM keywords omitted so ~6–10k Starlinks stay small)
 *   **Starlink alias:** `GET /satellites/starlink` — same payload as `/satellites/gp?group=starlink`
 *   **Metadata only:** `GET /satellites/meta?group=starlink` — `fetched_at`, `count`, `group`, `ttl_seconds`, `age_seconds`, `stale`, `allowed_groups` (does not call CelesTrak)
+*   **Deployed Starlink (Starship V3 / Group 31):** `GET /satellites/deployed`
+    *   Used by spacex-dashboard `globe.html` (`ingestDeployedPayload`) to recolor this flight's sats inside the existing constellation Points shell. Pi clients proxy this path; they do not call CelesTrak.
+    *   **Parameters:**
+        *   `launch_date` (optional, `YYYY-MM-DD`) — UTC SATCAT launch date. Omit to use the NET date of the Starship launch whose mission text contains `v3` or `group 31-` (Flight 14 is `Starship | Starlink Group 31-1`).
+        *   `force=true` (optional) — bypass the fresh cache and refetch SATCAT.
+    *   **Source:** CelesTrak SATCAT `GROUP=starlink`, filtered to that `LAUNCH_DATE`. Decayed objects, rocket bodies, and debris are dropped. Remaining payloads are joined to GP TLEs by NORAD (the cached Starlink GP feed, then `gp.php?INTDES=`, then supplemental GP only for catalog numbers the main set does not have). Same-day Starlink rows are included. **No positions are invented.**
+    *   **Caching:** Fresh for 1 hour (Redis key `satellites_deployed_v1:{date}`, in-memory fallback). A slim recent SATCAT index is kept the same way. Stale copies are kept ~48 hours. The raw multi-megabyte SATCAT download is not stored.
+    *   **Response fields the globe reads:**
+        *   `satellites`: `{name, norad_id, tle_line1, tle_line2}` — same compact shape as `/satellites/gp`. Both TLE lines are required; `generation` is `v3` on each row when the launch text says so.
+        *   `catalog_count`: SATCAT matches before the TLE join. `catalog_count > 0` with no TLE lines → dashboard `catalog-no-tle`.
+        *   `note`: contains `unavailable` only when SATCAT could not be fetched and nothing is cached → dashboard `satcat-unavailable`. An honest empty catalog does **not** say unavailable → dashboard `awaiting-catalog`.
+        *   `source`: `celestrak-satcat`.
+    *   **Also returned:** `launch_date`, `generation`, `mission`, `fetched_at`, `ttl_seconds`, `count`, `stale`, `empty`.
+    *   **Sample (SATCAT has no rows for the flight date yet):**
+```json
+{
+  "launch_date": "2026-09-28",
+  "generation": "v3",
+  "mission": "Starship | Starlink Group 31-1 (Starship Flight 14)",
+  "fetched_at": "2026-09-28T14:00:00Z",
+  "ttl_seconds": 3600,
+  "count": 0,
+  "catalog_count": 0,
+  "stale": false,
+  "empty": true,
+  "source": "celestrak-satcat",
+  "note": "No Starlink SATCAT objects with LAUNCH_DATE 2026-09-28 yet. Positions are SGP4 predictions from GP/TLE element sets, not live telemetry.",
+  "satellites": []
+}
+```
 *   **Sample Response (`GET /satellites/gp?group=stations`):**
 ```json
 {
@@ -366,7 +396,7 @@ The API utilizes a **Timer-Based Refresh Strategy** to ensure stability and spee
 2.  **Hot raw (opt-in):** `GET /launch_raw/{id}?hot=1` refreshes **only the current/next launch** from Launch Library on a ~20s stale-while-revalidate TTL (single-flight per id). This is not a full-list refresh. Other ids, and `/launch_raw/{id}` without `hot`, keep the long-lived side store.
 3.  **Manual Force:** Users can trigger an immediate refresh via the dashboard buttons or by appending `?force=true` to API requests.
 4.  **Incremental History:** Previous launch data is never fully replaced; new launches are appended to the existing historical cache to preserve a continuous record.
-5.  **Satellite GP:** `/satellites/*` is a CelesTrak proxy with a 1-hour freshness window. Element sets are GP/TLE; globe dots are SGP4 predictions, not live positions.
+5.  **Satellite GP:** `/satellites/gp`, `/satellites/starlink`, and `/satellites/meta` are a CelesTrak proxy with a 1-hour freshness window. `/satellites/deployed` uses the same window for the Starship V3 SATCAT join. Element sets are GP/TLE; globe dots are SGP4 predictions, not live positions. An empty deployed list means SATCAT has no objects for that launch date.
 
 ---
 
