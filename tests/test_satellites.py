@@ -322,10 +322,313 @@ class SatelliteGpTests(unittest.TestCase):
         self.assertIn("/satellites/gp", paths)
         self.assertIn("/satellites/starlink", paths)
         self.assertIn("/satellites/meta", paths)
+        self.assertIn("/satellites/deployed", paths)
         dumped = json.dumps(schema)
         self.assertIn("Satellites", dumped)
         self.assertIn("starlink", dumped)
         self.assertIn("SGP4", dumped)
+
+
+def _satcat_row(name, norad, object_id, launch_date, object_type="PAY", decay=""):
+    return {
+        "OBJECT_NAME": name,
+        "OBJECT_ID": object_id,
+        "NORAD_CAT_ID": norad,
+        "OBJECT_TYPE": object_type,
+        "LAUNCH_DATE": launch_date,
+        "DECAY_DATE": decay,
+    }
+
+
+def _v3_omm(norad=100753, name="STARLINK-38381", object_id="2026-219A"):
+    omm = dict(STARLINK_OMM)
+    omm["OBJECT_NAME"] = name
+    omm["OBJECT_ID"] = object_id
+    omm["NORAD_CAT_ID"] = norad
+    return omm
+
+
+FLIGHT_14 = {
+    "id": "flight-14",
+    "mission": "Starship | Starlink Group 31-1 (Starship Flight 14)",
+    "name": "Starship | Starlink Group 31-1 (Starship Flight 14)",
+    "rocket": "Starship",
+    "net": "2026-09-28T12:48:59Z",
+    "status": "Launch in Flight",
+}
+
+
+class DeployedSatelliteTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def test_flight_14_group_31_is_the_v3_launch(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 9, 28, 16, 0, tzinfo=timezone.utc)
+        flight_13 = {
+            "id": "flight-13",
+            "mission": "Starship | Flight 13",
+            "rocket": "Starship",
+            "net": "2026-07-24T22:51:00Z",
+        }
+        chosen = app.select_v3_starship([FLIGHT_14], [flight_13, FLIGHT_14], now=now)
+        self.assertEqual(chosen["id"], "flight-14")
+        self.assertEqual(app.deployed_generation(app._launch_blob(chosen)), "v3")
+        self.assertIsNone(app.deployed_generation(app._launch_blob(flight_13)))
+
+    def test_slim_satcat_index_skips_decayed_debris_and_other_dates(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 9, 28, tzinfo=timezone.utc)
+        rows = [
+            _satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-28"),
+            _satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-28"),
+            _satcat_row("STARLINK-DEAD", 100701, "2026-219C", "2026-09-28", decay="2026-09-28"),
+            _satcat_row("STARLINK R/B", 100702, "2026-219D", "2026-09-28", object_type="R/B"),
+            _satcat_row("STARLINK DEB", 100703, "2026-219E", "2026-09-28", object_type="DEB"),
+            _satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-09-20"),
+            _satcat_row("NOT-A-STARLINK", 100799, "2026-219F", "2026-09-28"),
+        ]
+        index = app.slim_satcat_index(rows, now=now, extra_dates=["2020-01-01"])
+        self.assertEqual([row["norad_id"] for row in index["dates"]["2026-09-28"]], [100753])
+        self.assertEqual(index["dates"]["2026-09-20"][0]["norad_id"], 100700)
+        self.assertEqual(index["dates"]["2020-01-01"], [])
+        self.assertNotIn("2020-01-02", index["dates"])
+
+    def _route_celestrak(self, satcat_rows, gp_by_intdes=None, sup_by_intdes=None):
+        gp_by_intdes = gp_by_intdes or {}
+        sup_by_intdes = sup_by_intdes or {}
+        calls = []
+
+        def fake_get(url, params=None, **kwargs):
+            calls.append((url, dict(params or {})))
+            if url == app.CELESTRAK_SATCAT_URL:
+                return _json_response(satcat_rows)
+            intdes = (params or {}).get("INTDES")
+            if url == app.CELESTRAK_GP_URL:
+                return _json_response(gp_by_intdes.get(intdes, []))
+            if url == app.CELESTRAK_SUP_GP_URL:
+                return _json_response(sup_by_intdes.get(intdes, []))
+            raise AssertionError(url)
+
+        return fake_get, calls
+
+    def test_flight_14_empty_satcat_is_honest_and_does_not_fetch_gp(self):
+        rows = [_satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-09-20")]
+        fake_get, calls = self._route_celestrak(rows)
+        launches = {"upcoming": [FLIGHT_14], "previous": [FLIGHT_14], "last_updated": None}
+        with patch.object(app, "r", None), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(internal=True)
+
+        self.assertEqual(body["launch_date"], "2026-09-28")
+        self.assertEqual(body["generation"], "v3")
+        self.assertIn("Group 31-1", body["mission"])
+        self.assertEqual(body["satellites"], [])
+        self.assertEqual(body["count"], 0)
+        self.assertEqual(body["catalog_count"], 0)
+        self.assertTrue(body["empty"])
+        self.assertFalse(body["stale"])
+        self.assertEqual(body["source"], "celestrak-satcat")
+        self.assertNotIn("unavailable", body["note"].lower())
+        self.assertIn("2026-09-28", body["note"])
+        self.assertIn("SGP4", body["note"])
+        self.assertEqual([url for url, _params in calls], [app.CELESTRAK_SATCAT_URL])
+
+    def test_joins_real_tle_and_ignores_unrelated_gp_objects(self):
+        rows = [
+            _satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-28"),
+            _satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-09-20"),
+            _satcat_row("STARLINK-DEAD", 100701, "2026-219C", "2026-09-28", decay="2026-09-28"),
+        ]
+        # ISS is a real OMM but it is not in the SATCAT match, so it must not appear.
+        fake_get, calls = self._route_celestrak(
+            rows,
+            gp_by_intdes={"2026-219": [_v3_omm(), ISS_OMM]},
+        )
+        launches = {"upcoming": [FLIGHT_14], "previous": [], "last_updated": None}
+        with patch.object(app, "r", None), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["catalog_count"], 1)
+        self.assertEqual(body["count"], 1)
+        self.assertFalse(body["empty"])
+        self.assertFalse(body["stale"])
+        sat = body["satellites"][0]
+        self.assertEqual(set(sat), {"name", "norad_id", "tle_line1", "tle_line2", "generation"})
+        self.assertEqual(sat["norad_id"], 100753)
+        self.assertEqual(sat["name"], "STARLINK-38381")
+        self.assertEqual(sat["generation"], "v3")
+        self.assertEqual(len(sat["tle_line1"]), 69)
+        self.assertEqual(len(sat["tle_line2"]), 69)
+        self.assertTrue(sat["tle_line1"].startswith("1 A0753U"))
+        self.assertTrue(sat["tle_line2"].startswith("2 A0753"))
+        self.assertNotIn(25544, [row["norad_id"] for row in body["satellites"]])
+        gp_calls = [params for url, params in calls if url == app.CELESTRAK_GP_URL]
+        self.assertEqual(gp_calls, [{"INTDES": "2026-219", "FORMAT": "JSON"}])
+        self.assertFalse(any(url == app.CELESTRAK_SUP_GP_URL for url, _params in calls))
+
+    def test_supplemental_gp_fills_norads_missing_from_main_gp(self):
+        rows = [_satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-28")]
+        fake_get, calls = self._route_celestrak(
+            rows,
+            gp_by_intdes={"2026-219": []},
+            sup_by_intdes={"2026-219": [_v3_omm()]},
+        )
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["satellites"][0]["norad_id"], 100753)
+        self.assertTrue(any(url == app.CELESTRAK_SUP_GP_URL for url, _params in calls))
+
+    def test_cached_starlink_gp_skips_intdes_fetch(self):
+        omm = _v3_omm()
+        app._local_satellites["starlink"] = {
+            "fetched_at": app._utc_isoformat(),
+            "satellites": [app.slim_gp_record(omm)],
+        }
+        rows = [_satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-28")]
+        fake_get, calls = self._route_celestrak(rows, gp_by_intdes={"2026-219": [_v3_omm()]})
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["satellites"][0]["norad_id"], 100753)
+        self.assertEqual([url for url, _params in calls], [app.CELESTRAK_SATCAT_URL])
+
+    def test_catalog_without_tle_is_not_unavailable(self):
+        rows = [_satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-28")]
+        fake_get, _calls = self._route_celestrak(rows)
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["catalog_count"], 1)
+        self.assertEqual(body["count"], 0)
+        self.assertEqual(body["satellites"], [])
+        self.assertTrue(body["empty"])
+        self.assertFalse(body["stale"])
+        self.assertNotIn("unavailable", body["note"].lower())
+        self.assertIn("no GP TLE", body["note"])
+
+    def test_satcat_outage_without_cache_is_empty_and_flagged(self):
+        from fastapi.testclient import TestClient
+
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=RuntimeError("celestrak down")), \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            response = client.get("/satellites/deployed", params={"launch_date": "2026-09-28"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["satellites"], [])
+        self.assertEqual(body["catalog_count"], 0)
+        self.assertTrue(body["empty"])
+        self.assertTrue(body["stale"])
+        self.assertIn("unavailable", body["note"].lower())
+        self.assertEqual(body["source"], "celestrak-satcat")
+
+    def test_satcat_outage_serves_stale_cache_without_changing_the_note(self):
+        rows = [_satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-20")]
+        fake_get, _calls = self._route_celestrak(
+            rows,
+            gp_by_intdes={"2026-219": [_v3_omm()]},
+        )
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            fresh = app.get_satellites_deployed(launch_date="2026-09-20", internal=True)
+        self.assertEqual(fresh["count"], 1)
+        fresh_note = fresh["note"]
+        app._local_deployed["2026-09-20"]["fetched_at"] = "2020-01-01T00:00:00Z"
+        app._local_satcat_index["fetched_at"] = "2020-01-01T00:00:00Z"
+
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=RuntimeError("celestrak down")):
+            stale = app.get_satellites_deployed(launch_date="2026-09-20", internal=True)
+
+        self.assertTrue(stale["stale"])
+        self.assertEqual(stale["satellites"][0]["norad_id"], 100753)
+        self.assertEqual(stale["note"], fresh_note)
+        self.assertNotIn("unavailable", stale["note"].lower())
+
+    def test_fresh_cache_skips_a_second_satcat_download(self):
+        fake_get, calls = self._route_celestrak([])
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            first = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+            second = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertTrue(first["empty"])
+        self.assertTrue(second["empty"])
+        self.assertEqual(len(calls), 1)
+
+    def test_no_v3_launch_does_not_query_celestrak(self):
+        launches = {
+            "upcoming": [{
+                "mission": "Falcon 9 Block 5 | Starlink Group 10-20",
+                "rocket": "Falcon 9",
+                "net": "2026-09-28T00:00:00Z",
+            }],
+            "previous": [{
+                "mission": "Starship | Flight 13",
+                "rocket": "Starship",
+                "net": "2026-07-24T22:51:00Z",
+            }],
+        }
+        with patch.object(app, "r", None), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=AssertionError("upstream")):
+            body = app.get_satellites_deployed(internal=True)
+
+        self.assertIsNone(body["launch_date"])
+        self.assertIsNone(body["generation"])
+        self.assertTrue(body["empty"])
+        self.assertFalse(body["stale"])
+        self.assertEqual(body["satellites"], [])
+        self.assertNotIn("unavailable", body["note"].lower())
+        self.assertIn("No Starship V3", body["note"])
+
+    def test_bad_launch_date_is_400(self):
+        from fastapi.testclient import TestClient
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            response = client.get("/satellites/deployed", params={"launch_date": "09-28-2026"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("YYYY-MM-DD", response.json()["detail"])
+
+    def test_same_day_second_launch_is_included(self):
+        rows = [
+            _satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-28"),
+            _satcat_row("STARLINK-100", 44714, "2026-220A", "2026-09-28"),
+        ]
+        fake_get, calls = self._route_celestrak(
+            rows,
+            gp_by_intdes={
+                "2026-219": [_v3_omm()],
+                "2026-220": [_v3_omm(44714, "STARLINK-100", "2026-220A")],
+            },
+        )
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["catalog_count"], 2)
+        self.assertEqual(
+            [sat["norad_id"] for sat in body["satellites"]],
+            [44714, 100753],
+        )
+        intdes = sorted(params["INTDES"] for url, params in calls if url == app.CELESTRAK_GP_URL)
+        self.assertEqual(intdes, ["2026-219", "2026-220"])
 
 
 if __name__ == "__main__":
