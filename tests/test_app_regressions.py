@@ -628,6 +628,16 @@ class HotLaunchRawTests(unittest.TestCase):
         self.assertEqual(lock.call_args[0][0], "hot_raw_next-1")
 
 
+def _max_cross_track_km(leg, reference):
+    """Largest distance from a leg point to the nearest reference point."""
+    worst = 0.0
+    for point in leg:
+        nearest = min(app._distance_km(point, other) for other in reference)
+        if nearest > worst:
+            worst = nearest
+    return worst
+
+
 class LaunchSiteTrajectoryTests(unittest.TestCase):
     def setUp(self):
         app._reset_cache_coordination_for_tests()
@@ -888,13 +898,23 @@ class LaunchSiteTrajectoryTests(unittest.TestCase):
         self.assertGreater(max(lats), 48.0)
         self.assertLess(max(lats), 55.0)
         self.assertAlmostEqual(traj["inclination_deg"], 51.6, places=1)
-        # LZ-40 is a few hundred metres from SLC-40. No Atlantic return arc.
-        self.assertEqual(traj["booster_trajectory"], [])
-        self.assertIsNone(traj["booster_ground_track"])
-        self.assertAlmostEqual(traj["landing_site"]["lat"], 28.5634384, places=5)
-        self.assertAlmostEqual(traj["landing_site"]["lon"], -80.5752619, places=5)
+        ascent_km = app._polyline_length_km(traj["trajectory"])
+        # Orbital-rate coast for 9 minutes is ~4,000 km. The ramp covers about half.
+        self.assertGreater(ascent_km, 800.0)
+        self.assertLess(ascent_km, 2600.0)
+        self.assertGreater(max(p["lat"] for p in traj["trajectory"]), 34.0)
+        boost = traj["booster_trajectory"]
+        self.assertEqual(traj["booster_ground_track"], "along_track_return")
+        self.assertGreater(len(boost), 5)
+        pad = traj["launch_site"]
+        self.assertGreater(app._distance_km(pad, boost[0]), 60.0)
+        self.assertLess(app._distance_km(pad, boost[0]), 400.0)
+        self.assertAlmostEqual(boost[-1]["lat"], 28.5634384, places=3)
+        self.assertAlmostEqual(boost[-1]["lon"], -80.5752619, places=3)
+        # The return stays on the ascent ground track. It does not bow off it.
+        self.assertLess(_max_cross_track_km(boost, traj["trajectory"]), 25.0)
 
-    def test_lz1_offset_ends_at_the_published_pad_not_the_launch_pad(self):
+    def test_rtls_return_follows_the_ascent_track_and_ends_at_lz1(self):
         launch = {
             "mission": "Falcon Heavy | NROL-97",
             "pad": "Launch Complex 39A",
@@ -911,14 +931,18 @@ class LaunchSiteTrajectoryTests(unittest.TestCase):
             traj = app.get_launch_trajectory_data(launch)
         end = traj["booster_trajectory"][-1]
         pad = traj["launch_site"]
-        self.assertEqual(traj["booster_ground_track"], "landing_zone_offset")
+        start = traj["booster_trajectory"][0]
+        self.assertEqual(traj["booster_ground_track"], "along_track_return")
         self.assertAlmostEqual(end["lat"], 28.485712, places=3)
         self.assertAlmostEqual(end["lon"], -80.542963, places=3)
-        self.assertGreater(app._distance_km(pad, end), 10.0)
-        self.assertLess(app._distance_km(pad, end), 20.0)
-        # The leg stays near the Cape. It does not run downrange into the Atlantic.
-        self.assertLess(app._distance_km(pad, end), 30.0)
-        self.assertTrue(all(app._distance_km(pad, p) < 30.0 for p in traj["booster_trajectory"]))
+        # Staging is well downrange. The line is the return, not the 15 km pad offset.
+        self.assertGreater(app._distance_km(pad, start), 60.0)
+        self.assertLess(app._distance_km(pad, start), 400.0)
+        self.assertGreater(
+            max(app._distance_km(pad, p) for p in traj["booster_trajectory"]),
+            60.0,
+        )
+        self.assertLess(_max_cross_track_km(traj["booster_trajectory"], traj["trajectory"]), 25.0)
 
     def test_asds_uses_published_downrange_not_a_650_km_default(self):
         launch = {
@@ -935,11 +959,16 @@ class LaunchSiteTrajectoryTests(unittest.TestCase):
         with patch.object(app, "save_cache_to_file"), patch.object(app, "r", None):
             traj = app.get_launch_trajectory_data(launch)
         end = traj["booster_trajectory"][-1]
+        start = traj["booster_trajectory"][0]
         pad = traj["launch_site"]
-        distance = app._distance_km(pad, end)
-        self.assertEqual(traj["booster_ground_track"], "published_downrange")
-        self.assertAlmostEqual(distance, 574.0, delta=15.0)
-        self.assertGreater(abs(distance - 650.0), 40.0)
+        end_km = app._distance_km(pad, end)
+        start_km = app._distance_km(pad, start)
+        self.assertEqual(traj["booster_ground_track"], "along_track_downrange")
+        self.assertAlmostEqual(end_km, 574.0, delta=15.0)
+        self.assertGreater(abs(end_km - 650.0), 40.0)
+        self.assertGreater(start_km, 40.0)
+        self.assertLess(start_km, end_km)
+        self.assertLess(_max_cross_track_km(traj["booster_trajectory"], traj["trajectory"]), 25.0)
 
     def test_ocean_splashdown_without_coordinates_has_no_booster_track(self):
         launch = {
@@ -1008,8 +1037,11 @@ class LaunchSiteTrajectoryTests(unittest.TestCase):
             slim = app.get_launches_slim(internal=True)
 
         traj = slim["upcoming"][0]["trajectory_data"]
-        self.assertIn("booster_ground_track", traj)
-        self.assertEqual(traj["booster_trajectory"], [])
+        self.assertEqual(traj["booster_ground_track"], "along_track_return")
+        boost = traj["booster_trajectory"]
+        self.assertGreater(len(boost), 5)
+        # Regenerated return stays near the Cape. The cached arc reached 70°W.
+        self.assertGreater(min(p["lon"] for p in boost), -85.0)
         self.assertTrue(any(key == app.LAUNCHES_CACHE_KEY for key in persisted))
 
 

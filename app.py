@@ -1188,11 +1188,16 @@ _EXPLICIT_INCL_RE = re.compile(
     re.IGNORECASE,
 )
 # Droneship downranges in Launch Library are hundreds of kilometres.
-# Sub-30 km figures are RTLS pad offsets, not an ASDS station.
+# Sub-30 km figures are the landing pad's offset from the launch pad, not how
+# far the booster flew.
 _ASDS_DOWNRANGE_MIN_KM = 30.0
-# LZ-40 sits on SLC-40 (~0.3 km). LZ-1 is ~15 km south of LC-39A.
-_LZ_OFFSET_MIN_KM = 2.0
-_BOOSTER_SURFACE_R = 1.012
+# Linear ramp from rest to circular velocity. Mean speed is half of circular,
+# so the ascent ground arc is half of an already-orbital coast of the same
+# duration. This is a shape model, not a telemetry replay.
+_ASCENT_MEAN_SPEED_FRACTION = 0.5
+# Public Falcon 9 staging callout. Distance along the ramp scales with time squared.
+_MECO_TIME_MIN = 2.5
+_BOOSTER_TRACK_KINDS = (None, "along_track_return", "along_track_downrange")
 
 
 def _distance_km(a, b):
@@ -1302,49 +1307,53 @@ def _landing_numbers(launch):
     return lat, lon, down
 
 
-def _path_prefix_to_distance(path, distance_km):
-    """Ground-track prefix from the pad out to a published downrange."""
-    if not path or distance_km is None or distance_km <= 0:
-        return []
-    kept = [path[0]]
+def _polyline_length_km(path):
+    total = 0.0
+    for start, end in zip(path, path[1:]):
+        total += _distance_km(start, end)
+    return total
+
+
+def _point_at_path_distance(path, distance_km):
+    """Lat/lon at a distance along path, measured from the first point."""
+    if not path:
+        return None
+    if distance_km <= 0:
+        return {"lat": float(path[0]["lat"]), "lon": float(path[0]["lon"])}
     travelled = 0.0
     prev = path[0]
     for point in path[1:]:
         step = _distance_km(prev, point)
-        if travelled + step >= distance_km:
-            frac = (distance_km - travelled) / step if step > 1e-6 else 1.0
-            kept.append({
+        if travelled + step >= distance_km and step > 1e-9:
+            frac = (distance_km - travelled) / step
+            return {
                 "lat": prev["lat"] + frac * (point["lat"] - prev["lat"]),
                 "lon": prev["lon"] + frac * (point["lon"] - prev["lon"]),
-            })
-            break
-        kept.append(point)
+            }
         travelled += step
         prev = point
-    if len(kept) > 80:
-        step_n = max(1, len(kept) // 80)
-        sampled = kept[::step_n]
-        if sampled[-1] is not kept[-1]:
-            sampled.append(kept[-1])
-        kept = sampled
-    points = [
-        {"lat": float(point["lat"]), "lon": float(point["lon"]), "r": _BOOSTER_SURFACE_R}
-        for point in kept
-    ]
-    return points if len(points) >= 2 else []
+    return {"lat": float(path[-1]["lat"]), "lon": float(path[-1]["lon"])}
 
 
-def _surface_segment(start, end, num_points=12):
-    """Geodesic samples between two surveyed points. Not a boostback arc."""
-    n = max(2, num_points)
+def _sample_path_span(path, start_km, end_km, samples=48):
+    """Samples of the ground track between two distances. Either direction."""
+    if not path or abs(end_km - start_km) < 1.0:
+        return []
+    span = end_km - start_km
     points = []
-    for i in range(n):
-        t = i / (n - 1)
-        points.append({
-            "lat": start["lat"] + t * (end["lat"] - start["lat"]),
-            "lon": start["lon"] + t * (end["lon"] - start["lon"]),
-            "r": _BOOSTER_SURFACE_R,
-        })
+    last = max(1, samples - 1)
+    for i in range(samples):
+        dist = start_km + span * (i / last)
+        point = _point_at_path_distance(path, max(0.0, dist))
+        if point:
+            points.append(point)
+    return points
+
+
+def _stamp_linear_radius(points, r0, r1):
+    last = max(1, len(points) - 1)
+    for i, point in enumerate(points):
+        point["r"] = r0 + (r1 - r0) * (i / last)
     return points
 
 
@@ -1492,7 +1501,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         launch_site.get('lat', 0.0)
     )
 
-    ORBIT_CACHE_VERSION = 'v262-published-landing'
+    ORBIT_CACHE_VERSION = 'v263-along-track'
     landing_type = next_launch.get('landing_type')
     landing_loc = next_launch.get('landing_location')
     landing_lat, landing_lon, landing_downrange_km = _landing_numbers(next_launch)
@@ -1573,11 +1582,13 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     }.get(normalized_orbit, 9.0)
 
     # Fraction of master_path that represents the ascent phase.
-    # 20% upper cap prevents ascent from visually overlapping the orbit ring for
-    # very short periods; 2.5% lower floor ensures a minimum visible ascent path
-    # even for long-period orbits (GTO, GEO) where insertion is a tiny fraction.
-    traj_frac = min(0.20, max(0.025, ASCENT_TIME_MIN / orbital_period_min))
-    traj_len = max(50, int(len(master_path) * traj_frac))
+    # Time fraction alone would draw the ascent at orbital speed from liftoff
+    # and stretch a 9-minute burn across half an ocean. Half of that arc is the
+    # ground range of a linear speed ramp. The 20% cap keeps a short-period
+    # orbit from painting the ascent over the whole ring.
+    time_frac = ASCENT_TIME_MIN / max(0.1, orbital_period_min)
+    ground_frac = min(0.20, max(0.012, _ASCENT_MEAN_SPEED_FRACTION * time_frac))
+    traj_len = max(40, int(len(master_path) * ground_frac))
     trajectory = [p.copy() for p in master_path[:traj_len]]
 
     # The orbit path is the REMAINING part of the Master Path to avoid overlap
@@ -1599,50 +1610,62 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         progress = i / max(1, len(trajectory) - 1)
         p['r'] = 1.0 + (target_r - 1.0) * (progress ** 0.4)
 
-    # Booster leg uses only a published endpoint. There is no boostback curve:
-    # Launch Library does not provide one, and a Bezier from an estimated MECO
-    # back to the pad drew Crew-13 across the Atlantic and Flight 14 to a
-    # made-up Gulf point 400 km downrange.
+    # Booster polyline is a piece of the same ground track as the ascent.
+    # RTLS comes back along that track from staging to the published landing
+    # coordinate. ASDS continues along it from staging to the published
+    # downrange. No side bulge, and no pad-to-pad stub in place of the flight.
     landing_site = None
     if landing_lat is not None:
         landing_site = {
             'lat': landing_lat,
             'lon': landing_lon,
-            'name': next_launch.get('landing_location') or 'Landing zone',
+            'name': next_launch.get('landing_location') or '',
         }
     booster_trajectory = []
     booster_ground_track = None
     sep_idx = None
     try:
-        if landing_site is not None:
-            offset_km = _distance_km(launch_site, landing_site)
-            if offset_km >= _LZ_OFFSET_MIN_KM:
-                booster_trajectory = _surface_segment(launch_site, landing_site)
-                booster_ground_track = 'landing_zone_offset'
-                sep_idx = 0
-                logger.info(
-                    f"Booster leg is the surveyed pad-to-zone offset ({offset_km:.1f} km)"
-                )
-            else:
-                logger.info(
-                    f"Published landing zone is {offset_km:.2f} km from the pad; no return arc"
-                )
-        elif (
+        ascent_km = _polyline_length_km(trajectory)
+        meco_frac = (_MECO_TIME_MIN / max(0.1, ASCENT_TIME_MIN)) ** 2
+        meco_km = ascent_km * meco_frac
+        meco_r = 1.0 + (target_r - 1.0) * (min(1.0, meco_frac) ** 0.4)
+        ltype = (landing_type or '').lower()
+        rtls = ('return to launch site' in ltype) or ltype.strip() == 'rtls'
+        expended = 'expend' in ltype
+        ocean = ('ocean' in ltype) or ('splash' in ltype)
+        published_far = (
             landing_downrange_km is not None
             and landing_downrange_km >= _ASDS_DOWNRANGE_MIN_KM
-        ):
-            booster_trajectory = _path_prefix_to_distance(master_path, landing_downrange_km)
-            if len(booster_trajectory) >= 2:
-                booster_ground_track = 'published_downrange'
+        )
+        if expended or (ocean and not published_far):
+            logger.info("No published booster ground range; omitting booster track")
+        elif published_far and not rtls:
+            leg = _sample_path_span(master_path, meco_km, landing_downrange_km)
+            if len(leg) >= 2:
+                _stamp_linear_radius(leg, meco_r, 1.0)
+                booster_trajectory = leg
+                booster_ground_track = 'along_track_downrange'
                 sep_idx = 0
                 logger.info(
-                    f"Booster leg follows ascent azimuth to published downrange "
-                    f"{landing_downrange_km:.0f} km"
+                    f"Booster leg follows the ascent track from {meco_km:.0f} km "
+                    f"to published downrange {landing_downrange_km:.0f} km"
                 )
-            else:
-                booster_trajectory = []
+        elif rtls or landing_site is not None:
+            leg = _sample_path_span(master_path, meco_km, 0.0)
+            if len(leg) >= 2:
+                _stamp_linear_radius(leg, meco_r, 1.0)
+                if landing_site is not None:
+                    leg[-1]['lat'] = landing_site['lat']
+                    leg[-1]['lon'] = landing_site['lon']
+                    leg[-1]['r'] = 1.0
+                booster_trajectory = leg
+                booster_ground_track = 'along_track_return'
+                sep_idx = 0
+                logger.info(
+                    f"Booster return follows the ascent track back from {meco_km:.0f} km"
+                )
         else:
-            logger.info("No published landing coordinate or downrange; omitting booster track")
+            logger.info("No published booster ground range; omitting booster track")
     except Exception as e:
         logger.warning(f"Booster trajectory generation failed: {e}")
         booster_trajectory = []
@@ -1681,7 +1704,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             'landing_site': landing_site,
             'landing_downrange_km': landing_downrange_km,
             'booster_ground_track': booster_ground_track,
-            'model': 'v14-published-landing'
+            'model': 'v15-along-track'
         }
         save_cache_to_file(TRAJECTORY_CACHE_FILE, traj_cache, datetime.now(pytz.utc))
     except Exception as e:
@@ -5114,9 +5137,9 @@ def _repair_mismatched_trajectory(data):
     """Regenerate a cached trajectory that is on the wrong pad or an old model.
 
     Flight 14 was stored with an LC-39A launch site while its pad is OLP-2.
-    Tracks from before published landing endpoints omit ``booster_ground_track``
-    and still carry an invented booster arc. Slim responses serve that blob
-    until the next launch refresh, so correct it on read.
+    Tracks from before the along-track booster leg omit ``booster_ground_track``
+    or still carry a pad-to-pad stub. Slim responses serve that blob until the
+    next launch refresh, so correct it on read.
     """
     if not isinstance(data, dict):
         return False
@@ -5140,7 +5163,7 @@ def _repair_mismatched_trajectory(data):
     points = traj.get('trajectory')
     if isinstance(points, list) and points and isinstance(points[0], dict):
         origin = points[0]
-    stale_model = "booster_ground_track" not in traj
+    stale_model = traj.get("booster_ground_track", "missing") not in _BOOSTER_TRACK_KINDS
     if (
         not stale_model
         and not _coords_far(current, expected)

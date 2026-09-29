@@ -54,10 +54,10 @@ This is the production cutover: default `/launches` drops the ~19MB raw LL blobs
     *   `net`, `date`, `time`, `status`, `rocket`, `orbit`, `pad`
     *   `video_url`, `x_video_url`
     *   `trajectory_data`: (object, optional) Modeled ground track for the next launch. Ascent follows the pad and an inclination (51.6° for ISS crew/cargo, otherwise the orbit family, or a figure stated in the mission text). It is not a Flight Club or webcast telemetry path.
-        *   `trajectory`: (array) List of `{lat, lon, r}` points for ascent (starts at surface, radius 1.0).
+        *   `trajectory`: (array) Ascent ground track. Same azimuth as the orbit, shortened to the ground range of a linear speed ramp from rest to circular velocity (about half an orbital-rate coast).
         *   `orbit_path`: (array) List of `{lat, lon, r}` points for the rest of one modeled orbit.
-        *   `booster_trajectory`: (array) Empty unless Launch Library published an endpoint. A fixed zone more than 2 km from the pad is the geodesic between those surveyed points. A droneship with a downrange and no coordinates is the ascent azimuth out to that distance. Ocean splashdowns and on-pad RTLS zones do not get an invented curve.
-        *   `booster_ground_track`: (string or null) `landing_zone_offset`, `published_downrange`, or null.
+        *   `booster_trajectory`: (array) A piece of that same ground track. RTLS runs from staging back to the published landing coordinate. A droneship runs from staging out to the published downrange. Ocean splashdowns with no downrange are omitted. This is not a pad-to-pad marker and not a telemetry replay.
+        *   `booster_ground_track`: (string or null) `along_track_return`, `along_track_downrange`, or null.
         *   `landing_site`: (object or null) Published landing latitude/longitude when Launch Library has them.
         *   `inclination_deg`: (number) Inclination used for the ground track.
         *   `sep_idx`: (int or null) `0` when `booster_trajectory` is a standalone leg.
