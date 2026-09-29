@@ -2,20 +2,21 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 import requests
 import ast
 import re
 import redis
 import json
+import gzip
 import math
 import time
 import threading
 import zlib
 import base64
 import pytz
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
@@ -178,9 +179,18 @@ CELESTRAK_HEADERS = {
 }
 SATELLITE_GROUPS = ("starlink", "stations", "visual", "oneweb", "gps-ops", "weather")
 SATELLITES_CACHE_PREFIX = "satellites_gp_v1:"
+# Pre-rendered JSON (fresh + stale) so a cold dyno can return bytes without
+# rebuilding the 11k-record object graph on the request path.
+SATELLITES_HTTP_CACHE_PREFIX = "satellites_gp_http_v1:"
 SATELLITES_CACHE_TTL = 3600  # serve fresh for 1 hour
 SATELLITES_STALE_TTL = 48 * 3600  # Redis retains stale GP for fallback
-SATELLITES_FETCH_TIMEOUT = 45
+SATELLITES_FETCH_TIMEOUT = 45  # per-socket timeout; not a wall clock
+# Wall-clock cap. requests' timeout resets on every socket read, so a
+# trickle from CelesTrak can otherwise pin a worker well past Heroku's router.
+SATELLITES_GP_DEADLINE_SEC = 40
+# Cold request budget. Heroku's router returns 503 HTML at ~30s; stay under it.
+SATELLITES_REQUEST_BUDGET_SEC = 18
+SATELLITES_REFRESH_COOLDOWN_SEC = 60
 OMM_PROP_FIELDS = (
     "OBJECT_NAME",
     "OBJECT_ID",
@@ -207,7 +217,7 @@ SATELLITE_NOTE = (
 # slim recent-date index is cached (the raw catalog is ~4MB and is not stored).
 CELESTRAK_SATCAT_URL = "https://celestrak.org/satcat/records.php"
 CELESTRAK_SUP_GP_URL = "https://celestrak.org/NORAD/elements/supplemental/sup-gp.php"
-DEPLOYED_CACHE_PREFIX = "satellites_deployed_v1:"
+DEPLOYED_CACHE_PREFIX = "satellites_deployed_v2:"
 SATCAT_RECENT_CACHE_KEY = "satellites_satcat_starlink_recent_v1"
 SATCAT_RECENT_DAYS = 45
 DEPLOYED_SAT_CAP = 128  # matches the globe Points-shell append cap
@@ -226,6 +236,10 @@ SPACEX_POST_FALCON_STARLINK_ID_MIN = 40000
 SPACEX_EPHEM_CONCURRENCY = 8
 SPACEX_EPHEM_FETCH_TIMEOUT = 20
 SPACEX_EPHEM_BUDGET_SEC = 22
+# SpaceX republishes MEME files daily, so the window can start after the
+# launch calendar day. Still treat the file as this flight for a few weeks;
+# a much older launch date must not pick up today's post-Falcon set.
+MEME_ROLL_FORWARD_DAYS = 21
 SPACEX_EPHEM_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -266,7 +280,7 @@ class _SingleFlight:
         self._result = None
         self._error = None
 
-    def do(self, fn):
+    def do(self, fn, wait_timeout=None):
         leader = False
         with self._lock:
             if self._event is None:
@@ -276,9 +290,14 @@ class _SingleFlight:
                 leader = True
             event = self._event
         if not leader:
-            event.wait(timeout=REFRESH_LOCK_TTL)
-            if self._error is not None:
+            # Callers on the HTTP path pass a short wait so a refresh that is
+            # already running cannot hold them until Heroku's router times out.
+            timeout = REFRESH_LOCK_TTL if wait_timeout is None else wait_timeout
+            finished = event.wait(timeout=timeout)
+            if self._error is not None and (finished or wait_timeout is None):
                 raise self._error
+            if not finished:
+                return None
             return self._result
         try:
             self._result = fn()
@@ -311,8 +330,12 @@ _local_raw_launches = {}
 _local_hot_raw = {}
 _launches_mem = {"data": None, "at": 0.0}
 _local_satellites = {}
+_local_satellite_http = {}
 _satellite_flights = {}
 _satellite_flights_lock = threading.Lock()
+_satellite_refresh_lock = threading.Lock()
+_satellite_refresh_inflight = set()
+_satellite_refresh_after = {}
 _local_deployed = {}
 _local_satcat_index = None
 _deployed_flights = {}
@@ -342,6 +365,10 @@ def _reset_cache_coordination_for_tests():
     _launches_mem["data"] = None
     _launches_mem["at"] = 0.0
     _local_satellites.clear()
+    _local_satellite_http.clear()
+    with _satellite_refresh_lock:
+        _satellite_refresh_inflight.clear()
+        _satellite_refresh_after.clear()
     with _satellite_flights_lock:
         for flight in _satellite_flights.values():
             flight.reset()
@@ -355,7 +382,7 @@ def _reset_cache_coordination_for_tests():
         _deployed_flights.clear()
 
 
-def _redis_single_flight(name, fn):
+def _redis_single_flight(name, fn, wait_timeout=None):
     """Cross-process lock so multiple dyno workers don't stampede the same refresh."""
     if not r:
         return fn()
@@ -375,7 +402,8 @@ def _redis_single_flight(name, fn):
                     r.delete(lock_key)
             except Exception:
                 pass
-    deadline = time.time() + REFRESH_LOCK_TTL
+    timeout = REFRESH_LOCK_TTL if wait_timeout is None else wait_timeout
+    deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             if not r.exists(lock_key):
@@ -3233,9 +3261,149 @@ def _read_satellite_cache(group: str):
     return None
 
 
+def _satellite_http_cache_key(group: str) -> str:
+    return f"{SATELLITES_HTTP_CACHE_PREFIX}{group}"
+
+
+def _present_satellite_payload(payload: dict, *, stale: bool) -> dict:
+    """Shallow copy with an honest stale flag. Satellites are not copied."""
+    body = dict(payload)
+    body["stale"] = bool(stale)
+    body["ttl_seconds"] = SATELLITES_CACHE_TTL
+    return body
+
+
+def _render_satellite_http(payload: dict) -> dict:
+    """JSON and gzip bytes for the fresh and stale variants of one catalog."""
+    fresh = _present_satellite_payload(payload, stale=False)
+    stale = _present_satellite_payload(payload, stale=True)
+    json_fresh = json.dumps(fresh, separators=(",", ":")).encode("utf-8")
+    json_stale = json.dumps(stale, separators=(",", ":")).encode("utf-8")
+    count = payload.get("count")
+    if count is None:
+        count = len(payload.get("satellites") or [])
+    return {
+        "fetched_at": payload.get("fetched_at"),
+        "count": count,
+        "json_fresh": json_fresh,
+        "json_stale": json_stale,
+        "gzip_fresh": gzip.compress(json_fresh, compresslevel=6),
+        "gzip_stale": gzip.compress(json_stale, compresslevel=6),
+    }
+
+
+def _persist_satellite_http(group: str, doc: dict):
+    blob = {
+        "fetched_at": doc.get("fetched_at"),
+        "count": doc.get("count"),
+        "gzip_fresh": base64.b64encode(doc["gzip_fresh"]).decode("ascii"),
+        "gzip_stale": base64.b64encode(doc["gzip_stale"]).decode("ascii"),
+    }
+    set_cached_data(_satellite_http_cache_key(group), blob, ttl=SATELLITES_STALE_TTL)
+
+
+def _remember_satellite_http(group: str, payload: dict, persist: bool = True) -> dict:
+    """Keep pre-rendered response bytes so later requests do not re-serialize."""
+    with _satellite_refresh_lock:
+        existing = _local_satellite_http.get(group)
+        if (
+            existing
+            and existing.get("gzip_fresh")
+            and existing.get("fetched_at") == payload.get("fetched_at")
+        ):
+            return existing
+        doc = _render_satellite_http(payload)
+        _local_satellite_http[group] = doc
+    if not persist:
+        return doc
+    if _background_enabled:
+        threading.Thread(
+            target=_persist_satellite_http,
+            args=(group, doc),
+            daemon=True,
+            name=f"sat-http-{group}",
+        ).start()
+    else:
+        _persist_satellite_http(group, doc)
+    return doc
+
+
+def _read_satellite_http(group: str):
+    """Pre-rendered bytes only. Does not parse the satellite array."""
+    doc = _local_satellite_http.get(group)
+    if isinstance(doc, dict) and doc.get("gzip_fresh") and doc.get("gzip_stale"):
+        return doc
+    cached = get_cached_data(_satellite_http_cache_key(group))
+    if not isinstance(cached, dict):
+        return None
+    try:
+        gzip_fresh = base64.b64decode(cached["gzip_fresh"])
+        gzip_stale = base64.b64decode(cached["gzip_stale"])
+        doc = {
+            "fetched_at": cached.get("fetched_at"),
+            "count": cached.get("count"),
+            "gzip_fresh": gzip_fresh,
+            "gzip_stale": gzip_stale,
+            "json_fresh": gzip.decompress(gzip_fresh),
+            "json_stale": gzip.decompress(gzip_stale),
+        }
+    except Exception:
+        return None
+    _local_satellite_http[group] = doc
+    return doc
+
+
+def _client_accepts_gzip(request: Request) -> bool:
+    if request is None:
+        return False
+    accept = request.headers.get("accept-encoding") or ""
+    return "gzip" in accept.lower()
+
+
+def _encoded_satellite_response(doc: dict, request: Request, *, stale: bool, cache_state: str):
+    use_gzip = _client_accepts_gzip(request)
+    content = doc["gzip_stale" if stale else "gzip_fresh"] if use_gzip else doc[
+        "json_stale" if stale else "json_fresh"
+    ]
+    headers = {
+        "Vary": "Accept-Encoding",
+        "X-Satellite-Cache": cache_state,
+    }
+    if use_gzip:
+        headers["Content-Encoding"] = "gzip"
+    return Response(content=content, media_type="application/json", headers=headers)
+
+
+def _schedule_satellite_refresh(group: str):
+    """One background CelesTrak refresh per group. Never blocks the request."""
+    if not _background_enabled:
+        return
+    now = time.monotonic()
+    with _satellite_refresh_lock:
+        if group in _satellite_refresh_inflight:
+            return
+        if now < _satellite_refresh_after.get(group, 0):
+            return
+        _satellite_refresh_inflight.add(group)
+        _satellite_refresh_after[group] = now + SATELLITES_REFRESH_COOLDOWN_SEC
+
+    def _run():
+        try:
+            print(f"Background satellite GP refresh starting for {group}")
+            refresh_satellites_internal(group)
+        except Exception as exc:
+            print(f"Background satellite GP refresh failed for {group}: {exc}")
+        finally:
+            with _satellite_refresh_lock:
+                _satellite_refresh_inflight.discard(group)
+
+    threading.Thread(target=_run, daemon=True, name=f"sat-refresh-{group}").start()
+
+
 def _write_satellite_cache(group: str, payload: dict):
     _local_satellites[group] = payload
     set_cached_data(_satellite_cache_key(group), payload, ttl=SATELLITES_STALE_TTL)
+    _remember_satellite_http(group, payload, persist=True)
 
 
 def _satellite_payload(group: str, satellites: list, stale: bool = False) -> dict:
@@ -3251,67 +3419,127 @@ def _satellite_payload(group: str, satellites: list, stale: bool = False) -> dic
     }
 
 
-def fetch_celestrak_gp(group: str) -> list:
-    """Fetch GP/OMM JSON for an allowlisted CelesTrak group and slim it."""
-    increment_metric("api_calls")
-    params = {"GROUP": group, "FORMAT": "JSON"}
-    response = requests.get(
-        CELESTRAK_GP_URL,
-        params=params,
-        headers=CELESTRAK_HEADERS,
-        timeout=SATELLITES_FETCH_TIMEOUT,
-    )
-    response.raise_for_status()
+def _run_with_deadline(fn, seconds: float):
+    """Run ``fn`` and abandon the wait when the wall clock expires.
+
+    ``requests`` timeouts are per socket read. A slow trickle still completes
+    them and can sit on a dyno until Heroku's router kills the HTTP request.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn)
     try:
-        data = response.json()
-    except ValueError as exc:
-        raise ValueError("CelesTrak returned non-JSON GP data") from exc
-    if not isinstance(data, list):
-        raise ValueError("CelesTrak GP JSON was not a list")
-    satellites = []
-    for item in data:
-        if not isinstance(item, dict) or item.get("NORAD_CAT_ID") is None:
-            continue
-        satellites.append(slim_gp_record(item))
-    if not satellites:
-        raise ValueError(f"CelesTrak returned no GP records for group={group}")
-    return satellites
+        return future.result(timeout=seconds)
+    except FuturesTimeout:
+        raise TimeoutError(f"operation exceeded {seconds:.0f}s") from None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _refresh_satellites_uncached(group: str, force: bool = False):
+def fetch_celestrak_gp(group: str, deadline: float = None) -> list:
+    """Fetch GP/OMM JSON for an allowlisted CelesTrak group and slim it."""
+    seconds = SATELLITES_GP_DEADLINE_SEC if deadline is None else deadline
+    increment_metric("api_calls")
+
+    def _download():
+        params = {"GROUP": group, "FORMAT": "JSON"}
+        response = requests.get(
+            CELESTRAK_GP_URL,
+            params=params,
+            headers=CELESTRAK_HEADERS,
+            timeout=SATELLITES_FETCH_TIMEOUT,
+        )
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ValueError("CelesTrak returned non-JSON GP data") from exc
+        if not isinstance(data, list):
+            raise ValueError("CelesTrak GP JSON was not a list")
+        satellites = []
+        for item in data:
+            if not isinstance(item, dict) or item.get("NORAD_CAT_ID") is None:
+                continue
+            satellites.append(slim_gp_record(item))
+        if not satellites:
+            raise ValueError(f"CelesTrak returned no GP records for group={group}")
+        return satellites
+
+    try:
+        return _run_with_deadline(_download, seconds)
+    except TimeoutError:
+        print(f"CelesTrak GP deadline ({seconds:.0f}s) exceeded for group={group}")
+        raise
+
+
+def _refresh_satellites_uncached(group: str, force: bool = False, deadline: float = None):
     cached = _read_satellite_cache(group)
     if not force and cached and satellite_cache_is_fresh(cached):
-        cached["stale"] = False
-        cached["ttl_seconds"] = SATELLITES_CACHE_TTL
-        return cached
+        return _present_satellite_payload(cached, stale=False)
 
     try:
-        satellites = fetch_celestrak_gp(group)
+        satellites = fetch_celestrak_gp(group, deadline=deadline)
         payload = _satellite_payload(group, satellites, stale=False)
         _write_satellite_cache(group, payload)
         return payload
     except Exception as exc:
         print(f"Error fetching CelesTrak GP for {group}: {exc}")
         if cached and cached.get("satellites") is not None:
-            stale = dict(cached)
-            stale["stale"] = True
-            stale["ttl_seconds"] = SATELLITES_CACHE_TTL
-            _local_satellites[group] = stale
-            return stale
+            return _present_satellite_payload(cached, stale=True)
         raise
 
 
-def refresh_satellites_internal(group: str = "starlink", force: bool = False):
+def refresh_satellites_internal(
+    group: str = "starlink",
+    force: bool = False,
+    wait_timeout: float = None,
+    deadline: float = None,
+):
     """Load cached GP or refresh from CelesTrak (single-flight per group)."""
     group = _normalize_satellite_group(group)
 
     def _do():
-        return _redis_single_flight(
+        result = _redis_single_flight(
             f"satellites_{group}",
-            lambda: _refresh_satellites_uncached(group, force=force),
+            lambda: _refresh_satellites_uncached(group, force=force, deadline=deadline),
+            wait_timeout=wait_timeout,
         )
+        if result is None and wait_timeout is not None:
+            cached = _read_satellite_cache(group)
+            if cached and cached.get("satellites") is not None:
+                return _present_satellite_payload(
+                    cached, stale=not satellite_cache_is_fresh(cached)
+                )
+            raise TimeoutError(
+                f"Satellite GP refresh for {group} exceeded the request budget"
+            )
+        return result
 
-    return _get_satellite_flight(group).do(_do)
+    return _get_satellite_flight(group).do(_do, wait_timeout=wait_timeout)
+
+
+def _resolve_satellite_payload(group: str, force: bool = False):
+    """Return ``(payload, cache_state)``.
+
+    A stored catalog is returned immediately, fresh or stale. CelesTrak runs
+    on the request only when the cache is empty (bounded) or ``force`` is set.
+    """
+    if not force:
+        cached = _read_satellite_cache(group)
+        if cached and cached.get("satellites") is not None:
+            fresh = satellite_cache_is_fresh(cached)
+            if not fresh:
+                _schedule_satellite_refresh(group)
+            state = "hit" if fresh else "stale"
+            return _present_satellite_payload(cached, stale=not fresh), state
+    payload = refresh_satellites_internal(
+        group,
+        force=force,
+        wait_timeout=SATELLITES_REQUEST_BUDGET_SEC,
+        deadline=SATELLITES_REQUEST_BUDGET_SEC,
+    )
+    if not isinstance(payload, dict) or payload.get("satellites") is None:
+        raise TimeoutError(f"Satellite GP unavailable for group={group}")
+    return payload, "miss"
 
 
 def _satellite_meta_from_payload(group: str, payload):
@@ -3493,19 +3721,36 @@ def get_satellites_gp(
     group: str = Query("starlink", description="CelesTrak GROUP (allowlisted)"),
     force: bool = False,
     internal: bool = False,
+    request: Request = None,
 ):
     """Return slim GP records for satellite.js / SGP4 (not live telemetry).
 
     Default `group=starlink`. Cached ~1 hour in Redis (in-memory fallback).
-    On CelesTrak failure, a stale copy is served when one exists.
+    A stale copy is returned immediately and refreshed in the background.
+    CelesTrak is contacted on the request only when nothing is cached, and
+    that fetch is capped so Heroku's router does not turn it into a 503.
+    Clients that send ``Accept-Encoding: gzip`` receive a gzip body.
     """
     if not internal:
         increment_metric("total_requests")
     group = _normalize_satellite_group(group)
-    cached = None if force else _read_satellite_cache(group)
-    serving_fresh = bool(cached and satellite_cache_is_fresh(cached))
+    if request is not None and not force:
+        doc = _read_satellite_http(group)
+        if doc is None:
+            cached = _read_satellite_cache(group)
+            if cached and cached.get("satellites") is not None:
+                doc = _remember_satellite_http(group, cached)
+        if doc is not None:
+            fresh = satellite_cache_is_fresh(doc)
+            if not fresh:
+                _schedule_satellite_refresh(group)
+            state = "hit" if fresh else "stale"
+            increment_metric("cache_hits")
+            return _encoded_satellite_response(
+                doc, request, stale=not fresh, cache_state=state
+            )
     try:
-        payload = refresh_satellites_internal(group, force=force)
+        payload, state = _resolve_satellite_payload(group, force=force)
     except HTTPException:
         raise
     except Exception as exc:
@@ -3513,11 +3758,21 @@ def get_satellites_gp(
             status_code=502,
             detail=f"Satellite GP unavailable for group '{group}': {exc}",
         )
-    if serving_fresh:
-        increment_metric("cache_hits")
-    else:
+    if state == "miss":
         increment_metric("cache_misses")
-    return payload
+    else:
+        increment_metric("cache_hits")
+    if request is None:
+        return payload
+    doc = _local_satellite_http.get(group)
+    if not isinstance(doc, dict) or not doc.get("gzip_fresh"):
+        doc = _remember_satellite_http(group, payload)
+    return _encoded_satellite_response(
+        doc,
+        request,
+        stale=bool(payload.get("stale")),
+        cache_state=state,
+    )
 
 
 @app.get(
@@ -3525,9 +3780,15 @@ def get_satellites_gp(
     tags=["Satellites"],
     summary="Cached Starlink GP / TLE (alias for /satellites/gp?group=starlink)",
 )
-def get_satellites_starlink(force: bool = False, internal: bool = False):
+def get_satellites_starlink(
+    force: bool = False,
+    internal: bool = False,
+    request: Request = None,
+):
     """Convenience alias for the Starlink CelesTrak group."""
-    return get_satellites_gp(group="starlink", force=force, internal=internal)
+    return get_satellites_gp(
+        group="starlink", force=force, internal=internal, request=request
+    )
 
 
 @app.get(
@@ -4059,15 +4320,34 @@ def manifest_starlink_filenames(text: str) -> list:
     return [(sid, found[sid]) for sid in sorted(found)]
 
 
-def _meme_window_covers(header: dict, launch_date: str) -> bool:
-    """True when the published ephemeris window includes the launch calendar day."""
+def _meme_window_covers(header: dict, launch_date: str, when: datetime = None) -> bool:
+    """True when this MEME file belongs to the launch.
+
+    The published window must include the launch calendar day, or it must have
+    rolled forward (start on or after the launch day) and still cover ``when``.
+    Files that start before the launch day are not this deployment.
+    """
     try:
         day = datetime.strptime(launch_date, "%Y-%m-%d").date()
     except ValueError:
         return False
     start, stop = header.get("start"), header.get("stop")
     if start is not None and stop is not None:
-        return start.date() <= day <= stop.date()
+        if start.date() <= day <= stop.date():
+            return True
+        moment = None
+        if when is not None:
+            aware = _as_utc(when)
+            if aware is not None:
+                moment = aware.date()
+        roll_end = day + timedelta(days=MEME_ROLL_FORWARD_DAYS)
+        if (
+            moment is not None
+            and day <= start.date() <= roll_end
+            and start.date() <= moment <= stop.date()
+        ):
+            return True
+        return False
     created = header.get("created")
     return bool(created and created.date() == day)
 
@@ -4121,7 +4401,7 @@ def meme_state_from_lines(lines, launch_date: str, when: datetime):
                 header["stop"] = _parse_meme_stamp(" ".join(stamps[1]))
             # Reject before the state table so a streamed download can close.
             if header["start"] is not None and header["stop"] is not None:
-                if not _meme_window_covers(header, launch_date):
+                if not _meme_window_covers(header, launch_date, when):
                     return None
             continue
         match = _MEME_EPOCH_RE.match(line)
@@ -4140,7 +4420,7 @@ def meme_state_from_lines(lines, launch_date: str, when: datetime):
         else:
             nxt = sample
             break
-    if not _meme_window_covers(header, launch_date):
+    if not _meme_window_covers(header, launch_date, when):
         return None
     return _select_meme_state(prev, nxt, when)
 
@@ -5584,8 +5864,9 @@ def start_background_worker():
                     last_run["weather"] = now
 
                 # Starlink / stations GP hourly (CelesTrak asks not to hammer).
-                # The deployed feed is included; a manifest-backed copy expires
-                # sooner and the next request refetches it.
+                # Request handlers serve the cached catalog immediately; this
+                # refresh stays off the Heroku request path. The deployed feed
+                # is included; a manifest-backed copy expires sooner.
                 if now - last_run["satellites"] >= SATELLITES_CACHE_TTL:
                     try:
                         refresh_satellites_internal("starlink")
