@@ -302,13 +302,14 @@ Cached CelesTrak General Perturbations (GP / OMM) for the SpaceX dashboard Three
     *   **Parameters:**
         *   `launch_date` (optional, `YYYY-MM-DD`) — UTC SATCAT launch date. Omit to use the NET date of the Starship launch whose mission text contains `v3` or `group 31-` (Flight 14 is `Starship | Starlink Group 31-1`).
         *   `force=true` (optional) — bypass the fresh cache and refetch SATCAT.
-    *   **Source:** CelesTrak SATCAT `GROUP=starlink`, filtered to that `LAUNCH_DATE`. Decayed objects, rocket bodies, and debris are dropped. Remaining payloads are joined to GP TLEs by NORAD (the cached Starlink GP feed, then `gp.php?INTDES=`, then supplemental GP only for catalog numbers the main set does not have). Same-day Starlink rows are included. **No positions are invented.**
-    *   **Caching:** Fresh for 1 hour (Redis key `satellites_deployed_v1:{date}`, in-memory fallback). A slim recent SATCAT index is kept the same way. Stale copies are kept ~48 hours. The raw multi-megabyte SATCAT download is not stored.
+    *   **Source:** CelesTrak SATCAT `GROUP=starlink`, filtered to that `LAUNCH_DATE`, is preferred once it lists the flight. Decayed objects, rocket bodies, and debris are dropped. Remaining payloads are joined to GP TLEs by NORAD (the cached Starlink GP feed, then `gp.php?INTDES=`, then supplemental GP only for catalog numbers the main set does not have). Same-day Starlink rows are included. **No positions are invented.**
+    *   **Before SATCAT catalogs the flight:** SpaceX public MEME ephemerides (`https://api.starlink.com/public-files/ephemerides/MANIFEST.txt`, files only — not the operator portal). Candidates are `STARLINK-` ids in the post-Falcon band (id ≥ 40000) whose ephemeris window covers the launch date. Each file's inertial state is interpolated at request time into `lat` / `lon` / `alt_km` and an osculating TLE so the existing globe propagator can draw it. `source` is `spacex-manifest-ephemeris`. `norad_id` is omitted until CelesTrak assigns one; `id` / `name` are the SpaceX `STARLINK-` name. When SATCAT later has TLEs for that date, the same endpoint switches back to `celestrak-satcat`.
+    *   **Caching:** SATCAT-backed copies are fresh for 1 hour (Redis key `satellites_deployed_v1:{date}`, in-memory fallback). Manifest-backed copies and honest empties are fresh for 10 minutes so a newly published ephemeris is not stuck behind an empty SATCAT cache. Stale copies are kept ~48 hours. Raw multi-megabyte files are not stored; only the parsed satellite records are.
     *   **Response fields the globe reads:**
-        *   `satellites`: `{name, norad_id, tle_line1, tle_line2}` — same compact shape as `/satellites/gp`. Both TLE lines are required; `generation` is `v3` on each row when the launch text says so.
-        *   `catalog_count`: SATCAT matches before the TLE join. `catalog_count > 0` with no TLE lines → dashboard `catalog-no-tle`.
+        *   `satellites`: `{name, norad_id, tle_line1, tle_line2}` for SATCAT, or `{name, id, lat, lon, alt_km, epoch, tle_line1, tle_line2}` for the manifest bridge. Both TLE lines are required; `generation` is `v3` on each row when the launch text says so. Rows without both TLE lines are ignored by the globe.
+        *   `catalog_count`: SATCAT matches before the TLE join, or the ephemeris count on the manifest path. `catalog_count > 0` with no TLE lines → dashboard `catalog-no-tle`.
         *   `note`: contains `unavailable` only when SATCAT could not be fetched and nothing is cached → dashboard `satcat-unavailable`. An honest empty catalog does **not** say unavailable → dashboard `awaiting-catalog`.
-        *   `source`: `celestrak-satcat`.
+        *   `source`: `celestrak-satcat` or `spacex-manifest-ephemeris`.
     *   **Also returned:** `launch_date`, `generation`, `mission`, `fetched_at`, `ttl_seconds`, `count`, `stale`, `empty`.
     *   **Sample (SATCAT has no rows for the flight date yet):**
 ```json
@@ -317,7 +318,7 @@ Cached CelesTrak General Perturbations (GP / OMM) for the SpaceX dashboard Three
   "generation": "v3",
   "mission": "Starship | Starlink Group 31-1 (Starship Flight 14)",
   "fetched_at": "2026-09-28T14:00:00Z",
-  "ttl_seconds": 3600,
+  "ttl_seconds": 600,
   "count": 0,
   "catalog_count": 0,
   "stale": false,
