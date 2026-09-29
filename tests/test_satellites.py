@@ -283,12 +283,17 @@ class SatelliteGpTests(unittest.TestCase):
              patch.object(app.requests, "get", return_value=fake):
             app.refresh_satellites_internal("weather")
 
-        self.assertEqual(len(persisted), 1)
-        key, data, ttl = persisted[0]
-        self.assertEqual(key, "satellites_gp_v1:weather")
-        self.assertEqual(ttl, app.SATELLITES_STALE_TTL)
-        self.assertEqual(data["count"], 1)
-        self.assertEqual(data["satellites"][0]["name"], "ISS (ZARYA)")
+        keys = [item[0] for item in persisted]
+        self.assertIn("satellites_gp_v1:weather", keys)
+        self.assertIn("satellites_gp_http_v1:weather", keys)
+        gp = next(item for item in persisted if item[0] == "satellites_gp_v1:weather")
+        http = next(item for item in persisted if item[0] == "satellites_gp_http_v1:weather")
+        self.assertEqual(gp[2], app.SATELLITES_STALE_TTL)
+        self.assertEqual(http[2], app.SATELLITES_STALE_TTL)
+        self.assertEqual(gp[1]["count"], 1)
+        self.assertEqual(gp[1]["satellites"][0]["name"], "ISS (ZARYA)")
+        self.assertIn("gzip_fresh", http[1])
+        self.assertIn("gzip_stale", http[1])
 
     def test_redis_stale_fallback_when_memory_empty(self):
         stale_payload = {
@@ -344,6 +349,149 @@ class SatelliteGpTests(unittest.TestCase):
         self.assertIn("Satellites", dumped)
         self.assertIn("starlink", dumped)
         self.assertIn("SGP4", dumped)
+
+    def test_stale_catalog_does_not_wait_on_celestrak(self):
+        payload = app._satellite_payload(
+            "starlink", [app.slim_gp_record(STARLINK_OMM)]
+        )
+        payload["fetched_at"] = "2020-01-01T00:00:00Z"
+        app._local_satellites["starlink"] = payload
+
+        def slow_get(*args, **kwargs):
+            time.sleep(5)
+            return _json_response([ISS_OMM])
+
+        from fastapi.testclient import TestClient
+
+        started = time.perf_counter()
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=slow_get) as get, \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            response = client.get(
+                "/satellites/starlink",
+                headers={"Accept-Encoding": "identity"},
+            )
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(get.call_count, 0)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("content-encoding", response.headers)
+        self.assertEqual(response.headers.get("x-satellite-cache"), "stale")
+        body = response.json()
+        self.assertTrue(body["stale"])
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["satellites"][0]["norad_id"], 44714)
+        self.assertEqual(response.content, app._local_satellite_http["starlink"]["json_stale"])
+
+    def test_gzip_starlink_body_is_precomputed(self):
+        import gzip as gzip_mod
+        from fastapi.testclient import TestClient
+
+        payload = app._satellite_payload("starlink", [app.slim_gp_record(ISS_OMM)])
+        app._write_satellite_cache("starlink", payload)
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=AssertionError("upstream")), \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            response = client.get(
+                "/satellites/gp",
+                params={"group": "starlink"},
+                headers={"Accept-Encoding": "gzip"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("content-encoding"), "gzip")
+        self.assertEqual(response.headers.get("x-satellite-cache"), "hit")
+        self.assertIn("accept-encoding", response.headers.get("vary", "").lower())
+        raw = response.content
+        # httpx may already have decompressed. Accept either the gzip bytes
+        # or the decoded JSON, and require both to match the precomputed body.
+        doc = app._local_satellite_http["starlink"]
+        if raw[:2] == b"\x1f\x8b":
+            self.assertEqual(raw, doc["gzip_fresh"])
+            decoded = gzip_mod.decompress(raw)
+        else:
+            decoded = raw
+        self.assertEqual(decoded, doc["json_fresh"])
+        self.assertFalse(json.loads(decoded)["stale"])
+        self.assertEqual(json.loads(decoded)["count"], 1)
+
+    def test_cold_gp_deadline_is_json_502_not_a_hang(self):
+        from fastapi.testclient import TestClient
+
+        def slow_get(*args, **kwargs):
+            time.sleep(3)
+            return _json_response([STARLINK_OMM])
+
+        started = time.perf_counter()
+        with patch.object(app, "r", None), \
+             patch.object(app, "SATELLITES_REQUEST_BUDGET_SEC", 0.35), \
+             patch.object(app.requests, "get", side_effect=slow_get), \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            response = client.get("/satellites/starlink")
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(response.status_code, 502)
+        self.assertLess(elapsed, 2.0)
+        self.assertIn("unavailable", response.json()["detail"].lower())
+        self.assertIn("application/json", response.headers.get("content-type", ""))
+
+    def test_stale_cache_schedules_one_background_refresh(self):
+        payload = app._satellite_payload("stations", [app.slim_gp_record(ISS_OMM)])
+        payload["fetched_at"] = "2020-01-01T00:00:00Z"
+        app._local_satellites["stations"] = payload
+        started = threading.Event()
+
+        def fake_refresh(group="starlink", force=False, wait_timeout=None, deadline=None):
+            started.set()
+            return payload
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "_background_enabled", True), \
+             patch.object(app, "refresh_satellites_internal", side_effect=fake_refresh):
+            first = app.get_satellites_gp(group="stations", internal=True)
+            second = app.get_satellites_gp(group="stations", internal=True)
+            self.assertTrue(started.wait(1.0))
+
+        self.assertTrue(first["stale"])
+        self.assertTrue(second["stale"])
+        self.assertEqual(first["satellites"][0]["norad_id"], 25544)
+
+    def test_http_bytes_roundtrip_without_satellite_objects(self):
+        payload = app._satellite_payload("oneweb", [app.slim_gp_record(STARLINK_OMM)])
+        doc = app._render_satellite_http(payload)
+        blob = {
+            "fetched_at": doc["fetched_at"],
+            "count": doc["count"],
+            "gzip_fresh": __import__("base64").b64encode(doc["gzip_fresh"]).decode("ascii"),
+            "gzip_stale": __import__("base64").b64encode(doc["gzip_stale"]).decode("ascii"),
+        }
+
+        def cached(key):
+            if key == app._satellite_http_cache_key("oneweb"):
+                return blob
+            raise AssertionError(f"unexpected cache read {key}")
+
+        from fastapi.testclient import TestClient
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "get_cached_data", side_effect=cached), \
+             patch.object(app.requests, "get", side_effect=AssertionError("upstream")), \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            response = client.get(
+                "/satellites/gp",
+                params={"group": "oneweb"},
+                headers={"Accept-Encoding": "identity"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, doc["json_fresh"])
+        self.assertEqual(response.json()["count"], 1)
+        self.assertEqual(response.json()["satellites"][0]["name"], "STARLINK-1008")
 
 
 def _satcat_row(name, norad, object_id, launch_date, object_type="PAY", decay=""):
@@ -768,12 +916,35 @@ class ManifestEphemerisTests(unittest.TestCase):
         self.assertAlmostEqual(mid_rec["lon"], 96.07876, places=3)
         self.assertAlmostEqual(mid_rec["alt_km"], 257.511, places=2)
 
+        # A launch well outside the roll-forward window must not inherit this file.
         self.assertIsNone(
-            app.meme_state_from_lines(_MEME_SAMPLE.splitlines(), "2026-09-27", when)
+            app.meme_state_from_lines(_MEME_SAMPLE.splitlines(), "2026-08-01", when)
         )
         self.assertIsNone(
             app.meme_state_from_lines(_MEME_OLD.splitlines(), "2026-09-28", when)
         )
+
+    def test_rolled_forward_window_still_matches_the_launch(self):
+        from datetime import datetime, timezone
+
+        rolled = {
+            "created": datetime(2026, 9, 29, 2, 11, 53, tzinfo=timezone.utc),
+            "start": datetime(2026, 9, 29, 2, 8, 42, tzinfo=timezone.utc),
+            "stop": datetime(2026, 10, 1, 2, 7, 42, tzinfo=timezone.utc),
+        }
+        now = datetime(2026, 9, 29, 4, 0, tzinfo=timezone.utc)
+        self.assertFalse(app._meme_window_covers(rolled, "2026-09-28"))
+        self.assertTrue(app._meme_window_covers(rolled, "2026-09-28", now))
+        before_launch = {
+            "start": datetime(2026, 9, 27, 0, 0, tzinfo=timezone.utc),
+            "stop": datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc),
+        }
+        self.assertTrue(app._meme_window_covers(before_launch, "2026-09-28", now))
+        too_old = {
+            "start": datetime(2020, 1, 1, tzinfo=timezone.utc),
+            "stop": datetime(2020, 1, 2, tzinfo=timezone.utc),
+        }
+        self.assertFalse(app._meme_window_covers(too_old, "2026-09-28", now))
 
     def test_satcat_miss_manifest_hit_returns_flight_14_set(self):
         manifest_lines = [
@@ -883,6 +1054,52 @@ class ManifestEphemerisTests(unittest.TestCase):
             [url for url, _params in calls],
             [app.CELESTRAK_SATCAT_URL, app.SPACEX_MANIFEST_URL],
         )
+
+    def test_rolled_forward_manifest_fills_flight_14(self):
+        """SpaceX republishes MEMEs the day after launch. The window no longer
+        contains the launch date, but the post-Falcon ids are still this flight.
+        """
+        from datetime import datetime, timezone
+
+        class _RolledNow(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                stamp = cls(2026, 9, 29, 4, 0, 30, tzinfo=timezone.utc)
+                if tz is not None:
+                    return stamp.astimezone(tz)
+                return stamp
+
+        rolled = _MEME_SAMPLE.replace(
+            "created:2026-09-28 17:01:25 UTC",
+            "created:2026-09-29 02:11:53 UTC",
+        ).replace(
+            "ephemeris_start:2026-09-28 16:58:42 UTC ephemeris_stop:2026-09-30 16:57:42 UTC step_size:60",
+            "ephemeris_start:2026-09-29 02:08:42 UTC ephemeris_stop:2026-10-01 02:07:42 UTC step_size:60",
+        ).replace(
+            "2026271165842.000",
+            "2026272035950.000",
+        ).replace(
+            "2026271165942.000",
+            "2026272040050.000",
+        )
+        name = _f14_filename(40075)
+        router = DeployedSatelliteTests()
+        fake_get, calls = router._route_celestrak(
+            [],
+            manifest=name + "\n",
+            ephemerides={name: rolled},
+        )
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", _RolledNow), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["source"], "spacex-manifest-ephemeris")
+        self.assertEqual(body["count"], 1)
+        self.assertFalse(body["empty"])
+        self.assertEqual(body["satellites"][0]["id"], "STARLINK-40075")
+        self.assertEqual(len(body["satellites"][0]["tle_line1"]), 69)
+        self.assertTrue(any(url == app.SPACEX_MANIFEST_URL for url, _params in calls))
 
 
 if __name__ == "__main__":
