@@ -15,6 +15,7 @@ import threading
 import zlib
 import base64
 import pytz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env if present
@@ -49,9 +50,11 @@ app = FastAPI(
             "name": "Satellites",
             "description": (
                 "Cached CelesTrak GP/OMM element sets (Starlink, stations, and a "
-                "small allowlist) plus SATCAT-backed deployed Starlink TLEs for "
-                "the recent Starship V3 flight. Clients should propagate with "
-                "SGP4 (e.g. satellite.js); this is not live telemetry."
+                "small allowlist) plus deployed Starlink TLEs for the recent "
+                "Starship V3 flight. SATCAT GP is preferred once cataloged; "
+                "until then, SpaceX public MEME ephemerides fill the same "
+                "TLE shape. Clients propagate with SGP4 (e.g. satellite.js); "
+                "this is not live telemetry."
             ),
         },
     ],
@@ -210,6 +213,43 @@ SATCAT_RECENT_DAYS = 45
 DEPLOYED_SAT_CAP = 128  # matches the globe Points-shell append cap
 DEPLOYED_INTDES_CAP = 4
 DEPLOYED_SOURCE = "celestrak-satcat"
+# Pre-catalog bridge. SATCAT is still preferred once it lists the launch date.
+DEPLOYED_MANIFEST_SOURCE = "spacex-manifest-ephemeris"
+DEPLOYED_MANIFEST_TTL = 600  # OEM coast; shorter than the 1h SATCAT GP cache
+DEPLOYED_EMPTY_TTL = 600  # do not pin a SATCAT miss for an hour
+SPACEX_EPHEM_BASE = "https://api.starlink.com/public-files/ephemerides/"
+SPACEX_MANIFEST_URL = SPACEX_EPHEM_BASE + "MANIFEST.txt"
+# Falcon-era STARLINK ids in the public manifest top out below this
+# (38451 on 2026-09-28). 40xxx is the post-Falcon series SpaceX publishes
+# before CelesTrak assigns catalog numbers (Flight 14: 40075–40103).
+SPACEX_POST_FALCON_STARLINK_ID_MIN = 40000
+SPACEX_EPHEM_CONCURRENCY = 8
+SPACEX_EPHEM_FETCH_TIMEOUT = 20
+SPACEX_EPHEM_BUDGET_SEC = 22
+SPACEX_EPHEM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/plain,*/*",
+}
+# MEME rows are inertial km / km/s. UVW names the covariance block, not the state.
+_EARTH_MU_KM3_S2 = 398600.4418
+_WGS84_A_KM = 6378.137
+_WGS84_E2 = (1.0 / 298.257223563) * (2.0 - 1.0 / 298.257223563)
+_MANIFEST_NAME_RE = re.compile(
+    r"(MEME_\d+_STARLINK-(\d+)_\d+_Operational_\d+_UNCLASSIFIED\.txt)"
+)
+_MEME_EPOCH_RE = re.compile(
+    r"^(?P<epoch>\d{13}(?:\.\d+)?)\s+"
+    r"(?P<x>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s+"
+    r"(?P<y>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s+"
+    r"(?P<z>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s+"
+    r"(?P<vx>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s+"
+    r"(?P<vy>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s+"
+    r"(?P<vz>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
+)
+_MEME_STAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
 _INTDES_RE = re.compile(r"^(\d{4}-\d{3})")
 _TLE_ALPHA5 = "ABCDEFGHJKLMNPQRSTUVWXYZ"  # I and O omitted (Space-Track alpha-5)
 
@@ -3849,6 +3889,425 @@ def _join_deployed_tles(catalog_rows, generation) -> list:
     return satellites
 
 
+def _gmst_rad(dt: datetime) -> float:
+    """Greenwich mean sidereal time, radians. Matches the dashboard's Vallado form."""
+    dt = dt.astimezone(timezone.utc)
+    y, m = dt.year, dt.month
+    if m <= 2:
+        y -= 1
+        m += 12
+    a = y // 100
+    b = 2 - a + a // 4
+    day = (
+        dt.day
+        + (dt.hour + dt.minute / 60.0 + dt.second / 3600.0 + dt.microsecond / 3.6e9) / 24.0
+    )
+    jd = int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + day + b - 1524.5
+    tut1 = (jd - 2451545.0) / 36525.0
+    gmst_sec = (
+        67310.54841
+        + (876600.0 * 3600.0 + 8640184.812866) * tut1
+        + 0.093104 * tut1 * tut1
+        - 6.2e-6 * tut1 * tut1 * tut1
+    )
+    return math.radians((gmst_sec % 86400.0) / 240.0)
+
+
+def _teme_to_ecef(r, dt: datetime):
+    """Rotate an inertial position into ECEF. z is the Earth axis, so it is unchanged."""
+    theta = _gmst_rad(dt)
+    c, s = math.cos(theta), math.sin(theta)
+    x, y, z = r
+    return (c * x + s * y, -s * x + c * y, z)
+
+
+def _ecef_to_geodetic(x: float, y: float, z: float):
+    """WGS84 latitude (deg), longitude (deg), altitude (km)."""
+    lon = math.atan2(y, x)
+    p = math.hypot(x, y)
+    lat = math.atan2(z, p * (1.0 - _WGS84_E2))
+    alt = 0.0
+    for _ in range(6):
+        sin_lat = math.sin(lat)
+        n = _WGS84_A_KM / math.sqrt(1.0 - _WGS84_E2 * sin_lat * sin_lat)
+        cos_lat = math.cos(lat)
+        if abs(cos_lat) < 1e-8:
+            alt = abs(z) - _WGS84_A_KM * (1.0 - 1.0 / 298.257223563)
+        else:
+            alt = p / cos_lat - n
+        lat = math.atan2(z, p * (1.0 - _WGS84_E2 * n / (n + alt)))
+    return (
+        math.degrees(lat),
+        (math.degrees(lon) + 180.0) % 360.0 - 180.0,
+        alt,
+    )
+
+
+def _inertial_to_kepler(r, v) -> Optional[dict]:
+    """Osculating Keplerian elements from an inertial state (km, km/s)."""
+    rx, ry, rz = r
+    vx, vy, vz = v
+    rmag = math.sqrt(rx * rx + ry * ry + rz * rz)
+    vmag2 = vx * vx + vy * vy + vz * vz
+    if rmag < 6000.0 or vmag2 <= 0.0:
+        return None
+    hx = ry * vz - rz * vy
+    hy = rz * vx - rx * vz
+    hz = rx * vy - ry * vx
+    hmag = math.sqrt(hx * hx + hy * hy + hz * hz)
+    if hmag < 1e-6:
+        return None
+    nx, ny = -hy, hx
+    nmag = math.hypot(nx, ny)
+    rdotv = rx * vx + ry * vy + rz * vz
+    mu_over_r = _EARTH_MU_KM3_S2 / rmag
+    ex = ((vmag2 - mu_over_r) * rx - rdotv * vx) / _EARTH_MU_KM3_S2
+    ey = ((vmag2 - mu_over_r) * ry - rdotv * vy) / _EARTH_MU_KM3_S2
+    ez = ((vmag2 - mu_over_r) * rz - rdotv * vz) / _EARTH_MU_KM3_S2
+    ecc = math.sqrt(ex * ex + ey * ey + ez * ez)
+    energy = vmag2 / 2.0 - _EARTH_MU_KM3_S2 / rmag
+    if energy >= 0.0 or ecc >= 0.9:
+        return None
+    sma = -_EARTH_MU_KM3_S2 / (2.0 * energy)
+    inc = math.acos(max(-1.0, min(1.0, hz / hmag)))
+    if nmag < 1e-8:
+        raan = 0.0
+    else:
+        raan = math.acos(max(-1.0, min(1.0, nx / nmag)))
+        if ny < 0.0:
+            raan = 2.0 * math.pi - raan
+    if nmag < 1e-8 or ecc < 1e-8:
+        argp = 0.0
+    else:
+        argp = math.acos(max(-1.0, min(1.0, (nx * ex + ny * ey) / (nmag * ecc))))
+        if ez < 0.0:
+            argp = 2.0 * math.pi - argp
+    if ecc < 1e-8:
+        nu = 0.0
+    else:
+        nu = math.acos(max(-1.0, min(1.0, (ex * rx + ey * ry + ez * rz) / (ecc * rmag))))
+        if rdotv < 0.0:
+            nu = 2.0 * math.pi - nu
+    cos_e = (ecc + math.cos(nu)) / (1.0 + ecc * math.cos(nu))
+    sin_e = (
+        math.sqrt(max(0.0, 1.0 - ecc * ecc)) * math.sin(nu)
+        / (1.0 + ecc * math.cos(nu))
+    )
+    ecc_anom = math.atan2(sin_e, cos_e)
+    mean_anom = (ecc_anom - ecc * math.sin(ecc_anom)) % (2.0 * math.pi)
+    mean_motion = math.sqrt(_EARTH_MU_KM3_S2 / sma ** 3) * 86400.0 / (2.0 * math.pi)
+    return {
+        "ecc": ecc,
+        "inc_deg": math.degrees(inc) % 360.0,
+        "raan_deg": math.degrees(raan) % 360.0,
+        "argp_deg": math.degrees(argp) % 360.0,
+        "mean_anom_deg": math.degrees(mean_anom) % 360.0,
+        "mean_motion": mean_motion,
+    }
+
+
+def _parse_meme_stamp(text: str):
+    match = _MEME_STAMP_RE.search(text or "")
+    if not match:
+        return None
+    try:
+        return datetime.strptime(
+            f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_meme_epoch(token: str):
+    """Packed ``YYYYDDDHHMMSS.fff`` epoch from a MEME state row."""
+    whole, _, frac = str(token).partition(".")
+    if len(whole) < 13:
+        return None
+    try:
+        year = int(whole[0:4])
+        doy = int(whole[4:7])
+        hh = int(whole[7:9])
+        mm = int(whole[9:11])
+        ss = int(whole[11:13])
+        micro = int((frac + "000000")[:6]) if frac else 0
+    except ValueError:
+        return None
+    if not (1 <= doy <= 366 and 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 60):
+        return None
+    return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(
+        days=doy - 1, hours=hh, minutes=mm, seconds=ss, microseconds=micro
+    )
+
+
+def manifest_starlink_filenames(text: str) -> list:
+    """Post-Falcon STARLINK filenames in MANIFEST order, one per id.
+
+    The manifest lists the whole constellation. Only ids at or above
+    ``SPACEX_POST_FALCON_STARLINK_ID_MIN`` are candidates; the ephemeris
+    window is checked after the file header is read.
+    """
+    found = {}
+    for match in _MANIFEST_NAME_RE.finditer(text or ""):
+        filename, sid_text = match.group(1), match.group(2)
+        try:
+            sid = int(sid_text)
+        except ValueError:
+            continue
+        if sid < SPACEX_POST_FALCON_STARLINK_ID_MIN:
+            continue
+        found[sid] = filename
+    return [(sid, found[sid]) for sid in sorted(found)]
+
+
+def _meme_window_covers(header: dict, launch_date: str) -> bool:
+    """True when the published ephemeris window includes the launch calendar day."""
+    try:
+        day = datetime.strptime(launch_date, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    start, stop = header.get("start"), header.get("stop")
+    if start is not None and stop is not None:
+        return start.date() <= day <= stop.date()
+    created = header.get("created")
+    return bool(created and created.date() == day)
+
+
+def _lerp_meme_state(prev: dict, nxt: dict, when: datetime) -> dict:
+    span = (nxt["t"] - prev["t"]).total_seconds()
+    if span <= 0.0:
+        return prev
+    frac = max(0.0, min(1.0, (when - prev["t"]).total_seconds() / span))
+    rv = tuple(prev["rv"][i] + (nxt["rv"][i] - prev["rv"][i]) * frac for i in range(6))
+    return {"t": when, "rv": rv}
+
+
+def _select_meme_state(prev, nxt, when: datetime):
+    """Interpolate inside the table. One step outside uses the nearest row."""
+    if prev is not None and nxt is not None:
+        return _lerp_meme_state(prev, nxt, when)
+    if prev is not None and 0.0 <= (when - prev["t"]).total_seconds() <= 90.0:
+        return prev
+    if nxt is not None and 0.0 <= (nxt["t"] - when).total_seconds() <= 90.0:
+        return nxt
+    return None
+
+
+def meme_state_from_lines(lines, launch_date: str, when: datetime):
+    """Inertial state at ``when`` from a MEME file, or None if it does not apply.
+
+    State rows are ``YYYYDDDHHMMSS x y z vx vy vz`` in km and km/s, inertial.
+    The following three lines are a 6×6 UVW covariance and are ignored.
+    Reading stops once a sample is past ``when``.
+    """
+    header = {"created": None, "start": None, "stop": None}
+    prev = None
+    nxt = None
+    for raw in lines:
+        if raw is None:
+            continue
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        line = str(raw).strip()
+        if not line:
+            continue
+        if line.startswith("created:"):
+            header["created"] = _parse_meme_stamp(line)
+            continue
+        if line.startswith("ephemeris_start:"):
+            stamps = _MEME_STAMP_RE.findall(line)
+            if stamps:
+                header["start"] = _parse_meme_stamp(" ".join(stamps[0]))
+            if len(stamps) > 1:
+                header["stop"] = _parse_meme_stamp(" ".join(stamps[1]))
+            # Reject before the state table so a streamed download can close.
+            if header["start"] is not None and header["stop"] is not None:
+                if not _meme_window_covers(header, launch_date):
+                    return None
+            continue
+        match = _MEME_EPOCH_RE.match(line)
+        if not match:
+            continue
+        stamp = _parse_meme_epoch(match.group("epoch"))
+        if stamp is None:
+            continue
+        try:
+            rv = tuple(float(match.group(key)) for key in ("x", "y", "z", "vx", "vy", "vz"))
+        except ValueError:
+            continue
+        sample = {"t": stamp, "rv": rv}
+        if stamp <= when:
+            prev = sample
+        else:
+            nxt = sample
+            break
+    if not _meme_window_covers(header, launch_date):
+        return None
+    return _select_meme_state(prev, nxt, when)
+
+
+def _lines_from_response(response):
+    """Yield text lines. A test double may only set ``.text``."""
+    iterator = getattr(response, "iter_lines", None)
+    if callable(iterator):
+        try:
+            stream = iterator(decode_unicode=True)
+            for line in stream:
+                if isinstance(line, bytes):
+                    yield line.decode("utf-8", "replace")
+                elif isinstance(line, str):
+                    yield line
+                elif line is None:
+                    continue
+                else:
+                    raise TypeError("non-text ephemeris line")
+            return
+        except TypeError:
+            pass
+    text = getattr(response, "text", None)
+    if isinstance(text, str):
+        yield from text.splitlines()
+
+
+def _as_utc(value):
+    """Aware UTC datetime, or None.
+
+    Duck-typed so a test can replace the ``datetime`` name without dropping
+    timestamps that were built from the real class.
+    """
+    try:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _satellite_from_inertial_state(starlink_id: int, state: dict, generation):
+    """Geodetic position plus an osculating TLE. No NORAD id is assigned."""
+    rv = state.get("rv")
+    when = _as_utc(state.get("t"))
+    if not rv or len(rv) != 6 or when is None:
+        return None
+    r = rv[0:3]
+    v = rv[3:6]
+    elements = _inertial_to_kepler(r, v)
+    if not elements:
+        return None
+    ecef = _teme_to_ecef(r, when)
+    lat, lon, alt_km = _ecef_to_geodetic(*ecef)
+    if not (100.0 <= alt_km <= 2500.0):
+        return None
+    # Catalog number 0 is only a TLE-format placeholder. It is not published
+    # as norad_id — SpaceX has not been assigned one yet.
+    omm = {
+        "NORAD_CAT_ID": 0,
+        "OBJECT_ID": "",
+        "EPOCH": when.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "MEAN_MOTION": elements["mean_motion"],
+        "ECCENTRICITY": elements["ecc"],
+        "INCLINATION": elements["inc_deg"],
+        "RA_OF_ASC_NODE": elements["raan_deg"],
+        "ARG_OF_PERICENTER": elements["argp_deg"],
+        "MEAN_ANOMALY": elements["mean_anom_deg"],
+        "BSTAR": 0.0,
+        "MEAN_MOTION_DOT": 0.0,
+        "MEAN_MOTION_DDOT": 0.0,
+        "EPHEMERIS_TYPE": 0,
+        "CLASSIFICATION_TYPE": "U",
+        "ELEMENT_SET_NO": 999,
+        "REV_AT_EPOCH": 0,
+    }
+    line1, line2 = omm_to_tle_lines(omm)
+    if not line1 or not line2:
+        return None
+    name = f"STARLINK-{int(starlink_id)}"
+    record = {
+        "name": name,
+        "id": name,
+        "lat": round(lat, 5),
+        "lon": round(lon, 5),
+        "alt_km": round(alt_km, 3),
+        "epoch": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "tle_line1": line1,
+        "tle_line2": line2,
+    }
+    if generation:
+        record["generation"] = generation
+    return record
+
+
+def _download_manifest_text() -> str:
+    increment_metric("api_calls")
+    response = requests.get(
+        SPACEX_MANIFEST_URL,
+        headers=SPACEX_EPHEM_HEADERS,
+        timeout=SPACEX_EPHEM_FETCH_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.text or ""
+
+
+def _download_meme_satellite(filename, starlink_id, launch_date, when, generation):
+    increment_metric("api_calls")
+    response = requests.get(
+        SPACEX_EPHEM_BASE + filename,
+        headers=SPACEX_EPHEM_HEADERS,
+        timeout=SPACEX_EPHEM_FETCH_TIMEOUT,
+        stream=True,
+    )
+    try:
+        response.raise_for_status()
+        state = meme_state_from_lines(
+            _lines_from_response(response), launch_date, when
+        )
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    if not state:
+        return None
+    return _satellite_from_inertial_state(starlink_id, state, generation)
+
+
+def _manifest_satellites_for_launch(launch_date: str, generation, when: datetime = None) -> list:
+    """Download and parse post-Falcon MEME files whose window covers ``launch_date``."""
+    when = when or datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    candidates = manifest_starlink_filenames(_download_manifest_text())
+    if not candidates:
+        return []
+    satellites = []
+    workers = min(SPACEX_EPHEM_CONCURRENCY, len(candidates))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = [
+        pool.submit(
+            _download_meme_satellite, filename, sid, launch_date, when, generation
+        )
+        for sid, filename in candidates
+    ]
+    try:
+        for future in as_completed(futures, timeout=SPACEX_EPHEM_BUDGET_SEC):
+            try:
+                record = future.result()
+            except Exception as exc:
+                print(f"SpaceX ephemeris file failed: {exc}")
+                continue
+            if record:
+                satellites.append(record)
+    except TimeoutError:
+        pending = [item for item in futures if not item.done()]
+        print(
+            f"SpaceX ephemeris budget exceeded with {len(pending)} file(s) still running"
+        )
+        if not satellites:
+            raise
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    satellites.sort(key=lambda record: record.get("id") or "")
+    return satellites
+
+
 def _deployed_note_empty(launch_date: str) -> str:
     return (
         f"No Starlink SATCAT objects with LAUNCH_DATE {launch_date} yet. "
@@ -3875,6 +4334,41 @@ def _deployed_note_unavailable() -> str:
     return "CelesTrak SATCAT unavailable. " + SATELLITE_NOTE
 
 
+def _deployed_note_manifest(launch_date: str) -> str:
+    return (
+        f"No Starlink SATCAT objects with LAUNCH_DATE {launch_date} yet. "
+        "Positions are interpolated from SpaceX public MEME ephemerides "
+        "(api.starlink.com/public-files/ephemerides). "
+        "tle_line1/tle_line2 are osculating elements fitted to that inertial "
+        "state so the globe can coast them; they are not CelesTrak catalog numbers."
+    )
+
+
+def _deployed_ttl_seconds(payload: dict) -> int:
+    source = (payload or {}).get("source")
+    sats = (payload or {}).get("satellites") or []
+    if source == DEPLOYED_MANIFEST_SOURCE and sats:
+        return DEPLOYED_MANIFEST_TTL
+    if not sats:
+        return DEPLOYED_EMPTY_TTL
+    return SATELLITES_CACHE_TTL
+
+
+def _deployed_cache_is_fresh(payload) -> bool:
+    """Freshness by source. An empty SATCAT cache from before the manifest
+    check must not block the ephemeris fallback.
+    """
+    if not isinstance(payload, dict):
+        return False
+    age = satellite_age_seconds(payload)
+    if age is None:
+        return False
+    sats = payload.get("satellites") or []
+    if not sats and not payload.get("manifest_checked"):
+        return False
+    return age < _deployed_ttl_seconds(payload)
+
+
 def _no_v3_launch_payload() -> dict:
     return {
         "launch_date": None,
@@ -3896,9 +4390,11 @@ def _no_v3_launch_payload() -> dict:
     }
 
 
-def _deployed_payload(target, catalog_rows, satellites, *, stale: bool, note: str) -> dict:
+def _deployed_payload(
+    target, catalog_rows, satellites, *, stale: bool, note: str, source: str = None
+) -> dict:
     sats = list(satellites or [])
-    return {
+    body = {
         "launch_date": target.get("launch_date"),
         "generation": target.get("generation"),
         "mission": target.get("mission"),
@@ -3908,21 +4404,23 @@ def _deployed_payload(target, catalog_rows, satellites, *, stale: bool, note: st
         "catalog_count": len(catalog_rows or []),
         "stale": bool(stale),
         "empty": len(sats) == 0,
-        "source": DEPLOYED_SOURCE,
+        "source": source or DEPLOYED_SOURCE,
         "note": note,
         "satellites": sats,
     }
+    body["ttl_seconds"] = _deployed_ttl_seconds(body)
+    return body
 
 
 def _mark_deployed_cached(payload: dict, *, stale: bool) -> dict:
     body = dict(payload)
     body["stale"] = stale
     body["empty"] = not body.get("satellites")
-    body["ttl_seconds"] = SATELLITES_CACHE_TTL
     body["count"] = len(body.get("satellites") or [])
     if body.get("catalog_count") is None:
         body["catalog_count"] = body["count"]
     body["source"] = body.get("source") or DEPLOYED_SOURCE
+    body["ttl_seconds"] = _deployed_ttl_seconds(body)
     return body
 
 
@@ -4000,45 +4498,101 @@ def _resolve_deployed_target(launch_date_param):
 
 def _refresh_deployed_uncached(target: dict, force: bool = False):
     launch_date = target["launch_date"]
-    cached = _read_deployed_cache(launch_date)
-    if not force and cached and satellite_cache_is_fresh(cached):
+    cached = None if force else _read_deployed_cache(launch_date)
+    if cached and _deployed_cache_is_fresh(cached):
         return _mark_deployed_cached(cached, stale=False)
 
+    satcat_failed = False
+    index = None
+    index_stale = False
     try:
         index, index_stale = _get_satcat_index(launch_date, force=force)
     except Exception as exc:
         print(f"Deployed SATCAT refresh failed for {launch_date}: {exc}")
-        if cached:
-            return _mark_deployed_cached(cached, stale=True)
-        return _deployed_payload(
+        satcat_failed = True
+
+    # A failed SATCAT refresh must not rebuild (and drop) TLEs we already stored.
+    if (
+        not satcat_failed
+        and index_stale
+        and cached
+        and (cached.get("satellites") or [])
+    ):
+        return _mark_deployed_cached(cached, stale=True)
+
+    catalog_rows = [] if satcat_failed else _catalog_rows_for_date(index, launch_date)
+    satellites = []
+    if catalog_rows:
+        satellites = _join_deployed_tles(catalog_rows, target.get("generation"))
+    if satellites:
+        payload = _deployed_payload(
+            target,
+            catalog_rows,
+            satellites,
+            stale=index_stale,
+            note=_deployed_note_ready(launch_date),
+        )
+        if index_stale:
+            payload["fetched_at"] = index.get("fetched_at") or payload["fetched_at"]
+            payload["stale"] = True
+            _local_deployed[launch_date] = payload
+            return payload
+        _write_deployed_cache(launch_date, payload)
+        return payload
+
+    if satcat_failed and cached and (cached.get("satellites") or []):
+        return _mark_deployed_cached(cached, stale=True)
+
+    # SATCAT has nothing plottable yet. SpaceX public ephemerides cover the
+    # gap until the catalog lists this launch date.
+    manifest_failed = False
+    manifest_sats = []
+    try:
+        manifest_sats = _manifest_satellites_for_launch(
+            launch_date, target.get("generation")
+        )
+    except Exception as exc:
+        print(f"Deployed SpaceX MANIFEST refresh failed for {launch_date}: {exc}")
+        manifest_failed = True
+    if manifest_sats:
+        payload = _deployed_payload(
+            target,
+            manifest_sats,
+            manifest_sats,
+            stale=False,
+            note=_deployed_note_manifest(launch_date),
+            source=DEPLOYED_MANIFEST_SOURCE,
+        )
+        payload["manifest_checked"] = True
+        _write_deployed_cache(launch_date, payload)
+        return payload
+
+    if satcat_failed:
+        payload = _deployed_payload(
             target,
             [],
             [],
             stale=True,
             note=_deployed_note_unavailable(),
         )
+        payload["manifest_checked"] = True
+        _write_deployed_cache(launch_date, payload)
+        return payload
 
-    # A failed SATCAT refresh must not rebuild (and drop) TLEs we already stored.
-    if index_stale and cached:
-        return _mark_deployed_cached(cached, stale=True)
-
-    catalog_rows = _catalog_rows_for_date(index, launch_date)
-    satellites = _join_deployed_tles(catalog_rows, target.get("generation"))
     if not catalog_rows:
         note = _deployed_note_empty(launch_date)
-    elif not satellites:
-        note = _deployed_note_no_tle(launch_date, len(catalog_rows))
     else:
-        note = _deployed_note_ready(launch_date)
+        note = _deployed_note_no_tle(launch_date, len(catalog_rows))
     payload = _deployed_payload(
         target,
         catalog_rows,
-        satellites,
-        stale=index_stale,
+        [],
+        stale=bool(index_stale or manifest_failed),
         note=note,
     )
+    payload["manifest_checked"] = True
     if index_stale:
-        payload["fetched_at"] = index.get("fetched_at") or payload["fetched_at"]
+        payload["fetched_at"] = (index or {}).get("fetched_at") or payload["fetched_at"]
         payload["stale"] = True
         _local_deployed[launch_date] = payload
         return payload
@@ -4088,20 +4642,24 @@ def get_satellites_deployed(
 
     spacex-dashboard ``ingestDeployedPayload`` reads:
 
-    - ``satellites[]``: ``name``, ``norad_id``, ``tle_line1``, ``tle_line2``
-      (satellite.js). Rows without both TLE lines are ignored.
+    - ``satellites[]``: ``name``, ``tle_line1``, ``tle_line2`` (satellite.js).
+      Rows without both TLE lines are ignored. SATCAT rows also include
+      ``norad_id``. Manifest rows use the SpaceX ``STARLINK-`` id and do not
+      invent a NORAD catalog number; they add ``lat``, ``lon``, ``alt_km``.
     - ``catalog_count``: non-decayed Starlink SATCAT rows for ``launch_date``
-      before the GP join. Greater than zero with an empty ``satellites`` list
-      means the catalog matched and no TLE was available.
+      before the GP join, or the ephemeris count when SATCAT is empty.
+      Greater than zero with an empty ``satellites`` list means the catalog
+      matched and no TLE was available.
     - ``note``: contains ``unavailable`` only when CelesTrak SATCAT could not
       be fetched and no cached catalog exists.
-    - ``source``: ``celestrak-satcat``.
+    - ``source``: ``celestrak-satcat`` when SATCAT has TLEs, otherwise
+      ``spacex-manifest-ephemeris`` when public MEME files cover the date.
     - ``empty`` / ``stale``: honest empty catalog vs. a stale cached copy.
 
     The default date is the UTC NET date of the Starship launch whose mission
     text contains ``v3`` or ``group 31-``. Same-day Starlink SATCAT rows are
     included. Decayed objects are not. Positions are never invented: if SATCAT
-    has no rows for that date, ``satellites`` is ``[]``.
+    and the SpaceX manifest are both empty, ``satellites`` is ``[]``.
     """
     if not internal:
         increment_metric("total_requests")
@@ -4123,12 +4681,15 @@ def get_satellites_deployed(
             detail=f"Deployed satellite feed failed: {exc}",
         )
     serving_fresh = bool(
-        cached_before and satellite_cache_is_fresh(cached_before) and not force
+        cached_before and _deployed_cache_is_fresh(cached_before) and not force
     )
     if serving_fresh:
         increment_metric("cache_hits")
     else:
         increment_metric("cache_misses")
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        payload.pop("manifest_checked", None)
     return payload
 
 
@@ -5022,8 +5583,9 @@ def start_background_worker():
                     refresh_weather_internal()
                     last_run["weather"] = now
 
-                # Starlink / stations GP and the V3 deployed feed (hourly;
-                # CelesTrak asks not to hammer).
+                # Starlink / stations GP hourly (CelesTrak asks not to hammer).
+                # The deployed feed is included; a manifest-backed copy expires
+                # sooner and the next request refetches it.
                 if now - last_run["satellites"] >= SATELLITES_CACHE_TTL:
                     try:
                         refresh_satellites_internal("starlink")

@@ -99,6 +99,23 @@ def _json_response(payload, status_code=200):
     return response
 
 
+def _text_response(text, status_code=200):
+    response = Mock()
+    response.status_code = status_code
+    response.text = text
+    response.raise_for_status = Mock()
+    if status_code >= 400:
+        response.raise_for_status.side_effect = Exception(f"HTTP {status_code}")
+
+    def iter_lines(decode_unicode=False):
+        for line in text.splitlines():
+            yield line
+
+    response.iter_lines = iter_lines
+    response.close = Mock()
+    return response
+
+
 class SatelliteGpTests(unittest.TestCase):
     def setUp(self):
         app._reset_cache_coordination_for_tests()
@@ -396,15 +413,30 @@ class DeployedSatelliteTests(unittest.TestCase):
         self.assertEqual(index["dates"]["2020-01-01"], [])
         self.assertNotIn("2020-01-02", index["dates"])
 
-    def _route_celestrak(self, satcat_rows, gp_by_intdes=None, sup_by_intdes=None):
+    def _route_celestrak(
+        self,
+        satcat_rows,
+        gp_by_intdes=None,
+        sup_by_intdes=None,
+        manifest="",
+        ephemerides=None,
+    ):
         gp_by_intdes = gp_by_intdes or {}
         sup_by_intdes = sup_by_intdes or {}
+        ephemerides = ephemerides or {}
         calls = []
 
         def fake_get(url, params=None, **kwargs):
             calls.append((url, dict(params or {})))
             if url == app.CELESTRAK_SATCAT_URL:
                 return _json_response(satcat_rows)
+            if url == app.SPACEX_MANIFEST_URL:
+                return _text_response(manifest)
+            if isinstance(url, str) and url.startswith(app.SPACEX_EPHEM_BASE):
+                name = url.rsplit("/", 1)[-1]
+                if name not in ephemerides:
+                    raise AssertionError(url)
+                return _text_response(ephemerides[name])
             intdes = (params or {}).get("INTDES")
             if url == app.CELESTRAK_GP_URL:
                 return _json_response(gp_by_intdes.get(intdes, []))
@@ -432,10 +464,14 @@ class DeployedSatelliteTests(unittest.TestCase):
         self.assertTrue(body["empty"])
         self.assertFalse(body["stale"])
         self.assertEqual(body["source"], "celestrak-satcat")
+        self.assertEqual(body["ttl_seconds"], app.DEPLOYED_EMPTY_TTL)
         self.assertNotIn("unavailable", body["note"].lower())
         self.assertIn("2026-09-28", body["note"])
         self.assertIn("SGP4", body["note"])
-        self.assertEqual([url for url, _params in calls], [app.CELESTRAK_SATCAT_URL])
+        self.assertEqual(
+            [url for url, _params in calls],
+            [app.CELESTRAK_SATCAT_URL, app.SPACEX_MANIFEST_URL],
+        )
 
     def test_joins_real_tle_and_ignores_unrelated_gp_objects(self):
         rows = [
@@ -468,6 +504,7 @@ class DeployedSatelliteTests(unittest.TestCase):
         self.assertTrue(sat["tle_line1"].startswith("1 A0753U"))
         self.assertTrue(sat["tle_line2"].startswith("2 A0753"))
         self.assertNotIn(25544, [row["norad_id"] for row in body["satellites"]])
+        self.assertFalse(any(url == app.SPACEX_MANIFEST_URL for url, _params in calls))
         gp_calls = [params for url, params in calls if url == app.CELESTRAK_GP_URL]
         self.assertEqual(gp_calls, [{"INTDES": "2026-219", "FORMAT": "JSON"}])
         self.assertFalse(any(url == app.CELESTRAK_SUP_GP_URL for url, _params in calls))
@@ -567,7 +604,10 @@ class DeployedSatelliteTests(unittest.TestCase):
 
         self.assertTrue(first["empty"])
         self.assertTrue(second["empty"])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [url for url, _params in calls],
+            [app.CELESTRAK_SATCAT_URL, app.SPACEX_MANIFEST_URL],
+        )
 
     def test_no_v3_launch_does_not_query_celestrak(self):
         launches = {
@@ -629,6 +669,220 @@ class DeployedSatelliteTests(unittest.TestCase):
         )
         intdes = sorted(params["INTDES"] for url, params in calls if url == app.CELESTRAK_GP_URL)
         self.assertEqual(intdes, ["2026-219", "2026-220"])
+
+
+from datetime import datetime, timezone
+
+
+# Two inertial samples bracketing 2026-09-28 16:59:12 UTC (Flight 14 MEME shape).
+_MEME_SAMPLE = """created:2026-09-28 17:01:25 UTC
+ephemeris_start:2026-09-28 16:58:42 UTC ephemeris_stop:2026-09-30 16:57:42 UTC step_size:60
+ephemeris_source:blend
+UVW
+2026271165842.000 6514.9476854708 -391.0827173447 1215.5516556776 -0.2750437930 6.8311421476 3.6645843404
+0 0 0 0 0 0 0
+0 0 0 0 0 0 0
+0 0 0 0 0 0 0
+2026271165942.000 6482.4712625142 19.4108315434 1432.2542472462 -0.8070548990 6.8463729972 3.5558690285
+0 0 0 0 0 0 0
+0 0 0 0 0 0 0
+0 0 0 0 0 0 0
+"""
+
+_MEME_OLD = """created:2020-01-01 00:00:00 UTC
+ephemeris_start:2020-01-01 00:00:00 UTC ephemeris_stop:2020-01-02 00:00:00 UTC step_size:60
+ephemeris_source:blend
+UVW
+2020001000000.000 6514.9476854708 -391.0827173447 1215.5516556776 -0.2750437930 6.8311421476 3.6645843404
+0 0 0 0 0 0 0
+0 0 0 0 0 0 0
+0 0 0 0 0 0 0
+"""
+
+# Announced Flight 14 V3 set: 40075–40088, 40090–40095, 40097–40101, 40103.
+F14_STARLINK_IDS = (
+    list(range(40075, 40089))
+    + list(range(40090, 40096))
+    + list(range(40097, 40102))
+    + [40103]
+)
+
+
+def _f14_filename(sid):
+    return f"MEME_{sid}_STARLINK-{sid}_2711658_Operational_1_UNCLASSIFIED.txt"
+
+
+class _FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        stamp = cls(2026, 9, 28, 16, 59, 12, tzinfo=timezone.utc)
+        if tz is not None:
+            return stamp.astimezone(tz)
+        return stamp
+
+
+class ManifestEphemerisTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def test_manifest_keeps_only_the_post_falcon_band(self):
+        text = "\n".join([
+            "MEME_1_STARLINK-1008_2710000_Operational_1_UNCLASSIFIED.txt",
+            "MEME_2_STARLINK-38451_2710000_Operational_1_UNCLASSIFIED.txt",
+            _f14_filename(40075),
+            _f14_filename(40103),
+            "not a file",
+        ])
+        self.assertEqual(
+            [sid for sid, _name in app.manifest_starlink_filenames(text)],
+            [40075, 40103],
+        )
+
+    def test_meme_sample_interpolates_geodetic_and_fits_a_tle(self):
+        from datetime import datetime, timezone
+
+        when = datetime(2026, 9, 28, 16, 58, 42, tzinfo=timezone.utc)
+        state = app.meme_state_from_lines(_MEME_SAMPLE.splitlines(), "2026-09-28", when)
+        self.assertIsNotNone(state)
+        self.assertEqual(state["t"], when)
+        record = app._satellite_from_inertial_state(40075, state, "v3")
+        self.assertEqual(record["name"], "STARLINK-40075")
+        self.assertEqual(record["id"], "STARLINK-40075")
+        self.assertNotIn("norad_id", record)
+        self.assertEqual(record["generation"], "v3")
+        self.assertAlmostEqual(record["lat"], 10.61684, places=3)
+        self.assertAlmostEqual(record["lon"], 94.40681, places=3)
+        self.assertAlmostEqual(record["alt_km"], 261.488, places=2)
+        self.assertEqual(len(record["tle_line1"]), 69)
+        self.assertEqual(len(record["tle_line2"]), 69)
+        self.assertTrue(record["tle_line1"].startswith("1 00000U"))
+        self.assertTrue(record["tle_line2"].startswith("2 00000"))
+        self.assertIn(" 30.4", record["tle_line2"])
+        self.assertEqual(record["tle_line1"][-1], app._tle_checksum(record["tle_line1"]))
+        self.assertEqual(record["tle_line2"][-1], app._tle_checksum(record["tle_line2"]))
+
+        midpoint = datetime(2026, 9, 28, 16, 59, 12, tzinfo=timezone.utc)
+        mid = app.meme_state_from_lines(_MEME_SAMPLE.splitlines(), "2026-09-28", midpoint)
+        mid_rec = app._satellite_from_inertial_state(40075, mid, "v3")
+        self.assertAlmostEqual(mid_rec["lat"], 11.58256, places=3)
+        self.assertAlmostEqual(mid_rec["lon"], 96.07876, places=3)
+        self.assertAlmostEqual(mid_rec["alt_km"], 257.511, places=2)
+
+        self.assertIsNone(
+            app.meme_state_from_lines(_MEME_SAMPLE.splitlines(), "2026-09-27", when)
+        )
+        self.assertIsNone(
+            app.meme_state_from_lines(_MEME_OLD.splitlines(), "2026-09-28", when)
+        )
+
+    def test_satcat_miss_manifest_hit_returns_flight_14_set(self):
+        manifest_lines = [
+            "MEME_1_STARLINK-1008_2710000_Operational_1_UNCLASSIFIED.txt",
+            _f14_filename(40110),
+        ]
+        ephemerides = {_f14_filename(40110): _MEME_OLD}
+        for sid in F14_STARLINK_IDS:
+            name = _f14_filename(sid)
+            manifest_lines.append(name)
+            ephemerides[name] = _MEME_SAMPLE
+        router = DeployedSatelliteTests()
+        fake_get, calls = router._route_celestrak(
+            [],
+            manifest="\n".join(manifest_lines) + "\n",
+            ephemerides=ephemerides,
+        )
+        launches = {"upcoming": [], "previous": [FLIGHT_14], "last_updated": None}
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", _FrozenDateTime), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["source"], "spacex-manifest-ephemeris")
+        self.assertEqual(body["count"], 26)
+        self.assertEqual(body["catalog_count"], 26)
+        self.assertFalse(body["empty"])
+        self.assertFalse(body["stale"])
+        self.assertEqual(body["ttl_seconds"], app.DEPLOYED_MANIFEST_TTL)
+        self.assertEqual(body["launch_date"], "2026-09-28")
+        self.assertEqual(body["generation"], "v3")
+        self.assertNotIn("unavailable", body["note"].lower())
+        self.assertNotIn("manifest_checked", body)
+        names = [sat["name"] for sat in body["satellites"]]
+        self.assertEqual(names, [f"STARLINK-{sid}" for sid in F14_STARLINK_IDS])
+        self.assertNotIn("STARLINK-1008", names)
+        self.assertNotIn("STARLINK-40110", names)
+        sat = body["satellites"][0]
+        self.assertEqual(set(sat), {
+            "name", "id", "lat", "lon", "alt_km", "epoch",
+            "tle_line1", "tle_line2", "generation",
+        })
+        self.assertNotIn("norad_id", sat)
+        self.assertAlmostEqual(sat["lat"], 11.58256, places=3)
+        self.assertAlmostEqual(sat["lon"], 96.07876, places=3)
+        self.assertGreater(sat["alt_km"], 200)
+        self.assertLess(sat["alt_km"], 400)
+        self.assertEqual(len(sat["tle_line1"]), 69)
+        self.assertEqual(len(sat["tle_line2"]), 69)
+        file_calls = [
+            url for url, _params in calls
+            if url.startswith(app.SPACEX_EPHEM_BASE) and not url.endswith("MANIFEST.txt")
+        ]
+        self.assertEqual(len(file_calls), 27)  # 26 live + one expired window
+
+    def test_empty_satcat_cache_does_not_block_manifest(self):
+        app._local_deployed["2026-09-28"] = {
+            "launch_date": "2026-09-28",
+            "generation": "v3",
+            "mission": FLIGHT_14["mission"],
+            "fetched_at": "2026-09-28T16:50:00Z",
+            "ttl_seconds": 3600,
+            "count": 0,
+            "catalog_count": 0,
+            "stale": False,
+            "empty": True,
+            "source": "celestrak-satcat",
+            "note": "No Starlink SATCAT objects with LAUNCH_DATE 2026-09-28 yet.",
+            "satellites": [],
+        }
+        name = _f14_filename(40075)
+        router = DeployedSatelliteTests()
+        fake_get, _calls = router._route_celestrak(
+            [],
+            manifest=name + "\n",
+            ephemerides={name: _MEME_SAMPLE},
+        )
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", _FrozenDateTime), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["source"], "spacex-manifest-ephemeris")
+        self.assertFalse(body["empty"])
+        self.assertEqual(body["satellites"][0]["id"], "STARLINK-40075")
+
+    def test_both_sources_empty_stays_honest(self):
+        router = DeployedSatelliteTests()
+        fake_get, calls = router._route_celestrak(
+            [_satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-09-20")],
+            manifest="MEME_1_STARLINK-1008_2710000_Operational_1_UNCLASSIFIED.txt\n",
+        )
+        with patch.object(app, "r", None), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["satellites"], [])
+        self.assertEqual(body["count"], 0)
+        self.assertEqual(body["catalog_count"], 0)
+        self.assertTrue(body["empty"])
+        self.assertFalse(body["stale"])
+        self.assertEqual(body["source"], "celestrak-satcat")
+        self.assertNotIn("unavailable", body["note"].lower())
+        self.assertEqual(
+            [url for url, _params in calls],
+            [app.CELESTRAK_SATCAT_URL, app.SPACEX_MANIFEST_URL],
+        )
 
 
 if __name__ == "__main__":
