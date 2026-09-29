@@ -53,14 +53,18 @@ This is the production cutover: default `/launches` drops the ~19MB raw LL blobs
     *   `mission`: (string) Same as `name` (dashboard fast-path field).
     *   `net`, `date`, `time`, `status`, `rocket`, `orbit`, `pad`
     *   `video_url`, `x_video_url`
-    *   `trajectory_data`: (object, optional) High-fidelity orbital trajectory data (usually present for the next upcoming launch). Accounts for Earth's rotation and realistic ascent profiles.
+    *   `trajectory_data`: (object, optional) Modeled ground track for the next launch. Ascent follows the pad and an inclination (51.6° for ISS crew/cargo, otherwise the orbit family, or a figure stated in the mission text). It is not a Flight Club or webcast telemetry path.
         *   `trajectory`: (array) List of `{lat, lon, r}` points for ascent (starts at surface, radius 1.0).
-        *   `orbit_path`: (array) List of `{lat, lon, r}` points for the full orbit.
-        *   `booster_trajectory`: (array) Points for the booster return path (ASDS or RTLS).
-        *   `sep_idx`: (int) Index in `trajectory` where stage separation occurs (usually ~80km downrange).
+        *   `orbit_path`: (array) List of `{lat, lon, r}` points for the rest of one modeled orbit.
+        *   `booster_trajectory`: (array) Empty unless Launch Library published an endpoint. A fixed zone more than 2 km from the pad is the geodesic between those surveyed points. A droneship with a downrange and no coordinates is the ascent azimuth out to that distance. Ocean splashdowns and on-pad RTLS zones do not get an invented curve.
+        *   `booster_ground_track`: (string or null) `landing_zone_offset`, `published_downrange`, or null.
+        *   `landing_site`: (object or null) Published landing latitude/longitude when Launch Library has them.
+        *   `inclination_deg`: (number) Inclination used for the ground track.
+        *   `sep_idx`: (int or null) `0` when `booster_trajectory` is a standalone leg.
         *   `launch_site`: (object) Coordinates and name of the launch site.
         *   `landing_location`: (string) Name of the landing zone or droneship.
         *   `landing_type`: (string) Type of landing (ASDS, RTLS, Ocean, etc.).
+        *   `landing_latitude`, `landing_longitude`, `landing_downrange_km`: published landing geometry from Launch Library, when present.
         *   `orbit`: (string) Normalized orbit type (LEO-Equatorial, LEO-Polar, GTO, etc.).
         *   `mission`: (string) Mission name.
         *   `pad`: (string) Full name of the launch pad.

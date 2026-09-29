@@ -1175,6 +1175,179 @@ def _coords_far(point, expected):
     return dlat > _SITE_MISMATCH_DEG or dlon > _SITE_MISMATCH_DEG
 
 
+# NASA Crew-N, CRS, and Cargo Dragon fly to the ISS. The inclination is the
+# station's, not a guessed Starlink shell. "crew-\d+" is the NASA crew rotation
+# name; private flights (Axiom, Polaris, Fram2) are not named that way.
+_ISS_MISSION_RE = re.compile(
+    r"\b(?:iss|crs-\d+|crew-\d+)\b|international space station|\bspace station\b|\bcargo dragon\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_INCL_RE = re.compile(
+    r"(?:inclination(?:\s+of)?|inclined\s+to)\s*(\d{1,3}(?:\.\d+)?)\s*(?:°|deg(?:ree)?s?)"
+    r"|(\d{1,3}(?:\.\d+)?)\s*(?:°|deg(?:ree)?s?)\s+inclination",
+    re.IGNORECASE,
+)
+# Droneship downranges in Launch Library are hundreds of kilometres.
+# Sub-30 km figures are RTLS pad offsets, not an ASDS station.
+_ASDS_DOWNRANGE_MIN_KM = 30.0
+# LZ-40 sits on SLC-40 (~0.3 km). LZ-1 is ~15 km south of LC-39A.
+_LZ_OFFSET_MIN_KM = 2.0
+_BOOSTER_SURFACE_R = 1.012
+
+
+def _distance_km(a, b):
+    """Great-circle distance in kilometres."""
+    return _ang_dist_deg(a, b) * (_EARTH_CIRCUMFERENCE_KM / 360.0)
+
+
+def _mission_blob(launch, orbit_label=""):
+    parts = []
+    if isinstance(launch, dict):
+        for key in ("mission", "name", "description"):
+            value = launch.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+    if isinstance(orbit_label, str) and orbit_label.strip():
+        parts.append(orbit_label)
+    return " ".join(parts)
+
+
+def _explicit_inclination_deg(text):
+    """Inclination only when the source text states one. No shell guesses."""
+    match = _EXPLICIT_INCL_RE.search(text or "")
+    if not match:
+        return None
+    raw = match.group(1) or match.group(2)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= value <= 180.0:
+        return value
+    return None
+
+
+def _select_stage_landing(launcher_stage):
+    """Pick the recovery Launch Library actually located.
+
+    Fixed pads (LZ-1, LZ-2, LZ-4, LZ-40) include latitude and longitude.
+    Droneships usually include a downrange distance and null coordinates.
+    An expended stage is skipped when another stage is recovered.
+    """
+    parsed = []
+    if not isinstance(launcher_stage, list):
+        return {}
+    for stage in launcher_stage:
+        if not isinstance(stage, dict):
+            continue
+        landing = stage.get("landing")
+        if not isinstance(landing, dict):
+            continue
+        loc = landing.get("landing_location")
+        if not isinstance(loc, dict):
+            alt = landing.get("location")
+            loc = alt if isinstance(alt, dict) else {}
+        raw_type = landing.get("type")
+        ltype = raw_type.get("name") if isinstance(raw_type, dict) else None
+        lat = _finite_coord(loc.get("latitude")) if loc else None
+        lon = _finite_coord(loc.get("longitude")) if loc else None
+        if not _usable_pad_coords(lat, lon):
+            lat, lon = None, None
+        down = _finite_coord(landing.get("downrange_distance"))
+        if down is not None and down < 0:
+            down = None
+        parsed.append({
+            "landing_type": ltype,
+            "landing_location": loc.get("name") if loc else None,
+            "landing_latitude": lat,
+            "landing_longitude": lon,
+            "landing_downrange_km": down,
+        })
+
+    def recoverable(item):
+        name = (item.get("landing_type") or "").lower()
+        return bool(name) and "expend" not in name
+
+    with_coords = [
+        item for item in parsed
+        if recoverable(item) and item["landing_latitude"] is not None
+    ]
+    if with_coords:
+        return with_coords[0]
+    with_range = [
+        item for item in parsed
+        if recoverable(item)
+        and item["landing_downrange_km"] is not None
+        and item["landing_downrange_km"] >= _ASDS_DOWNRANGE_MIN_KM
+    ]
+    if with_range:
+        return with_range[0]
+    recovered = [item for item in parsed if recoverable(item)]
+    if recovered:
+        return recovered[0]
+    return parsed[0] if parsed else {}
+
+
+def _landing_numbers(launch):
+    """Parsed landing latitude, longitude, and downrange kilometres."""
+    if not isinstance(launch, dict):
+        return None, None, None
+    lat = _finite_coord(launch.get("landing_latitude"))
+    lon = _finite_coord(launch.get("landing_longitude"))
+    if not _usable_pad_coords(lat, lon):
+        lat, lon = None, None
+    down = _finite_coord(launch.get("landing_downrange_km"))
+    if down is not None and down < 0:
+        down = None
+    return lat, lon, down
+
+
+def _path_prefix_to_distance(path, distance_km):
+    """Ground-track prefix from the pad out to a published downrange."""
+    if not path or distance_km is None or distance_km <= 0:
+        return []
+    kept = [path[0]]
+    travelled = 0.0
+    prev = path[0]
+    for point in path[1:]:
+        step = _distance_km(prev, point)
+        if travelled + step >= distance_km:
+            frac = (distance_km - travelled) / step if step > 1e-6 else 1.0
+            kept.append({
+                "lat": prev["lat"] + frac * (point["lat"] - prev["lat"]),
+                "lon": prev["lon"] + frac * (point["lon"] - prev["lon"]),
+            })
+            break
+        kept.append(point)
+        travelled += step
+        prev = point
+    if len(kept) > 80:
+        step_n = max(1, len(kept) // 80)
+        sampled = kept[::step_n]
+        if sampled[-1] is not kept[-1]:
+            sampled.append(kept[-1])
+        kept = sampled
+    points = [
+        {"lat": float(point["lat"]), "lon": float(point["lon"]), "r": _BOOSTER_SURFACE_R}
+        for point in kept
+    ]
+    return points if len(points) >= 2 else []
+
+
+def _surface_segment(start, end, num_points=12):
+    """Geodesic samples between two surveyed points. Not a boostback arc."""
+    n = max(2, num_points)
+    points = []
+    for i in range(n):
+        t = i / (n - 1)
+        points.append({
+            "lat": start["lat"] + t * (end["lat"] - start["lat"]),
+            "lon": start["lon"] + t * (end["lon"] - start["lon"]),
+            "r": _BOOSTER_SURFACE_R,
+        })
+    return points
+
+
 def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
     """
     Get trajectory data for the next upcoming launch or a specific launch.
@@ -1265,29 +1438,21 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
 
     # Resolve an inclination assumption
     def _resolve_inclination_deg(norm_orbit: str, site_name: str, site_lat: float) -> float:
-        """Return best-estimate orbital inclination in degrees.
+        """Inclination from a stated figure or a known station orbit, else the family.
 
-        Priority order:
-        1. Mission-name keyword overrides (ISS, Crew/Cargo Dragon, Starlink shell hints)
-        2. Orbit-type formulas (SSO via J2, GPS/MEO standard, GTO ≈ site latitude)
-        3. Generic LEO fallback clamped to a physically achievable range
+        Starlink shell numbers are not inferred. Launch Library does not publish
+        inclination, and a single shell guess is wrong often enough (Group 15 is
+        ~70°, not 53°) that the ground track would be a fabricated azimuth.
         """
         try:
+            text = _mission_blob(next_launch, orbit)
+            explicit = _explicit_inclination_deg(text)
+            if explicit is not None:
+                return explicit
+            if _ISS_MISSION_RE.search(text):
+                return 51.6
+
             label = (orbit or '').lower()
-
-            # ── Mission-specific overrides ────────────────────────────────────
-            if 'iss' in label or 'crew dragon' in label or 'cargo dragon' in label:
-                return 51.6   # ISS inclination
-
-            # Starlink: shell depends on launch site and payload name hints
-            if 'starlink' in label:
-                if 'Vandenberg' in site_name:
-                    return _compute_sso_inclination_deg(550.0)  # ~97.6° polar shell
-                if 'polar' in label or '70' in label:
-                    return 70.0   # high-inclination Starlink shell (~70°)
-                return 53.0       # most common Starlink shell from KSC
-
-            # ── Orbit-type formulas ───────────────────────────────────────────
             if norm_orbit in ('SSO', 'Polar') or 'sso' in label or 'sun-synchronous' in label:
                 # SSO inclination is altitude-dependent (J2 perturbation theory)
                 # Use 550 km for SSO, 600 km for generic polar
@@ -1327,10 +1492,18 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         launch_site.get('lat', 0.0)
     )
 
-    ORBIT_CACHE_VERSION = 'v261-pad-coords'
+    ORBIT_CACHE_VERSION = 'v262-published-landing'
     landing_type = next_launch.get('landing_type')
     landing_loc = next_launch.get('landing_location')
-    cache_key = f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:{round(assumed_incl, 1)}:{landing_type}:{landing_loc}"
+    landing_lat, landing_lon, landing_downrange_km = _landing_numbers(next_launch)
+    coord_key = (
+        f"{landing_lat:.4f},{landing_lon:.4f}" if landing_lat is not None else "none"
+    )
+    down_key = "none" if landing_downrange_km is None else f"{landing_downrange_km:.1f}"
+    cache_key = (
+        f"{ORBIT_CACHE_VERSION}:{matched_site_key}:{normalized_orbit}:"
+        f"{round(assumed_incl, 1)}:{landing_type}:{landing_loc}:{coord_key}:{down_key}"
+    )
 
     global _TRAJECTORY_DATA_CACHE
     if _TRAJECTORY_DATA_CACHE is None:
@@ -1355,71 +1528,15 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             'mission': mission_name,
             'pad': pad,
             'landing_type': landing_type,
-            'landing_location': cached.get('landing_location', next_launch.get('landing_location'))
+            'landing_location': cached.get('landing_location', next_launch.get('landing_location')),
+            'landing_site': cached.get('landing_site'),
+            'landing_downrange_km': cached.get('landing_downrange_km', landing_downrange_km),
+            'booster_ground_track': cached.get('booster_ground_track'),
+            'inclination_deg': cached.get('inclination_deg', assumed_incl),
         }
 
     traj_cache = _TRAJECTORY_DATA_CACHE
     logger.info(f"Trajectory cache miss for {cache_key}; generating new trajectory")
-
-    def generate_curved_trajectory(start_point, end_point, num_points, orbit_type='default', end_bearing_deg=None):
-        points = []
-        start_lat = start_point['lat']
-        start_lon = start_point['lon']
-        end_lat = end_point['lat']
-        end_lon = end_point['lon']
-
-        if end_bearing_deg is not None:
-            lat1 = math.radians(start_lat);
-            lon1 = math.radians(start_lon)
-            lat2 = math.radians(end_lat);
-            lon2 = math.radians(end_lon)
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1 - a)))
-            ang_deg = math.degrees(c)
-            # Tighter control point distance (L) to avoid "flat" segments near insertion
-            L = min(15.0, max(3.0, ang_deg / 4.0))
-            br = math.radians(end_bearing_deg)
-            cos_lat = max(1e-6, math.cos(math.radians(end_lat)))
-            dlat_deg = L * math.cos(br)
-            dlon_deg = (L * math.sin(br)) / cos_lat
-            control_lat = end_lat - dlat_deg
-            control_lon = (end_lon - dlon_deg + 180.0) % 360.0 - 180.0
-        else:
-            mid_lat = (start_lat + end_lat) / 2
-            mid_lon = (start_lon + end_lon) / 2
-            dist = _ang_dist_deg(start_point, end_point)
-
-            # Scale control point offset based on distance
-            offset = max(5, min(30, dist * 0.4))
-
-            if orbit_type == 'polar':
-                control_lat = max(-85.0, mid_lat - offset)
-                control_lon = mid_lon - offset / 2
-            elif orbit_type == 'equatorial':
-                # Aim more towards equator
-                target_equator_lat = 0
-                control_lat = (mid_lat + target_equator_lat) / 2
-                control_lon = mid_lon + offset
-            elif orbit_type == 'gto':
-                control_lat = mid_lat + offset
-                control_lon = mid_lon + offset * 2
-            elif orbit_type == 'suborbital':
-                # Suborbital/Booster return needs a tighter arc
-                control_lat = mid_lat + offset / 4
-                control_lon = mid_lon + offset / 4
-            else:
-                control_lat = mid_lat + offset
-                control_lon = mid_lon + offset * 1.5
-
-        for i in range(num_points + 1):
-            t = i / num_points
-            lat = (1 - t) ** 2 * start_lat + 2 * (1 - t) * t * control_lat + t ** 2 * end_lat
-            lon = (1 - t) ** 2 * start_lon + 2 * (1 - t) * t * control_lon + t ** 2 * end_lon
-            lon = (lon + 180) % 360 - 180
-            points.append({'lat': lat, 'lon': lon})
-        return points
 
     # Main generation
     target_r = compute_orbit_radius(orbit)
@@ -1482,97 +1599,71 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         progress = i / max(1, len(trajectory) - 1)
         p['r'] = 1.0 + (target_r - 1.0) * (progress ** 0.4)
 
-    # ── Booster Return Trajectory ─────────────────────────────────────────────
-    # MECO (stage separation) for Falcon 9 occurs at T+~2:30 regardless of
-    # mission type.  Compute the corresponding index into the ascent trajectory.
-    MECO_TIME_MIN = 2.5
-    sep_frac = MECO_TIME_MIN / max(0.1, ASCENT_TIME_MIN)
+    # Booster leg uses only a published endpoint. There is no boostback curve:
+    # Launch Library does not provide one, and a Bezier from an estimated MECO
+    # back to the pad drew Crew-13 across the Atlantic and Flight 14 to a
+    # made-up Gulf point 400 km downrange.
+    landing_site = None
+    if landing_lat is not None:
+        landing_site = {
+            'lat': landing_lat,
+            'lon': landing_lon,
+            'name': next_launch.get('landing_location') or 'Landing zone',
+        }
     booster_trajectory = []
+    booster_ground_track = None
     sep_idx = None
-    if trajectory and len(trajectory) > 10:
-        try:
-            sep_idx = max(4, min(int(len(trajectory) * sep_frac), len(trajectory) - 10))
-
-            sep_point = trajectory[sep_idx].copy()
-            sep_radius = sep_point['r']
-
-            l_type = (landing_type or '').upper()
-            l_loc = (next_launch.get('landing_location') or '').upper()
-            combined_landing_info = f"{l_type} {l_loc}"
-
-            # Expanded detection for ASDS and RTLS
-            asds_keywords = ['ASDS', 'DRONE', 'SHIP', 'OCISLY', 'JRTI', 'ASOG', 'GRAVITAS', 'INSTRUCTIONS',
-                             'STILL LOVE YOU']
-            rtls_keywords = ['RTLS', 'LAUNCH SITE', 'CATCH', 'TOWER', 'LZ', 'LANDING ZONE']
-
-            if any(k in combined_landing_info for k in asds_keywords):
-                # ASDS droneship: Falcon 9 lands ~650 km downrange for LEO,
-                # ~690 km for GTO (longer coast after higher-energy MECO).
-                # Express as fraction of the orbital circumference (≈ 40 030 km).
-                asds_km = 690.0 if normalized_orbit == 'GTO' else 650.0
-                dist_frac = asds_km / _EARTH_CIRCUMFERENCE_KM
-                landing_idx = min(len(master_path) - 1, int(len(master_path) * dist_frac))
-                landing_point = master_path[landing_idx]
-
-                return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
-
-                # Altitude profile: parabolic arc peaking at ~80 km above sep altitude
-                # (ASDS peak ≈ 80 km; RTLS peak ≈ 150 km)
-                peak_dr = (80.0 / _EARTH_RADIUS_KM)
-                for i, p in enumerate(return_part):
-                    prog = i / max(1, len(return_part) - 1)
-                    p['r'] = (sep_radius + (1.0 - sep_radius) * prog
-                              + peak_dr * math.sin(prog * math.pi))
-
-                booster_trajectory = return_part
-                sep_idx = 0  # Indicates start of booster_trajectory in visual tools
-                logger.info(f"Generated accurate ASDS booster trajectory (~{asds_km:.0f} km)")
-            elif any(k in combined_landing_info for k in rtls_keywords):
-                # RTLS / Mechazilla catch: booster returns to launch site with a
-                # higher boostback arc (~150 km peak above sep altitude).
-                return_part = generate_curved_trajectory(sep_point, launch_site, 100, orbit_type='suborbital')
-                peak_dr = (150.0 / _EARTH_RADIUS_KM)
-                for i, p in enumerate(return_part):
-                    prog = i / max(1, len(return_part) - 1)
-                    p['r'] = (sep_radius + (1.0 - sep_radius) * prog
-                              + peak_dr * math.sin(prog * math.pi))
-
-                booster_trajectory = return_part
+    try:
+        if landing_site is not None:
+            offset_km = _distance_km(launch_site, landing_site)
+            if offset_km >= _LZ_OFFSET_MIN_KM:
+                booster_trajectory = _surface_segment(launch_site, landing_site)
+                booster_ground_track = 'landing_zone_offset'
                 sep_idx = 0
-                logger.info(f"Generated accurate RTLS booster trajectory")
-            elif any(k in combined_landing_info for k in ['OCEAN', 'SPLASHDOWN']):
-                # Expendable ocean splashdown: ~400 km downrange (between RTLS and ASDS)
-                ocean_km = 400.0
-                dist_frac = ocean_km / _EARTH_CIRCUMFERENCE_KM
-                landing_idx = min(len(master_path) - 1, int(len(master_path) * dist_frac))
-                landing_point = master_path[landing_idx]
-                return_part = generate_curved_trajectory(sep_point, landing_point, 100, orbit_type='suborbital')
-                peak_dr = (60.0 / _EARTH_RADIUS_KM)
-                for i, p in enumerate(return_part):
-                    prog = i / max(1, len(return_part) - 1)
-                    p['r'] = (sep_radius + (1.0 - sep_radius) * prog
-                              + peak_dr * math.sin(prog * math.pi))
-                booster_trajectory = return_part
+                logger.info(
+                    f"Booster leg is the surveyed pad-to-zone offset ({offset_km:.1f} km)"
+                )
+            else:
+                logger.info(
+                    f"Published landing zone is {offset_km:.2f} km from the pad; no return arc"
+                )
+        elif (
+            landing_downrange_km is not None
+            and landing_downrange_km >= _ASDS_DOWNRANGE_MIN_KM
+        ):
+            booster_trajectory = _path_prefix_to_distance(master_path, landing_downrange_km)
+            if len(booster_trajectory) >= 2:
+                booster_ground_track = 'published_downrange'
                 sep_idx = 0
-                logger.info(f"Generated Ocean splashdown booster trajectory")
+                logger.info(
+                    f"Booster leg follows ascent azimuth to published downrange "
+                    f"{landing_downrange_km:.0f} km"
+                )
             else:
                 booster_trajectory = []
-                sep_idx = None
-                logger.info(f"Skipping booster trajectory for unknown/expendable type")
-        except Exception as e:
-            logger.warning(f"Booster trajectory generation failed: {e}")
+        else:
+            logger.info("No published landing coordinate or downrange; omitting booster track")
+    except Exception as e:
+        logger.warning(f"Booster trajectory generation failed: {e}")
+        booster_trajectory = []
+        booster_ground_track = None
+        sep_idx = None
 
     result = {
         'launch_site': launch_site,
         'trajectory': trajectory,
         'booster_trajectory': booster_trajectory,
+        'booster_ground_track': booster_ground_track,
         'sep_idx': sep_idx,
         'orbit_path': orbit_path,
         'orbit': orbit,
         'mission': mission_name,
         'pad': pad,
         'landing_type': landing_type,
-        'landing_location': next_launch.get('landing_location')
+        'landing_location': next_launch.get('landing_location'),
+        'landing_site': landing_site,
+        'landing_downrange_km': landing_downrange_km,
+        'inclination_deg': assumed_incl,
     }
 
     # Persist to cache
@@ -1587,7 +1678,10 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             'inclination_deg': assumed_incl,
             'landing_type': landing_type,
             'landing_location': next_launch.get('landing_location'),
-            'model': 'v13-orbital-mechanics'
+            'landing_site': landing_site,
+            'landing_downrange_km': landing_downrange_km,
+            'booster_ground_track': booster_ground_track,
+            'model': 'v14-published-landing'
         }
         save_cache_to_file(TRAJECTORY_CACHE_FILE, traj_cache, datetime.now(pytz.utc))
     except Exception as e:
@@ -2290,16 +2384,11 @@ def _ll_request_headers():
 
 def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
     """Helper to parse raw API launch data into the dashboard's internal format."""
-    launcher_stage = launch.get('rocket', {}).get('launcher_stage', [])
-    landing_type = None
-    landing_location = None
-    if isinstance(launcher_stage, list) and len(launcher_stage) > 0:
-        landing = launcher_stage[0].get('landing')
-        if landing:
-            landing_type = landing.get('type', {}).get('name')
-            landing_location = landing.get('landing_location', {}).get('name')
-            if not landing_location:
-                landing_location = landing.get('location', {}).get('name')
+    rocket = launch.get('rocket') if isinstance(launch.get('rocket'), dict) else {}
+    launcher_stage = rocket.get('launcher_stage', [])
+    landing = _select_stage_landing(launcher_stage if isinstance(launcher_stage, list) else [])
+    landing_type = landing.get('landing_type')
+    landing_location = landing.get('landing_location')
 
     mission_data = launch.get('mission') or {}
     launch_name = launch.get('name', 'Unknown')
@@ -2360,6 +2449,9 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
                             '') if vid_urls else '',
         'landing_type': landing_type,
         'landing_location': landing_location,
+        'landing_latitude': landing.get('landing_latitude'),
+        'landing_longitude': landing.get('landing_longitude'),
+        'landing_downrange_km': landing.get('landing_downrange_km'),
         'is_detailed': is_detailed,
         # New enriched fields for "ALL data" view
         'description': mission_data.get('description', ''),
@@ -5019,11 +5111,12 @@ def _slim_launch(launch, keep_trajectory=False):
 
 
 def _repair_mismatched_trajectory(data):
-    """Regenerate a cached trajectory whose origin does not match the pad.
+    """Regenerate a cached trajectory that is on the wrong pad or an old model.
 
     Flight 14 was stored with an LC-39A launch site while its pad is OLP-2.
-    Slim responses serve that blob until the next launch refresh, so correct
-    it on read and persist the Starbase track.
+    Tracks from before published landing endpoints omit ``booster_ground_track``
+    and still carry an invented booster arc. Slim responses serve that blob
+    until the next launch refresh, so correct it on read.
     """
     if not isinstance(data, dict):
         return False
@@ -5047,7 +5140,12 @@ def _repair_mismatched_trajectory(data):
     points = traj.get('trajectory')
     if isinstance(points, list) and points and isinstance(points[0], dict):
         origin = points[0]
-    if not _coords_far(current, expected) and not _coords_far(origin, expected):
+    stale_model = "booster_ground_track" not in traj
+    if (
+        not stale_model
+        and not _coords_far(current, expected)
+        and not _coords_far(origin, expected)
+    ):
         return False
     new_traj = get_launch_trajectory_data(launch, previous)
     if not new_traj:

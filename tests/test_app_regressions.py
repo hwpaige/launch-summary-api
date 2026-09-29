@@ -802,6 +802,7 @@ class LaunchSiteTrajectoryTests(unittest.TestCase):
                         "name": "Cape Canaveral, FL",
                     },
                     "trajectory": [{"lat": 28.6084, "lon": -80.6043, "r": 1.0}],
+                    "booster_ground_track": None,
                 },
             }],
             "previous": [],
@@ -818,6 +819,198 @@ class LaunchSiteTrajectoryTests(unittest.TestCase):
             slim["upcoming"][0]["trajectory_data"]["launch_site"]["name"],
             "Cape Canaveral, FL",
         )
+
+    def test_parse_keeps_published_landing_zone_over_expended_core(self):
+        parsed = app.parse_launch_data({
+            "id": "fh-1",
+            "name": "Falcon Heavy | NROL-97",
+            "net": "2026-10-02T03:53:00Z",
+            "status": {"name": "Go", "id": 1},
+            "rocket": {
+                "configuration": {"name": "Falcon Heavy"},
+                "launcher_stage": [
+                    {
+                        "type": "Strap-On Booster",
+                        "landing": {
+                            "type": {"name": "Return to Launch Site"},
+                            "downrange_distance": 14.9,
+                            "landing_location": {
+                                "name": "Landing Zone 1",
+                                "latitude": 28.485712,
+                                "longitude": -80.542963,
+                            },
+                        },
+                    },
+                    {
+                        "type": "Core",
+                        "landing": {
+                            "type": {"name": "Expended"},
+                            "downrange_distance": None,
+                            "landing_location": {
+                                "name": "Atlantic Ocean",
+                                "latitude": None,
+                                "longitude": None,
+                            },
+                        },
+                    },
+                ],
+            },
+            "mission": {"orbit": {"name": "Unknown"}, "description": "Classified payload."},
+            "pad": {"name": "Launch Complex 39A", "latitude": 28.60822681, "longitude": -80.60428186},
+        })
+        self.assertEqual(parsed["landing_type"], "Return to Launch Site")
+        self.assertEqual(parsed["landing_location"], "Landing Zone 1")
+        self.assertAlmostEqual(parsed["landing_latitude"], 28.485712, places=5)
+        self.assertAlmostEqual(parsed["landing_longitude"], -80.542963, places=5)
+        self.assertAlmostEqual(parsed["landing_downrange_km"], 14.9, places=2)
+
+    def test_crew_iss_ground_track_uses_station_inclination(self):
+        launch = {
+            "mission": "Falcon 9 Block 5 | Crew-13",
+            "name": "Falcon 9 Block 5 | Crew-13",
+            "description": (
+                "SpaceX Crew-13 is the thirteenth crewed operational flight of a "
+                "Crew Dragon spacecraft to the International Space Station."
+            ),
+            "pad": "Space Launch Complex 40",
+            "pad_latitude": 28.56194122,
+            "pad_longitude": -80.57735736,
+            "orbit": "Low Earth Orbit",
+            "landing_type": "Return to Launch Site",
+            "landing_location": "Landing Zone 40",
+            "landing_latitude": 28.5634384,
+            "landing_longitude": -80.5752619,
+            "landing_downrange_km": 0.3,
+        }
+        with patch.object(app, "save_cache_to_file"), patch.object(app, "r", None):
+            traj = app.get_launch_trajectory_data(launch)
+        lats = [p["lat"] for p in traj["orbit_path"]]
+        self.assertGreater(max(lats), 48.0)
+        self.assertLess(max(lats), 55.0)
+        self.assertAlmostEqual(traj["inclination_deg"], 51.6, places=1)
+        # LZ-40 is a few hundred metres from SLC-40. No Atlantic return arc.
+        self.assertEqual(traj["booster_trajectory"], [])
+        self.assertIsNone(traj["booster_ground_track"])
+        self.assertAlmostEqual(traj["landing_site"]["lat"], 28.5634384, places=5)
+        self.assertAlmostEqual(traj["landing_site"]["lon"], -80.5752619, places=5)
+
+    def test_lz1_offset_ends_at_the_published_pad_not_the_launch_pad(self):
+        launch = {
+            "mission": "Falcon Heavy | NROL-97",
+            "pad": "Launch Complex 39A",
+            "pad_latitude": 28.60822681,
+            "pad_longitude": -80.60428186,
+            "orbit": "Unknown",
+            "landing_type": "Return to Launch Site",
+            "landing_location": "Landing Zone 1",
+            "landing_latitude": 28.485712,
+            "landing_longitude": -80.542963,
+            "landing_downrange_km": 14.9,
+        }
+        with patch.object(app, "save_cache_to_file"), patch.object(app, "r", None):
+            traj = app.get_launch_trajectory_data(launch)
+        end = traj["booster_trajectory"][-1]
+        pad = traj["launch_site"]
+        self.assertEqual(traj["booster_ground_track"], "landing_zone_offset")
+        self.assertAlmostEqual(end["lat"], 28.485712, places=3)
+        self.assertAlmostEqual(end["lon"], -80.542963, places=3)
+        self.assertGreater(app._distance_km(pad, end), 10.0)
+        self.assertLess(app._distance_km(pad, end), 20.0)
+        # The leg stays near the Cape. It does not run downrange into the Atlantic.
+        self.assertLess(app._distance_km(pad, end), 30.0)
+        self.assertTrue(all(app._distance_km(pad, p) < 30.0 for p in traj["booster_trajectory"]))
+
+    def test_asds_uses_published_downrange_not_a_650_km_default(self):
+        launch = {
+            "mission": "Falcon 9 Block 5 | Starlink Group 15-25",
+            "pad": "Space Launch Complex 4E",
+            "pad_latitude": 34.632,
+            "pad_longitude": -120.611,
+            "pad_location": "Vandenberg SFB, CA, USA",
+            "orbit": "Low Earth Orbit",
+            "landing_type": "Autonomous Spaceport Drone Ship",
+            "landing_location": "Of Course I Still Love You",
+            "landing_downrange_km": 574.0,
+        }
+        with patch.object(app, "save_cache_to_file"), patch.object(app, "r", None):
+            traj = app.get_launch_trajectory_data(launch)
+        end = traj["booster_trajectory"][-1]
+        pad = traj["launch_site"]
+        distance = app._distance_km(pad, end)
+        self.assertEqual(traj["booster_ground_track"], "published_downrange")
+        self.assertAlmostEqual(distance, 574.0, delta=15.0)
+        self.assertGreater(abs(distance - 650.0), 40.0)
+
+    def test_ocean_splashdown_without_coordinates_has_no_booster_track(self):
+        launch = {
+            "mission": "Starship | Starlink Group 31-1 (Starship Flight 14)",
+            "pad": "Orbital Launch Pad 2",
+            "pad_latitude": 25.99677,
+            "pad_longitude": -97.15799,
+            "pad_location": "SpaceX Starbase, TX, USA",
+            "orbit": "Low Earth Orbit",
+            "landing_type": "Ocean",
+            "landing_location": "Gulf of Mexico",
+            "description": (
+                "The booster’s primary test objective on Flight 14 will be a "
+                "landing burn at an offshore landing point in the Gulf."
+            ),
+        }
+        with patch.object(app, "save_cache_to_file"), patch.object(app, "r", None):
+            traj = app.get_launch_trajectory_data(launch)
+        self.assertIn("Starbase", traj["launch_site"]["name"])
+        self.assertEqual(traj["booster_trajectory"], [])
+        self.assertIsNone(traj["booster_ground_track"])
+        self.assertIsNone(traj["landing_site"])
+
+    def test_stale_booster_model_is_regenerated_on_read(self):
+        payload = {
+            "upcoming": [{
+                "id": "crew-13",
+                "mission": "Falcon 9 Block 5 | Crew-13",
+                "pad": "Space Launch Complex 40",
+                "pad_latitude": 28.56194122,
+                "pad_longitude": -80.57735736,
+                "orbit": "Low Earth Orbit",
+                "landing_type": "Return to Launch Site",
+                "landing_location": "Landing Zone 40",
+                "landing_latitude": 28.5634384,
+                "landing_longitude": -80.5752619,
+                "trajectory_data": {
+                    "launch_site": {
+                        "lat": 28.56194122,
+                        "lon": -80.57735736,
+                        "name": "Cape Canaveral, FL",
+                    },
+                    "trajectory": [
+                        {"lat": 28.56194122, "lon": -80.57735736, "r": 1.0},
+                        {"lat": 29.0, "lon": -70.0, "r": 1.04},
+                    ],
+                    "booster_trajectory": [
+                        {"lat": 29.0, "lon": -70.0, "r": 1.04},
+                        {"lat": 28.56194122, "lon": -80.57735736, "r": 1.0},
+                    ],
+                },
+            }],
+            "previous": [],
+            "last_updated": "2026-09-28T00:00:00Z",
+        }
+        persisted = []
+
+        def fake_persist(key, data, ttl=None):
+            persisted.append(key)
+            return True
+
+        with patch.object(app, "get_cached_data", return_value=payload), \
+             patch.object(app, "set_cached_data", side_effect=fake_persist), \
+             patch.object(app, "save_cache_to_file"), \
+             patch.object(app, "r", None):
+            slim = app.get_launches_slim(internal=True)
+
+        traj = slim["upcoming"][0]["trajectory_data"]
+        self.assertIn("booster_ground_track", traj)
+        self.assertEqual(traj["booster_trajectory"], [])
+        self.assertTrue(any(key == app.LAUNCHES_CACHE_KEY for key in persisted))
 
 
 if __name__ == "__main__":
