@@ -33,7 +33,7 @@ app = FastAPI(
     title="SpaceX Launch Summary API",
     description=(
         "Witty SpaceX launch narratives, upcoming-launch data, weather, "
-        "cached CelesTrak satellite GP/TLE for the dashboard globe, and "
+        "cached satellite GP/TLE for the dashboard globe, and "
         "Launch Buddy notification copy. Past-launch narratives and "
         "`/notify/copy` both use the xAI Grok model "
         f"`{GROK_MODEL}` via `XAI_API_KEY`."
@@ -50,12 +50,14 @@ app = FastAPI(
         {
             "name": "Satellites",
             "description": (
-                "Cached CelesTrak GP/OMM element sets (Starlink, stations, and a "
+                "Cached GP/OMM element sets (Starlink, stations, and a "
                 "small allowlist) plus deployed Starlink TLEs for the recent "
-                "Starship V3 flight. SATCAT GP is preferred once cataloged; "
-                "until then, SpaceX public MEME ephemerides fill the same "
-                "TLE shape. Clients propagate with SGP4 (e.g. satellite.js); "
-                "this is not live telemetry."
+                "Starship V3 flight. Starlink GP is loaded from Space-Track "
+                "when SPACE_TRACK_IDENTITY and SPACE_TRACK_PASSWORD are set, "
+                "and from CelesTrak otherwise. SATCAT is preferred once "
+                "cataloged; until then, SpaceX public MEME ephemerides fill "
+                "the same TLE shape. Clients propagate with SGP4 "
+                "(e.g. satellite.js); this is not live telemetry."
             ),
         },
     ],
@@ -167,8 +169,9 @@ WEATHER_DEBOUNCE_SEC = 20.0
 REFRESH_LOCK_TTL = 90
 HEAVY_LAUNCH_FIELDS = ("all_data",)
 
-# CelesTrak GP / OMM — 1h freshness, keep a longer stale copy so Pi clients
-# are not sent to celestrak.org (CORS + rate limits) when upstream blips.
+# GP / OMM — 1h freshness, keep a longer stale copy so Pi clients are not
+# sent upstream when a fetch blips. Starlink GP prefers Space-Track (their
+# GP class is 1/hour). CelesTrak is the secondary if that query fails.
 CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
 CELESTRAK_HEADERS = {
     "User-Agent": (
@@ -267,6 +270,48 @@ _MEME_STAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
 _INTDES_RE = re.compile(r"^(\d{4}-\d{3})")
 _TLE_ALPHA5 = "ABCDEFGHJKLMNPQRSTUVWXYZ"  # I and O omitted (Space-Track alpha-5)
 
+# Space-Track session auth. Password is read from the environment at call
+# time and is never logged. There is no API-key product; the session cookie
+# name is chocolatechip.
+SPACE_TRACK_BASE = "https://www.space-track.org"
+SPACE_TRACK_LOGIN_URL = SPACE_TRACK_BASE + "/ajaxauth/login"
+# One GP-class query per hour (Space-Track published limit). decay_date null
+# and epoch within 10 days keeps the set propagable, per their GP guidance.
+SPACE_TRACK_STARLINK_GP_PATH = (
+    "/basicspacedata/query/class/gp/"
+    "OBJECT_NAME/STARLINK~~/"
+    "decay_date/null-val/epoch/%3Enow-10/"
+    "orderby/NORAD_CAT_ID%20asc/format/json/emptyresult/show"
+)
+# SATCAT is a different class (1/day). Used only when CelesTrak SATCAT fails.
+SPACE_TRACK_STARLINK_SATCAT_PATH = (
+    "/basicspacedata/query/class/satcat/"
+    "SATNAME/STARLINK~~/"
+    "orderby/NORAD_CAT_ID%20asc/format/json/emptyresult/show"
+)
+SPACE_TRACK_HEADERS = {
+    "User-Agent": (
+        "launch-summary-api/satellites "
+        "(https://github.com/hwpaige/launch-summary-api; SpaceX dashboard GP cache)"
+    ),
+    "Accept": "application/json",
+}
+SPACE_TRACK_LOGIN_TIMEOUT = 20
+SPACE_TRACK_QUERY_TIMEOUT = 45
+# Stay under the published 30/minute and 300/hour ceilings.
+SPACE_TRACK_MAX_PER_MINUTE = 29
+SPACE_TRACK_MAX_PER_HOUR = 299
+SPACE_TRACK_GP_SUCCESS_SEC = 3600
+SPACE_TRACK_GP_FAIL_BACKOFF_SEC = 120
+SPACE_TRACK_GP_MAX_ATTEMPTS = 3
+SPACE_TRACK_SATCAT_SUCCESS_SEC = 24 * 3600
+SPACE_TRACK_SATCAT_FAIL_BACKOFF_SEC = 900
+SPACE_TRACK_SATCAT_MAX_ATTEMPTS = 2
+SPACE_TRACK_GP_OK_KEY = "space_track_gp_starlink_ok_v1"
+SPACE_TRACK_SATCAT_OK_KEY = "space_track_satcat_starlink_ok_v1"
+SATELLITES_STALE_ALERT_SEC = 6 * 3600
+SATELLITES_STALE_ALERT_REPEAT_SEC = 15 * 60
+
 
 _UTC_NOW = object()
 
@@ -340,14 +385,279 @@ _local_deployed = {}
 _local_satcat_index = None
 _deployed_flights = {}
 _deployed_flights_lock = threading.Lock()
+_deployed_refresh_lock = threading.Lock()
+_deployed_refresh_inflight = set()
+_deployed_refresh_after = {}
 _satcat_flight = _SingleFlight()
+_stale_alert_after = {}
+_stale_alert_lock = threading.Lock()
+_space_track_unconfigured_logged = False
+
+
+def _redact_space_track_secret(exc) -> str:
+    """Exception text safe to log. SPACE_TRACK_PASSWORD is never included."""
+    text = f"{type(exc).__name__}: {exc}"
+    password = os.getenv("SPACE_TRACK_PASSWORD") or ""
+    if password:
+        text = text.replace(password, "[redacted]")
+    return text
+
+
+class _SpaceTrackSkipped(Exception):
+    """Space-Track was not queried (no credentials, or a class rate limit)."""
+
+
+class _SpaceTrackError(Exception):
+    """Space-Track was queried and did not return a usable catalog."""
+
+
+class _SpaceTrackClient:
+    """Identity/password session against space-track.org.
+
+    Login is POST /ajaxauth/login. Later calls send the chocolatechip cookie.
+    A 401 logs in again once. Request rate stays under 30/minute and 300/hour.
+    The GP class is additionally limited to one successful Starlink download
+    per hour, and SATCAT to one successful download per day.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._session = None
+        self._logged_in = False
+        self._request_times = []
+        self._gp_success_mono = 0.0
+        self._satcat_success_mono = 0.0
+        self._gp_attempts = []
+        self._satcat_attempts = []
+
+    def reset(self):
+        with self._lock:
+            self._session = None
+            self._logged_in = False
+            self._request_times = []
+            self._gp_success_mono = 0.0
+            self._satcat_success_mono = 0.0
+            self._gp_attempts = []
+            self._satcat_attempts = []
+
+    def configured(self) -> bool:
+        identity = (os.getenv("SPACE_TRACK_IDENTITY") or "").strip()
+        password = os.getenv("SPACE_TRACK_PASSWORD") or ""
+        return bool(identity and password)
+
+    def gp_allowed(self) -> bool:
+        with self._lock:
+            if self._recent_success(
+                self._gp_success_mono, SPACE_TRACK_GP_OK_KEY, SPACE_TRACK_GP_SUCCESS_SEC
+            ):
+                return False
+            return not self._attempts_blocked(
+                "gp",
+                SPACE_TRACK_GP_MAX_ATTEMPTS,
+                SPACE_TRACK_GP_FAIL_BACKOFF_SEC,
+                SPACE_TRACK_GP_SUCCESS_SEC,
+            )
+
+    def satcat_allowed(self) -> bool:
+        with self._lock:
+            if self._recent_success(
+                self._satcat_success_mono,
+                SPACE_TRACK_SATCAT_OK_KEY,
+                SPACE_TRACK_SATCAT_SUCCESS_SEC,
+            ):
+                return False
+            return not self._attempts_blocked(
+                "satcat",
+                SPACE_TRACK_SATCAT_MAX_ATTEMPTS,
+                SPACE_TRACK_SATCAT_FAIL_BACKOFF_SEC,
+                SPACE_TRACK_SATCAT_SUCCESS_SEC,
+            )
+
+    def note_gp_attempt(self):
+        with self._lock:
+            self._gp_attempts.append(time.monotonic())
+            self._incr_redis("space_track_gp_attempts_v1", SPACE_TRACK_GP_SUCCESS_SEC)
+
+    def note_satcat_attempt(self):
+        with self._lock:
+            self._satcat_attempts.append(time.monotonic())
+            self._incr_redis(
+                "space_track_satcat_attempts_v1", SPACE_TRACK_SATCAT_SUCCESS_SEC
+            )
+
+    def note_gp_success(self):
+        with self._lock:
+            self._gp_success_mono = time.monotonic()
+        set_cached_data(
+            SPACE_TRACK_GP_OK_KEY,
+            {"fetched_at": _utc_isoformat()},
+            ttl=SPACE_TRACK_GP_SUCCESS_SEC,
+        )
+
+    def note_satcat_success(self):
+        with self._lock:
+            self._satcat_success_mono = time.monotonic()
+        set_cached_data(
+            SPACE_TRACK_SATCAT_OK_KEY,
+            {"fetched_at": _utc_isoformat()},
+            ttl=SPACE_TRACK_SATCAT_SUCCESS_SEC,
+        )
+
+    def get_json(self, path: str, timeout: float):
+        url = SPACE_TRACK_BASE + path
+        with self._lock:
+            self._ensure_login(timeout)
+            response = self._get_locked(url, timeout)
+            if getattr(response, "status_code", None) == 401:
+                self._logged_in = False
+                self._ensure_login(timeout)
+                response = self._get_locked(url, timeout)
+            status = getattr(response, "status_code", None)
+            if status != 200:
+                raise _SpaceTrackError(f"HTTP {status}")
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise _SpaceTrackError("non-JSON response") from exc
+
+    def _ensure_login(self, timeout: float):
+        if self._logged_in and _space_track_cookie(self._session):
+            return
+        self._logged_in = False
+        self._login(timeout)
+
+    def _login(self, timeout: float):
+        identity = (os.getenv("SPACE_TRACK_IDENTITY") or "").strip()
+        password = os.getenv("SPACE_TRACK_PASSWORD") or ""
+        if not identity or not password:
+            raise _SpaceTrackSkipped("credentials not configured")
+        if self._session is None:
+            self._session = requests.Session()
+        self._reserve_request()
+        try:
+            response = self._session.post(
+                SPACE_TRACK_LOGIN_URL,
+                data={"identity": identity, "password": password},
+                headers={"Accept": "application/json, text/plain, */*"},
+                timeout=min(SPACE_TRACK_LOGIN_TIMEOUT, max(1.0, timeout)),
+            )
+        except _SpaceTrackError:
+            self._logged_in = False
+            raise
+        except Exception as exc:
+            self._logged_in = False
+            raise _SpaceTrackError(_redact_space_track_secret(exc)) from None
+        status = getattr(response, "status_code", None)
+        if status != 200 or not _space_track_cookie(self._session):
+            self._logged_in = False
+            raise _SpaceTrackError(f"login failed: HTTP {status}")
+        self._logged_in = True
+
+    def _get_locked(self, url: str, timeout: float):
+        if self._session is None:
+            raise _SpaceTrackError("not logged in")
+        self._reserve_request()
+        try:
+            return self._session.get(
+                url,
+                headers=SPACE_TRACK_HEADERS,
+                timeout=max(1.0, min(SPACE_TRACK_QUERY_TIMEOUT, timeout)),
+            )
+        except _SpaceTrackError:
+            raise
+        except Exception as exc:
+            raise _SpaceTrackError(_redact_space_track_secret(exc)) from None
+
+    def _reserve_request(self):
+        now = time.monotonic()
+        self._request_times = [t for t in self._request_times if now - t < 3600]
+        in_minute = sum(1 for t in self._request_times if now - t < 60)
+        if (
+            in_minute >= SPACE_TRACK_MAX_PER_MINUTE
+            or len(self._request_times) >= SPACE_TRACK_MAX_PER_HOUR
+        ):
+            raise _SpaceTrackError("Space-Track rate limit reached")
+        self._request_times.append(now)
+
+    def _recent_success(self, mono_stamp, redis_key, interval) -> bool:
+        if mono_stamp and (time.monotonic() - mono_stamp) < interval:
+            return True
+        cached = get_cached_data(redis_key)
+        if isinstance(cached, dict):
+            age = satellite_age_seconds(cached)
+            if age is not None and age < interval:
+                return True
+        return False
+
+    def _attempts_blocked(self, kind, max_attempts, backoff, window) -> bool:
+        now = time.monotonic()
+        stamps = self._gp_attempts if kind == "gp" else self._satcat_attempts
+        recent = [t for t in stamps if now - t < window]
+        if kind == "gp":
+            self._gp_attempts = recent
+        else:
+            self._satcat_attempts = recent
+        count = len(recent)
+        redis_count = self._redis_count(f"space_track_{kind}_attempts_v1")
+        if redis_count is not None:
+            count = max(count, redis_count)
+        if count >= max_attempts:
+            return True
+        if recent and (now - recent[-1]) < backoff:
+            return True
+        return False
+
+    def _incr_redis(self, key, ttl):
+        if not r:
+            return
+        try:
+            count = int(r.incr(key))
+            if count == 1:
+                r.expire(key, int(ttl))
+        except Exception as exc:
+            print(f"Space-Track rate-limit counter failed for {key}: {exc}")
+
+    def _redis_count(self, key):
+        if not r:
+            return None
+        try:
+            raw = r.get(key)
+            if raw is None:
+                return 0
+            return int(raw)
+        except Exception:
+            return None
+
+
+def _space_track_cookie(session):
+    if session is None:
+        return None
+    jar = getattr(session, "cookies", None)
+    if jar is None:
+        return None
+    direct = jar.get("chocolatechip") if hasattr(jar, "get") else None
+    if direct:
+        return direct
+    try:
+        for cookie in jar:
+            name = getattr(cookie, "name", "")
+            if str(name).lower() == "chocolatechip":
+                return getattr(cookie, "value", None) or True
+    except TypeError:
+        return None
+    return None
+
+
+_space_track = _SpaceTrackClient()
 
 
 def _reset_cache_coordination_for_tests():
     """Reset single-flight / debounce state between unit tests."""
     global _weather_last_refresh_at, _weather_last_result, _background_enabled, _TRAJECTORY_DATA_CACHE
-    global _local_satcat_index
+    global _local_satcat_index, _space_track_unconfigured_logged
     _background_enabled = False
+    _space_track_unconfigured_logged = False
+    _space_track.reset()
     _TRAJECTORY_DATA_CACHE = {}
     _weather_flight.reset()
     _launches_flight.reset()
@@ -380,6 +690,11 @@ def _reset_cache_coordination_for_tests():
         for flight in _deployed_flights.values():
             flight.reset()
         _deployed_flights.clear()
+    with _deployed_refresh_lock:
+        _deployed_refresh_inflight.clear()
+        _deployed_refresh_after.clear()
+    with _stale_alert_lock:
+        _stale_alert_after.clear()
 
 
 def _redis_single_flight(name, fn, wait_timeout=None):
@@ -3324,12 +3639,23 @@ def omm_to_tle_lines(omm: dict):
         return None, None
 
 
+def _official_tle_lines(omm: dict):
+    """Use upstream TLE lines when both are already valid 69-character lines."""
+    line1 = str((omm or {}).get("TLE_LINE1") or "").strip()
+    line2 = str((omm or {}).get("TLE_LINE2") or "").strip()
+    if len(line1) == 69 and len(line2) == 69 and line1[0] == "1" and line2[0] == "2":
+        return line1, line2
+    return None, None
+
+
 def slim_gp_record(omm: dict) -> dict:
     """Compact satellite.js record: name + norad + TLE, with slim OMM fallback."""
     name = omm.get("OBJECT_NAME") or ""
     norad = omm.get("NORAD_CAT_ID")
     record = {"name": name, "norad_id": norad}
-    line1, line2 = omm_to_tle_lines(omm)
+    line1, line2 = _official_tle_lines(omm)
+    if not line1 or not line2:
+        line1, line2 = omm_to_tle_lines(omm)
     if line1 and line2:
         record["tle_line1"] = line1
         record["tle_line2"] = line2
@@ -3363,6 +3689,39 @@ def satellite_age_seconds(payload):
 def satellite_cache_is_fresh(payload, ttl=SATELLITES_CACHE_TTL) -> bool:
     age = satellite_age_seconds(payload)
     return age is not None and age < ttl
+
+
+def _note_satellite_staleness(payload, *, kind, name, refresh_failed=False):
+    """Structured warning when a served catalog is older than about six hours.
+
+    Repeated hits for the same catalog are throttled. The log line never
+    includes Space-Track credentials.
+    """
+    age = satellite_age_seconds(payload)
+    if age is None or age < SATELLITES_STALE_ALERT_SEC:
+        return
+    key = f"{kind}:{name}"
+    now = time.monotonic()
+    with _stale_alert_lock:
+        if now < _stale_alert_after.get(key, 0):
+            return
+        _stale_alert_after[key] = now + SATELLITES_STALE_ALERT_REPEAT_SEC
+    count = (payload or {}).get("count")
+    if count is None:
+        sats = (payload or {}).get("satellites")
+        count = len(sats) if isinstance(sats, list) else None
+    logger.warning(json.dumps({
+        "event": "satellite_catalog_stale",
+        "alert": True,
+        "threshold_hours": 6,
+        "age_seconds": int(age),
+        "fetched_at": (payload or {}).get("fetched_at"),
+        "kind": kind,
+        "name": name,
+        "count": count,
+        "source": (payload or {}).get("source"),
+        "refresh_failed": bool(refresh_failed),
+    }, sort_keys=True, default=str))
 
 
 def _read_satellite_cache(group: str):
@@ -3521,14 +3880,14 @@ def _write_satellite_cache(group: str, payload: dict):
     _remember_satellite_http(group, payload, persist=True)
 
 
-def _satellite_payload(group: str, satellites: list, stale: bool = False) -> dict:
+def _satellite_payload(group: str, satellites: list, stale: bool = False, source: str = "celestrak") -> dict:
     return {
         "group": group,
         "fetched_at": _utc_isoformat(),
         "ttl_seconds": SATELLITES_CACHE_TTL,
         "count": len(satellites),
         "stale": stale,
-        "source": "celestrak",
+        "source": source or "celestrak",
         "note": SATELLITE_NOTE,
         "satellites": satellites,
     }
@@ -3548,6 +3907,141 @@ def _run_with_deadline(fn, seconds: float):
         raise TimeoutError(f"operation exceeded {seconds:.0f}s") from None
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+
+
+def normalize_space_track_gp(item):
+    """Map a Space-Track GP JSON object onto the OMM fields this app already uses.
+
+    Returns None when the row is not a Starlink with a catalog number and epoch.
+    Numeric fields may arrive as strings; they are coerced. Positions are not
+    invented: rows that cannot be parsed are dropped.
+    """
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("OBJECT_NAME") or "").strip()
+    if not name.upper().startswith("STARLINK"):
+        return None
+    norad = _norad_int(item.get("NORAD_CAT_ID"))
+    epoch = str(item.get("EPOCH") or "").strip()
+    if norad is None or not epoch:
+        return None
+    omm = {
+        "OBJECT_NAME": name,
+        "NORAD_CAT_ID": norad,
+        "EPOCH": epoch.replace(" ", "T"),
+    }
+    object_id = str(item.get("OBJECT_ID") or "").strip()
+    if object_id:
+        omm["OBJECT_ID"] = object_id
+    classification = str(item.get("CLASSIFICATION_TYPE") or "U").strip() or "U"
+    omm["CLASSIFICATION_TYPE"] = classification[:1]
+    for key in (
+        "MEAN_MOTION",
+        "ECCENTRICITY",
+        "INCLINATION",
+        "RA_OF_ASC_NODE",
+        "ARG_OF_PERICENTER",
+        "MEAN_ANOMALY",
+        "BSTAR",
+        "MEAN_MOTION_DOT",
+        "MEAN_MOTION_DDOT",
+    ):
+        if item.get(key) in (None, ""):
+            continue
+        try:
+            omm[key] = float(item.get(key))
+        except (TypeError, ValueError):
+            continue
+    for key in ("EPHEMERIS_TYPE", "ELEMENT_SET_NO", "REV_AT_EPOCH"):
+        if item.get(key) in (None, ""):
+            continue
+        try:
+            omm[key] = int(float(item.get(key)))
+        except (TypeError, ValueError):
+            continue
+    for key in ("TLE_LINE1", "TLE_LINE2"):
+        line = str(item.get(key) or "").strip()
+        if line:
+            omm[key] = line
+    return omm
+
+
+def _log_space_track_unconfigured():
+    global _space_track_unconfigured_logged
+    if _space_track_unconfigured_logged:
+        return
+    _space_track_unconfigured_logged = True
+    print(
+        "Space-Track credentials not set "
+        "(SPACE_TRACK_IDENTITY / SPACE_TRACK_PASSWORD); Starlink GP uses CelesTrak"
+    )
+
+
+def fetch_space_track_starlink_gp(deadline: float = None) -> list:
+    """Download the current Starlink GP catalog from Space-Track as slim records."""
+    if not _space_track.configured():
+        _log_space_track_unconfigured()
+        raise _SpaceTrackSkipped("credentials not configured")
+    if not _space_track.gp_allowed():
+        raise _SpaceTrackSkipped("hourly GP limit")
+    seconds = SATELLITES_GP_DEADLINE_SEC if deadline is None else deadline
+
+    def _download():
+        _space_track.note_gp_attempt()
+        data = _space_track.get_json(SPACE_TRACK_STARLINK_GP_PATH, timeout=seconds)
+        if not isinstance(data, list):
+            raise _SpaceTrackError("GP JSON was not a list")
+        satellites = []
+        for item in data:
+            omm = normalize_space_track_gp(item)
+            if omm is None:
+                continue
+            satellites.append(slim_gp_record(omm))
+        if not satellites:
+            raise _SpaceTrackError("GP query returned no Starlink records")
+        return satellites
+
+    try:
+        satellites = _run_with_deadline(_download, seconds)
+    except TimeoutError:
+        print(f"Space-Track GP deadline ({seconds:.0f}s) exceeded for starlink")
+        raise
+    _space_track.note_gp_success()
+    print(f"Space-Track GP starlink records={len(satellites)}")
+    return satellites
+
+
+def _fetch_satellite_gp(group: str, deadline: float = None):
+    """Return ``(satellites, source)``.
+
+    Starlink tries Space-Track first. Any other allowlisted group stays on
+    CelesTrak: Space-Track allows one GP-class download per hour, and that
+    budget is the Starlink catalog. A failed Starlink query still falls
+    through to CelesTrak with whatever deadline remains.
+    """
+    started = time.monotonic()
+    budget = deadline
+    space_error = None
+    if group == "starlink":
+        try:
+            return fetch_space_track_starlink_gp(deadline=budget), "space-track"
+        except _SpaceTrackSkipped as exc:
+            if "hourly" in str(exc):
+                print(f"Space-Track GP skipped for starlink: {exc}")
+        except Exception as exc:
+            space_error = _redact_space_track_secret(exc)
+            print(f"Space-Track GP failed for starlink: {space_error}")
+        if budget is not None:
+            budget = max(0.1, budget - (time.monotonic() - started))
+    try:
+        return fetch_celestrak_gp(group, deadline=budget), "celestrak"
+    except Exception as exc:
+        if space_error:
+            raise RuntimeError(
+                f"Space-Track GP failed ({space_error}); "
+                f"CelesTrak GP failed ({_redact_space_track_secret(exc)})"
+            ) from None
+        raise
 
 
 def fetch_celestrak_gp(group: str, deadline: float = None) -> list:
@@ -3592,13 +4086,16 @@ def _refresh_satellites_uncached(group: str, force: bool = False, deadline: floa
         return _present_satellite_payload(cached, stale=False)
 
     try:
-        satellites = fetch_celestrak_gp(group, deadline=deadline)
-        payload = _satellite_payload(group, satellites, stale=False)
+        satellites, source = _fetch_satellite_gp(group, deadline=deadline)
+        payload = _satellite_payload(group, satellites, stale=False, source=source)
         _write_satellite_cache(group, payload)
         return payload
     except Exception as exc:
-        print(f"Error fetching CelesTrak GP for {group}: {exc}")
+        print(f"Error fetching satellite GP for {group}: {_redact_space_track_secret(exc)}")
         if cached and cached.get("satellites") is not None:
+            _note_satellite_staleness(
+                cached, kind="gp", name=group, refresh_failed=True
+            )
             return _present_satellite_payload(cached, stale=True)
         raise
 
@@ -3675,7 +4172,7 @@ def _satellite_meta_from_payload(group: str, payload):
         "ttl_seconds": SATELLITES_CACHE_TTL,
         "age_seconds": None if age is None else int(age),
         "stale": stale,
-        "source": "celestrak",
+        "source": (payload or {}).get("source") or "celestrak",
         "note": SATELLITE_NOTE,
         "allowed_groups": list(SATELLITE_GROUPS),
     }
@@ -3842,8 +4339,10 @@ def get_satellites_gp(
 
     Default `group=starlink`. Cached ~1 hour in Redis (in-memory fallback).
     A stale copy is returned immediately and refreshed in the background.
-    CelesTrak is contacted on the request only when nothing is cached, and
-    that fetch is capped so Heroku's router does not turn it into a 503.
+    Starlink is fetched from Space-Track when credentials are configured,
+    then CelesTrak if that query fails. Other groups use CelesTrak. Upstream
+    is contacted on the request only when nothing is cached, and that fetch
+    is capped so Heroku's router does not turn it into a 503.
     Clients that send ``Accept-Encoding: gzip`` receive a gzip body.
     """
     if not internal:
@@ -3860,6 +4359,7 @@ def get_satellites_gp(
             if not fresh:
                 _schedule_satellite_refresh(group)
             state = "hit" if fresh else "stale"
+            _note_satellite_staleness(doc, kind="gp", name=group)
             increment_metric("cache_hits")
             return _encoded_satellite_response(
                 doc, request, stale=not fresh, cache_state=state
@@ -3877,6 +4377,7 @@ def get_satellites_gp(
         increment_metric("cache_misses")
     else:
         increment_metric("cache_hits")
+    _note_satellite_staleness(payload, kind="gp", name=group)
     if request is None:
         return payload
     doc = _local_satellite_http.get(group)
@@ -3924,6 +4425,7 @@ def get_satellites_meta(
         increment_metric("cache_hits")
     else:
         increment_metric("cache_misses")
+    _note_satellite_staleness(payload, kind="gp", name=group)
     return _satellite_meta_from_payload(group, payload)
 
 
@@ -4078,14 +4580,19 @@ def _write_satcat_index(payload: dict):
     set_cached_data(SATCAT_RECENT_CACHE_KEY, payload, ttl=SATELLITES_STALE_TTL)
 
 
-def fetch_starlink_satcat_rows() -> list:
+def _fetch_celestrak_satcat_rows() -> list:
     """Download CelesTrak SATCAT GROUP=starlink (JSON list)."""
     increment_metric("api_calls")
+    # When Space-Track can take over, don't let a dead CelesTrak socket
+    # consume the whole request budget before the fallback runs.
+    timeout = SATELLITES_FETCH_TIMEOUT
+    if _space_track.configured():
+        timeout = min(timeout, 15)
     response = requests.get(
         CELESTRAK_SATCAT_URL,
         params={"GROUP": "starlink", "FORMAT": "JSON"},
         headers=CELESTRAK_HEADERS,
-        timeout=SATELLITES_FETCH_TIMEOUT,
+        timeout=timeout,
     )
     response.raise_for_status()
     try:
@@ -4095,6 +4602,95 @@ def fetch_starlink_satcat_rows() -> list:
     if not isinstance(data, list):
         raise ValueError("CelesTrak SATCAT JSON was not a list")
     return data
+
+
+def _normalize_satcat_object_type(value) -> str:
+    text = str(value or "").strip().upper()
+    if text in ("R/B", "ROCKET BODY", "ROCKET_BODY"):
+        return "R/B"
+    if text in ("DEB", "DEBRIS"):
+        return "DEB"
+    if text in ("PAY", "PAYLOAD"):
+        return "PAY"
+    return text
+
+
+def normalize_space_track_satcat(item):
+    """Map a Space-Track SATCAT row onto the CelesTrak field names already indexed."""
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("SATNAME") or item.get("OBJECT_NAME") or "").strip()
+    norad = _norad_int(item.get("NORAD_CAT_ID"))
+    if norad is None or not name.upper().startswith("STARLINK"):
+        return None
+    launch = item.get("LAUNCH")
+    if launch in (None, ""):
+        launch = item.get("LAUNCH_DATE") or ""
+    decay = item.get("DECAY")
+    if decay in (None, ""):
+        decay = item.get("DECAY_DATE") or ""
+    decay_text = str(decay or "").strip()
+    if decay_text.lower() in ("null", "none"):
+        decay_text = ""
+    return {
+        "OBJECT_NAME": name,
+        "OBJECT_ID": str(item.get("INTLDES") or item.get("OBJECT_ID") or "").strip(),
+        "NORAD_CAT_ID": norad,
+        "OBJECT_TYPE": _normalize_satcat_object_type(item.get("OBJECT_TYPE")),
+        "LAUNCH_DATE": str(launch)[:10],
+        "DECAY_DATE": decay_text[:10] if decay_text else "",
+    }
+
+
+def fetch_space_track_starlink_satcat() -> list:
+    """Starlink SATCAT via Space-Track. At most one successful pull per day."""
+    if not _space_track.configured():
+        raise _SpaceTrackSkipped("credentials not configured")
+    if not _space_track.satcat_allowed():
+        raise _SpaceTrackSkipped("daily SATCAT limit")
+    _space_track.note_satcat_attempt()
+    data = _space_track.get_json(
+        SPACE_TRACK_STARLINK_SATCAT_PATH,
+        timeout=SATELLITES_FETCH_TIMEOUT,
+    )
+    if not isinstance(data, list):
+        raise _SpaceTrackError("SATCAT JSON was not a list")
+    rows = []
+    for item in data:
+        row = normalize_space_track_satcat(item)
+        if row is not None:
+            rows.append(row)
+    if not rows:
+        raise _SpaceTrackError("SATCAT query returned no Starlink records")
+    _space_track.note_satcat_success()
+    print(f"Space-Track SATCAT starlink records={len(rows)}")
+    return rows
+
+
+def fetch_starlink_satcat_rows() -> list:
+    """Starlink SATCAT. CelesTrak first; Space-Track only if that request fails.
+
+    Space-Track's SATCAT class is limited to about one download per day, so it
+    stays a backup for the deployed-feed catalog when CelesTrak HTTPS is down.
+    """
+    try:
+        return _fetch_celestrak_satcat_rows()
+    except Exception as celestrak_exc:
+        if not _space_track.configured():
+            raise
+        try:
+            return fetch_space_track_starlink_satcat()
+        except Exception as space_exc:
+            print(
+                "Space-Track SATCAT failed: "
+                f"{_redact_space_track_secret(space_exc)}"
+            )
+            raise RuntimeError(
+                "CelesTrak SATCAT failed "
+                f"({_redact_space_track_secret(celestrak_exc)}); "
+                "Space-Track SATCAT failed "
+                f"({_redact_space_track_secret(space_exc)})"
+            ) from None
 
 
 def _load_or_fetch_satcat_index(wanted_date: str, force: bool = False):
@@ -4117,7 +4713,7 @@ def _load_or_fetch_satcat_index(wanted_date: str, force: bool = False):
         _write_satcat_index(payload)
         return payload, False
     except Exception as exc:
-        print(f"Error fetching CelesTrak SATCAT: {exc}")
+        print(f"Error fetching Starlink SATCAT: {_redact_space_track_secret(exc)}")
         fallback = cached or _read_satcat_index()
         if fallback and _satcat_index_covers(fallback, wanted_date):
             return fallback, True
@@ -4198,6 +4794,8 @@ def fetch_gp_by_intdes(intdes: str, needed_norads) -> dict:
 
     Main GP is enough when it already covers ``needed_norads``. Supplemental
     GP is only fetched for catalog numbers the main set does not have.
+    Space-Track allows one GP-class download per hour; that query is the
+    Starlink catalog. Per-launch gaps stay on CelesTrak.
     """
     needed = {n for n in (_norad_int(item) for item in needed_norads) if n is not None}
     best = {}
@@ -4891,6 +5489,72 @@ def _resolve_deployed_target(launch_date_param):
     }
 
 
+def _merge_deployed_tles(catalog_rows, fresh, previous, generation) -> list:
+    """Prefer newly joined TLEs. Keep a prior TLE only for the same catalog id.
+
+    Nothing is synthesized. A NORAD that is in neither set is left unmatched.
+    """
+    fresh_by_norad = {}
+    for sat in fresh or []:
+        norad = _norad_int((sat or {}).get("norad_id"))
+        if norad is None or not sat.get("tle_line1") or not sat.get("tle_line2"):
+            continue
+        fresh_by_norad[norad] = sat
+    previous_by_norad = {}
+    for sat in (previous or {}).get("satellites") or []:
+        norad = _norad_int((sat or {}).get("norad_id"))
+        if norad is None or not sat.get("tle_line1") or not sat.get("tle_line2"):
+            continue
+        previous_by_norad[norad] = sat
+    ordered = []
+    for row in catalog_rows or []:
+        norad = _norad_int((row or {}).get("norad_id"))
+        if norad is None:
+            continue
+        sat = fresh_by_norad.get(norad) or previous_by_norad.get(norad)
+        if not sat:
+            continue
+        record = {
+            "name": sat.get("name") or row.get("name") or "",
+            "norad_id": norad,
+            "tle_line1": sat["tle_line1"],
+            "tle_line2": sat["tle_line2"],
+        }
+        if generation:
+            record["generation"] = generation
+        ordered.append(record)
+        if len(ordered) >= DEPLOYED_SAT_CAP:
+            break
+    return ordered
+
+
+def _rejoin_stale_deployed(target, index, cached):
+    """Rebuild deployed TLEs from a stale SATCAT index plus current GP.
+
+    Returns None when the rebuild would be empty so the caller can keep the
+    last good copy unchanged.
+    """
+    launch_date = target["launch_date"]
+    catalog_rows = _catalog_rows_for_date(index, launch_date)
+    if not catalog_rows:
+        return None
+    fresh = _join_deployed_tles(catalog_rows, target.get("generation"))
+    satellites = _merge_deployed_tles(
+        catalog_rows, fresh, cached, target.get("generation")
+    )
+    if not satellites:
+        return None
+    payload = _deployed_payload(
+        target,
+        catalog_rows,
+        satellites,
+        stale=False,
+        note=_deployed_note_ready(launch_date),
+    )
+    _write_deployed_cache(launch_date, payload)
+    return payload
+
+
 def _refresh_deployed_uncached(target: dict, force: bool = False):
     launch_date = target["launch_date"]
     cached = None if force else _read_deployed_cache(launch_date)
@@ -4903,16 +5567,28 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
     try:
         index, index_stale = _get_satcat_index(launch_date, force=force)
     except Exception as exc:
-        print(f"Deployed SATCAT refresh failed for {launch_date}: {exc}")
+        print(
+            f"Deployed SATCAT refresh failed for {launch_date}: "
+            f"{_redact_space_track_secret(exc)}"
+        )
         satcat_failed = True
 
-    # A failed SATCAT refresh must not rebuild (and drop) TLEs we already stored.
+    # A stale SATCAT index can still name the flight. Re-join those NORADs to
+    # the current GP cache (Space-Track when that is the Starlink source) and
+    # keep any prior TLE the new join did not replace. An empty rebuild must
+    # not drop the last good copy.
     if (
         not satcat_failed
         and index_stale
         and cached
         and (cached.get("satellites") or [])
     ):
+        rebuilt = _rejoin_stale_deployed(target, index, cached)
+        if rebuilt is not None:
+            return rebuilt
+        _note_satellite_staleness(
+            cached, kind="deployed", name=launch_date, refresh_failed=True
+        )
         return _mark_deployed_cached(cached, stale=True)
 
     catalog_rows = [] if satcat_failed else _catalog_rows_for_date(index, launch_date)
@@ -4936,6 +5612,9 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
         return payload
 
     if satcat_failed and cached and (cached.get("satellites") or []):
+        _note_satellite_staleness(
+            cached, kind="deployed", name=launch_date, refresh_failed=True
+        )
         return _mark_deployed_cached(cached, stale=True)
 
     # SATCAT has nothing plottable yet. SpaceX public ephemerides cover the
@@ -5017,6 +5696,60 @@ def refresh_deployed_satellites_internal(launch_date: str = None, force: bool = 
     return _get_deployed_flight(date).do(_do)
 
 
+def _deployed_last_good(payload) -> bool:
+    """True only when a previous fetch actually stored satellites."""
+    if not isinstance(payload, dict) or not payload.get("fetched_at"):
+        return False
+    return bool(payload.get("satellites"))
+
+
+def _schedule_deployed_refresh(launch_date: str):
+    """One background deployed refresh per date. Never blocks the request."""
+    if not _background_enabled or not launch_date:
+        return
+    now = time.monotonic()
+    with _deployed_refresh_lock:
+        if launch_date in _deployed_refresh_inflight:
+            return
+        if now < _deployed_refresh_after.get(launch_date, 0):
+            return
+        _deployed_refresh_inflight.add(launch_date)
+        _deployed_refresh_after[launch_date] = now + SATELLITES_REFRESH_COOLDOWN_SEC
+
+    def _run():
+        try:
+            print(f"Background deployed satellite refresh starting for {launch_date}")
+            refresh_deployed_satellites_internal(launch_date)
+        except Exception as exc:
+            print(
+                "Background deployed satellite refresh failed for "
+                f"{launch_date}: {_redact_space_track_secret(exc)}"
+            )
+        finally:
+            with _deployed_refresh_lock:
+                _deployed_refresh_inflight.discard(launch_date)
+
+    threading.Thread(
+        target=_run, daemon=True, name=f"deployed-refresh-{launch_date}"
+    ).start()
+
+
+def _finish_deployed_response(payload, *, cache_hit: bool):
+    if cache_hit:
+        increment_metric("cache_hits")
+    else:
+        increment_metric("cache_misses")
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        payload.pop("manifest_checked", None)
+        _note_satellite_staleness(
+            payload,
+            kind="deployed",
+            name=str(payload.get("launch_date") or ""),
+        )
+    return payload
+
+
 @app.get(
     "/satellites/deployed",
     tags=["Satellites"],
@@ -5045,8 +5778,11 @@ def get_satellites_deployed(
       before the GP join, or the ephemeris count when SATCAT is empty.
       Greater than zero with an empty ``satellites`` list means the catalog
       matched and no TLE was available.
-    - ``note``: contains ``unavailable`` only when CelesTrak SATCAT could not
+    - ``note``: contains ``unavailable`` only when SATCAT could not
       be fetched and no cached catalog exists.
+    A stored catalog with satellites is returned immediately, fresh or stale.
+    Refresh runs in the background and does not hold the request. An empty
+    failed fetch is not treated as a catalog.
     - ``source``: ``celestrak-satcat`` when SATCAT has TLEs, otherwise
       ``spacex-manifest-ephemeris`` when public MEME files cover the date.
     - ``empty`` / ``stale``: honest empty catalog vs. a stale cached copy.
@@ -5067,6 +5803,12 @@ def get_satellites_deployed(
         target = _resolve_deployed_target(launch_date)
         if target.get("query") and target.get("launch_date") and not force:
             cached_before = _read_deployed_cache(target["launch_date"])
+            if _deployed_last_good(cached_before):
+                fresh = _deployed_cache_is_fresh(cached_before)
+                if not fresh:
+                    _schedule_deployed_refresh(target["launch_date"])
+                body = _mark_deployed_cached(cached_before, stale=not fresh)
+                return _finish_deployed_response(body, cache_hit=fresh)
         payload = refresh_deployed_satellites_internal(launch_date, force=force)
     except HTTPException:
         raise
@@ -5078,14 +5820,7 @@ def get_satellites_deployed(
     serving_fresh = bool(
         cached_before and _deployed_cache_is_fresh(cached_before) and not force
     )
-    if serving_fresh:
-        increment_metric("cache_hits")
-    else:
-        increment_metric("cache_misses")
-    if isinstance(payload, dict):
-        payload = dict(payload)
-        payload.pop("manifest_checked", None)
-    return payload
+    return _finish_deployed_response(payload, cache_hit=serving_fresh)
 
 
 def _parse_net_dt(net_str):
@@ -5984,7 +6719,8 @@ def start_background_worker():
                     refresh_weather_internal()
                     last_run["weather"] = now
 
-                # Starlink / stations GP hourly (CelesTrak asks not to hammer).
+                # Starlink GP hourly from Space-Track (1/hour class limit), then
+                # CelesTrak if that query fails. Stations stay on CelesTrak.
                 # Request handlers serve the cached catalog immediately; this
                 # refresh stays off the Heroku request path. The deployed feed
                 # is included; a manifest-backed copy expires sooner.
@@ -5993,7 +6729,7 @@ def start_background_worker():
                         refresh_satellites_internal("starlink")
                         refresh_satellites_internal("stations")
                     except Exception as e:
-                        print(f"Satellite GP refresh error: {e}")
+                        print(f"Satellite GP refresh error: {_redact_space_track_secret(e)}")
                     try:
                         refresh_deployed_satellites_internal()
                     except Exception as e:
