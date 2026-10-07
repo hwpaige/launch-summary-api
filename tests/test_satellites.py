@@ -1102,5 +1102,322 @@ class ManifestEphemerisTests(unittest.TestCase):
         self.assertTrue(any(url == app.SPACEX_MANIFEST_URL for url, _params in calls))
 
 
+_SPACE_TRACK_ENV = {
+    "SPACE_TRACK_IDENTITY": "operator@example.com",
+    "SPACE_TRACK_PASSWORD": "unit-test-space-track-password",
+}
+
+
+def _space_track_session(get_responses, login_status=200, cookie="chocolatechip-session"):
+    session = Mock()
+    session.cookies = Mock()
+    session.cookies.get.return_value = cookie
+    login = Mock()
+    login.status_code = login_status
+    session.post.return_value = login
+    session.get.side_effect = list(get_responses)
+    return session
+
+
+class SpaceTrackPrimaryTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def _creds(self):
+        return patch.dict("os.environ", _SPACE_TRACK_ENV, clear=False)
+
+    def test_starlink_gp_uses_space_track_and_skips_celestrak(self):
+        official_1 = "1 44714U 19074B   26262.50000000  .00001000  00000+0  10000-3 0  9991"
+        official_2 = "2 44714  53.0500 100.0000 0001234  50.0000 310.0000 15.06400000 12345"
+        self.assertEqual(len(official_1), 69)
+        self.assertEqual(len(official_2), 69)
+        payload = dict(STARLINK_OMM)
+        payload["NORAD_CAT_ID"] = "44714"
+        payload["EPOCH"] = "2026-09-19 12:00:00.000000"
+        payload["TLE_LINE1"] = official_1
+        payload["TLE_LINE2"] = official_2
+        payload_with_stray = [dict(ISS_OMM), payload]
+        session = _space_track_session([_json_response(payload_with_stray)])
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", side_effect=AssertionError("celestrak")) as get:
+            body = app.get_satellites_gp(group="starlink", internal=True)
+
+        self.assertEqual(get.call_count, 0)
+        self.assertEqual(session.post.call_count, 1)
+        login_url = session.post.call_args.args[0]
+        login_data = session.post.call_args.kwargs["data"]
+        self.assertEqual(login_url, app.SPACE_TRACK_LOGIN_URL)
+        self.assertEqual(login_data["identity"], _SPACE_TRACK_ENV["SPACE_TRACK_IDENTITY"])
+        self.assertEqual(login_data["password"], _SPACE_TRACK_ENV["SPACE_TRACK_PASSWORD"])
+        gp_url = session.get.call_args.args[0]
+        self.assertIn("/class/gp/", gp_url)
+        self.assertIn("OBJECT_NAME/STARLINK~~", gp_url)
+        self.assertIn("decay_date/null-val", gp_url)
+        self.assertIn("epoch/%3Enow-10", gp_url)
+        self.assertIn("format/json", gp_url)
+        self.assertNotIn(_SPACE_TRACK_ENV["SPACE_TRACK_PASSWORD"], gp_url)
+        self.assertEqual(body["source"], "space-track")
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["satellites"][0]["norad_id"], 44714)
+        self.assertEqual(body["satellites"][0]["tle_line1"], official_1)
+        self.assertEqual(body["satellites"][0]["tle_line2"], official_2)
+        self.assertFalse(body["stale"])
+
+    def test_non_200_and_tls_eof_fall_back_to_celestrak(self):
+        tls = _space_track_session([
+            requests_ssl_error(),
+        ])
+        celestrak = _json_response([STARLINK_OMM])
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=tls), \
+             patch.object(app.requests, "get", return_value=celestrak) as get:
+            tls_body = app.refresh_satellites_internal("starlink", force=True)
+        self.assertEqual(tls_body["source"], "celestrak")
+        self.assertEqual(tls_body["count"], 1)
+        self.assertEqual(get.call_count, 1)
+
+        app._reset_cache_coordination_for_tests()
+        denied = Mock()
+        denied.status_code = 503
+        session = _space_track_session([denied])
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", return_value=celestrak):
+            body = app.refresh_satellites_internal("starlink", force=True)
+        self.assertEqual(body["source"], "celestrak")
+        self.assertEqual(body["satellites"][0]["norad_id"], 44714)
+
+    def test_401_relogin_once_then_uses_the_catalog(self):
+        denied = Mock()
+        denied.status_code = 401
+        session = _space_track_session([denied, _json_response([STARLINK_OMM])])
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", side_effect=AssertionError("celestrak")):
+            body = app.refresh_satellites_internal("starlink", force=True)
+        self.assertEqual(session.post.call_count, 2)
+        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(body["source"], "space-track")
+        self.assertEqual(body["count"], 1)
+
+    def test_missing_cookie_does_not_accept_the_login(self):
+        session = _space_track_session([_json_response([STARLINK_OMM])], cookie=None)
+        celestrak = _json_response([ISS_OMM])
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", return_value=celestrak):
+            body = app.refresh_satellites_internal("stations", force=True)
+        # stations are not the Starlink GP query
+        self.assertEqual(body["source"], "celestrak")
+        self.assertEqual(session.post.call_count, 0)
+
+        app._reset_cache_coordination_for_tests()
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", return_value=celestrak):
+            body = app.refresh_satellites_internal("starlink", force=True)
+        self.assertEqual(body["source"], "celestrak")
+        self.assertEqual(body["satellites"][0]["norad_id"], 25544)
+        self.assertGreaterEqual(session.post.call_count, 1)
+
+    def test_hourly_gp_limit_uses_celestrak_for_the_next_force(self):
+        session = _space_track_session([
+            _json_response([STARLINK_OMM]),
+            _json_response([ISS_OMM]),
+        ])
+        celestrak = _json_response([ISS_OMM])
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", return_value=celestrak) as get:
+            first = app.refresh_satellites_internal("starlink", force=True)
+            second = app.refresh_satellites_internal("starlink", force=True)
+        self.assertEqual(first["source"], "space-track")
+        self.assertEqual(second["source"], "celestrak")
+        self.assertEqual(second["satellites"][0]["norad_id"], 25544)
+        self.assertEqual(session.get.call_count, 1)
+        self.assertEqual(get.call_count, 1)
+
+    def test_empty_or_failed_catalog_does_not_invent_positions(self):
+        from fastapi.testclient import TestClient
+
+        session = _space_track_session([_json_response([])])
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", side_effect=RuntimeError("celestrak down")), \
+             patch.object(app, "_background_enabled", False):
+            client = TestClient(app.app)
+            response = client.get("/satellites/gp", params={"group": "starlink"})
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("unavailable", response.json()["detail"].lower())
+        self.assertNotIn(_SPACE_TRACK_ENV["SPACE_TRACK_PASSWORD"], response.text)
+        cached = app._local_satellites.get("starlink")
+        self.assertTrue(cached is None or not (cached.get("satellites") or []))
+
+    def test_both_sources_fail_serves_last_good_without_logging_the_password(self):
+        import io
+        from contextlib import redirect_stdout
+
+        stored = app._satellite_payload("starlink", [app.slim_gp_record(STARLINK_OMM)])
+        stored["fetched_at"] = "2020-01-01T00:00:00Z"
+        app._local_satellites["starlink"] = stored
+        boom = RuntimeError(
+            "tls eof while sending " + _SPACE_TRACK_ENV["SPACE_TRACK_PASSWORD"]
+        )
+        session = _space_track_session([boom])
+        stdout = io.StringIO()
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", side_effect=RuntimeError("celestrak down")), \
+             redirect_stdout(stdout):
+            body = app.refresh_satellites_internal("starlink", force=True)
+        logged = stdout.getvalue()
+        self.assertNotIn(_SPACE_TRACK_ENV["SPACE_TRACK_PASSWORD"], logged)
+        self.assertIn("[redacted]", logged)
+        self.assertIn("satellite_catalog_stale", logged)
+        self.assertTrue(body["stale"])
+        self.assertEqual(body["satellites"][0]["norad_id"], 44714)
+        self.assertEqual(len(body["satellites"]), 1)
+
+    def test_request_rate_limit_stops_before_thirty_per_minute(self):
+        now = time.monotonic()
+        app._space_track._request_times = [now] * app.SPACE_TRACK_MAX_PER_MINUTE
+        with self.assertRaises(app._SpaceTrackError):
+            app._space_track._reserve_request()
+
+    def test_unconfigured_starlink_still_uses_celestrak(self):
+        fake = _json_response([STARLINK_OMM])
+        with patch.dict("os.environ", {"SPACE_TRACK_IDENTITY": "", "SPACE_TRACK_PASSWORD": ""}, clear=False), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", side_effect=AssertionError("no session")), \
+             patch.object(app.requests, "get", return_value=fake) as get:
+            body = app.refresh_satellites_internal("starlink", force=True)
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(body["source"], "celestrak")
+        self.assertEqual(body["count"], 1)
+
+    def test_deployed_last_good_returns_immediately_and_alerts_when_old(self):
+        import io
+        from contextlib import redirect_stdout
+
+        record = app.slim_gp_record(_v3_omm())
+        record["generation"] = "v3"
+        app._local_deployed["2026-09-28"] = {
+            "launch_date": "2026-09-28",
+            "generation": "v3",
+            "mission": FLIGHT_14["mission"],
+            "fetched_at": "2020-01-01T00:00:00Z",
+            "ttl_seconds": app.SATELLITES_CACHE_TTL,
+            "count": 1,
+            "catalog_count": 1,
+            "stale": False,
+            "empty": False,
+            "source": "celestrak-satcat",
+            "note": "Starlink SATCAT objects with LAUNCH_DATE 2026-09-28, joined to CelesTrak GP TLEs.",
+            "satellites": [record],
+        }
+        snapshot = dict(app._local_deployed["2026-09-28"])
+        started_refresh = threading.Event()
+        finished_refresh = threading.Event()
+
+        def slow_refresh(launch_date=None, force=False):
+            started_refresh.set()
+            time.sleep(0.3)
+            finished_refresh.set()
+            return snapshot
+
+        stdout = io.StringIO()
+        started = time.perf_counter()
+        with patch.object(app, "r", None), \
+             patch.object(app, "_background_enabled", True), \
+             patch.object(app, "refresh_deployed_satellites_internal", side_effect=slow_refresh), \
+             patch.object(app.requests, "get", side_effect=AssertionError("upstream")), \
+             redirect_stdout(stdout):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+            elapsed = time.perf_counter() - started
+            self.assertTrue(started_refresh.wait(1.0))
+            self.assertTrue(finished_refresh.wait(1.0))
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(body["stale"])
+        self.assertEqual(body["satellites"][0]["norad_id"], 100753)
+        self.assertNotIn("manifest_checked", body)
+        logged = stdout.getvalue()
+        self.assertIn("satellite_catalog_stale", logged)
+        self.assertIn("2026-09-28", logged)
+        self.assertNotIn("unit-test-space-track-password", logged)
+
+    def test_deployed_satcat_falls_back_to_space_track_without_inventing_rows(self):
+        import requests
+
+        session = _space_track_session([_json_response([
+            {
+                "SATNAME": "STARLINK-38381",
+                "INTLDES": "2026-219A",
+                "NORAD_CAT_ID": "100753",
+                "OBJECT_TYPE": "PAYLOAD",
+                "LAUNCH": "2026-09-28",
+                "DECAY": None,
+            },
+            {
+                "SATNAME": "STARLINK DEB",
+                "INTLDES": "2026-219E",
+                "NORAD_CAT_ID": 100703,
+                "OBJECT_TYPE": "DEBRIS",
+                "LAUNCH": "2026-09-28",
+                "DECAY": None,
+            },
+            {
+                "SATNAME": "NOT-STARLINK",
+                "INTLDES": "2026-219F",
+                "NORAD_CAT_ID": 100799,
+                "OBJECT_TYPE": "PAYLOAD",
+                "LAUNCH": "2026-09-28",
+                "DECAY": None,
+            },
+        ])])
+
+        def fake_get(url, params=None, **kwargs):
+            if url == app.CELESTRAK_SATCAT_URL:
+                raise requests.exceptions.SSLError("TLS EOF")
+            if url == app.CELESTRAK_GP_URL:
+                return _json_response([_v3_omm()])
+            raise AssertionError(url)
+
+        with self._creds(), \
+             patch.object(app, "r", None), \
+             patch.object(app.requests, "Session", return_value=session), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+            again = app.get_satellites_deployed(
+                launch_date="2026-09-28", force=True, internal=True
+            )
+
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["catalog_count"], 1)
+        self.assertEqual(body["satellites"][0]["norad_id"], 100753)
+        self.assertEqual(body["source"], "celestrak-satcat")
+        self.assertNotIn("unavailable", body["note"].lower())
+        self.assertEqual(again["satellites"][0]["norad_id"], 100753)
+        self.assertEqual(session.get.call_count, 1)
+        satcat_url = session.get.call_args.args[0]
+        self.assertIn("/class/satcat/", satcat_url)
+        self.assertIn("SATNAME/STARLINK~~", satcat_url)
+        self.assertNotIn(_SPACE_TRACK_ENV["SPACE_TRACK_PASSWORD"], satcat_url)
+
+
+def requests_ssl_error():
+    import requests
+    return requests.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c: TLS EOF)")
+
+
 if __name__ == "__main__":
     unittest.main()
