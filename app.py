@@ -183,8 +183,13 @@ CELESTRAK_HEADERS = {
 SATELLITE_GROUPS = ("starlink", "stations", "visual", "oneweb", "gps-ops", "weather")
 SATELLITES_CACHE_PREFIX = "satellites_gp_v1:"
 # Pre-rendered JSON (fresh + stale) so a cold dyno can return bytes without
-# rebuilding the 11k-record object graph on the request path.
+# rebuilding the 11k-record object graph on the request path. These bytes are
+# a rendering of the catalog below, never a second catalog: they are served
+# only when their fetched_at matches the shared stamp.
 SATELLITES_HTTP_CACHE_PREFIX = "satellites_gp_http_v1:"
+# Small shared generation record. Dynos compare this before trusting process
+# memory, so /satellites/meta and /satellites/starlink cannot drift apart.
+SATELLITES_STAMP_PREFIX = "satellites_gp_stamp_v1:"
 SATELLITES_CACHE_TTL = 3600  # serve fresh for 1 hour
 SATELLITES_STALE_TTL = 48 * 3600  # Redis retains stale GP for fallback
 SATELLITES_FETCH_TIMEOUT = 45  # per-socket timeout; not a wall clock
@@ -309,7 +314,12 @@ SPACE_TRACK_SATCAT_FAIL_BACKOFF_SEC = 900
 SPACE_TRACK_SATCAT_MAX_ATTEMPTS = 2
 SPACE_TRACK_GP_OK_KEY = "space_track_gp_starlink_ok_v1"
 SPACE_TRACK_SATCAT_OK_KEY = "space_track_satcat_starlink_ok_v1"
+# Held only while a Starlink GP download is running, so a second dyno cannot
+# start another GP-class query before the success key is written.
+SPACE_TRACK_GP_FLIGHT_KEY = "space_track_gp_starlink_flight_v1"
 SATELLITES_STALE_ALERT_SEC = 6 * 3600
+# Starlink GP feeds the globes. Warn sooner than the generic 6h catalog alert.
+SATELLITES_STARLINK_STALE_ALERT_SEC = 2 * 3600
 SATELLITES_STALE_ALERT_REPEAT_SEC = 15 * 60
 
 
@@ -429,6 +439,7 @@ class _SpaceTrackClient:
         self._satcat_success_mono = 0.0
         self._gp_attempts = []
         self._satcat_attempts = []
+        self._gp_flight_token = None
 
     def reset(self):
         with self._lock:
@@ -439,6 +450,7 @@ class _SpaceTrackClient:
             self._satcat_success_mono = 0.0
             self._gp_attempts = []
             self._satcat_attempts = []
+            self._gp_flight_token = None
 
     def configured(self) -> bool:
         identity = (os.getenv("SPACE_TRACK_IDENTITY") or "").strip()
@@ -493,6 +505,55 @@ class _SpaceTrackClient:
             {"fetched_at": _utc_isoformat()},
             ttl=SPACE_TRACK_GP_SUCCESS_SEC,
         )
+
+    def claim_gp_flight(self) -> bool:
+        """Single-flight the Starlink GP download across dynos.
+
+        Process memory cannot see another dyno's download. The Redis NX key
+        can. A missing Redis client keeps the in-process behavior (tests).
+        """
+        if not r:
+            self._gp_flight_token = None
+            return True
+        token = f"{os.getpid()}:{threading.get_ident()}:{time.time()}"
+        try:
+            acquired = r.set(
+                SPACE_TRACK_GP_FLIGHT_KEY,
+                token,
+                nx=True,
+                ex=SPACE_TRACK_QUERY_TIMEOUT + 15,
+            )
+        except Exception as exc:
+            print(f"Space-Track GP flight claim failed: {exc}")
+            return True
+        if not acquired:
+            # Leave an existing token alone. Another thread on this process may
+            # still own the claim; wiping it would skip the release.
+            return False
+        self._gp_flight_token = token
+        return True
+
+    def release_gp_flight(self):
+        if not r:
+            return
+        token = self._gp_flight_token
+        self._gp_flight_token = None
+        if not token:
+            return
+        try:
+            if r.get(SPACE_TRACK_GP_FLIGHT_KEY) == token:
+                r.delete(SPACE_TRACK_GP_FLIGHT_KEY)
+        except Exception as exc:
+            print(f"Space-Track GP flight release failed: {exc}")
+
+    def gp_flight_in_progress(self) -> bool:
+        """True while some dyno holds the Starlink GP download claim."""
+        if not r:
+            return False
+        try:
+            return bool(r.exists(SPACE_TRACK_GP_FLIGHT_KEY))
+        except Exception:
+            return False
 
     def note_satcat_success(self):
         with self._lock:
@@ -577,7 +638,33 @@ class _SpaceTrackClient:
             or len(self._request_times) >= SPACE_TRACK_MAX_PER_HOUR
         ):
             raise _SpaceTrackError("Space-Track rate limit reached")
+        # Account-wide caps. Each dyno also keeps the local window above so a
+        # Redis blip cannot multiply requests, and so unit tests without Redis
+        # still stop at 30/minute and 300/hour.
+        self._redis_reserve_request()
         self._request_times.append(now)
+
+    def _redis_reserve_request(self):
+        if not r:
+            return
+        now = datetime.now(timezone.utc)
+        minute_key = now.strftime("space_track_req_min_v1:%Y%m%d%H%M")
+        hour_key = now.strftime("space_track_req_hour_v1:%Y%m%d%H")
+        try:
+            minute_count = int(r.incr(minute_key))
+            if minute_count == 1:
+                r.expire(minute_key, 120)
+            hour_count = int(r.incr(hour_key))
+            if hour_count == 1:
+                r.expire(hour_key, 7200)
+        except Exception as exc:
+            print(f"Space-Track rate-limit counter failed: {exc}")
+            return
+        if (
+            minute_count > SPACE_TRACK_MAX_PER_MINUTE
+            or hour_count > SPACE_TRACK_MAX_PER_HOUR
+        ):
+            raise _SpaceTrackError("Space-Track rate limit reached")
 
     def _recent_success(self, mono_stamp, redis_key, interval) -> bool:
         if mono_stamp and (time.monotonic() - mono_stamp) < interval:
@@ -3691,14 +3778,23 @@ def satellite_cache_is_fresh(payload, ttl=SATELLITES_CACHE_TTL) -> bool:
     return age is not None and age < ttl
 
 
-def _note_satellite_staleness(payload, *, kind, name, refresh_failed=False):
-    """Structured warning when a served catalog is older than about six hours.
+def _satellite_stale_alert_seconds(kind, name) -> int:
+    """Starlink GP alerts at 2 hours. Other catalogs stay at 6 hours."""
+    if kind == "gp" and name == "starlink":
+        return SATELLITES_STARLINK_STALE_ALERT_SEC
+    return SATELLITES_STALE_ALERT_SEC
 
+
+def _note_satellite_staleness(payload, *, kind, name, refresh_failed=False):
+    """Structured warning when a served catalog is past its age threshold.
+
+    Starlink GP warns after 2 hours. Other catalogs still warn after 6.
     Repeated hits for the same catalog are throttled. The log line never
     includes Space-Track credentials.
     """
+    threshold = _satellite_stale_alert_seconds(kind, name)
     age = satellite_age_seconds(payload)
-    if age is None or age < SATELLITES_STALE_ALERT_SEC:
+    if age is None or age < threshold:
         return
     key = f"{kind}:{name}"
     now = time.monotonic()
@@ -3713,7 +3809,7 @@ def _note_satellite_staleness(payload, *, kind, name, refresh_failed=False):
     logger.warning(json.dumps({
         "event": "satellite_catalog_stale",
         "alert": True,
-        "threshold_hours": 6,
+        "threshold_hours": int(threshold // 3600),
         "age_seconds": int(age),
         "fetched_at": (payload or {}).get("fetched_at"),
         "kind": kind,
@@ -3724,14 +3820,85 @@ def _note_satellite_staleness(payload, *, kind, name, refresh_failed=False):
     }, sort_keys=True, default=str))
 
 
+def _satellite_stamp_key(group: str) -> str:
+    return f"{SATELLITES_STAMP_PREFIX}{group}"
+
+
+def _satellite_stamp_from_payload(group: str, payload: dict) -> dict:
+    count = payload.get("count")
+    if count is None:
+        count = len(payload.get("satellites") or [])
+    return {
+        "group": group,
+        "fetched_at": payload.get("fetched_at"),
+        "count": count,
+        "source": payload.get("source") or "celestrak",
+    }
+
+
+def _write_satellite_stamp(group: str, payload: dict):
+    if not payload or not payload.get("fetched_at"):
+        return False
+    return set_cached_data(
+        _satellite_stamp_key(group),
+        _satellite_stamp_from_payload(group, payload),
+        ttl=SATELLITES_STALE_TTL,
+    )
+
+
+def _read_satellite_stamp(group: str):
+    """Shared generation for this group, or None when Redis has no stamp."""
+    if not r:
+        return None
+    cached = get_cached_data(_satellite_stamp_key(group))
+    if isinstance(cached, dict) and cached.get("fetched_at"):
+        return cached
+    return None
+
+
+def _fetched_at_ge(left, right) -> bool:
+    """True when ``left`` is present and not older than ``right``.
+
+    A missing ``right`` means there is no shared generation to catch up to,
+    so process memory (or a Redis payload) is still the catalog.
+    """
+    if not left:
+        return False
+    if not right:
+        return True
+    left_dt = _satellite_fetched_dt({"fetched_at": left})
+    right_dt = _satellite_fetched_dt({"fetched_at": right})
+    if left_dt is None or right_dt is None:
+        return str(left) == str(right)
+    return left_dt >= right_dt
+
+
 def _read_satellite_cache(group: str):
+    """Return the one GP catalog for ``group``.
+
+    Redis is the shared copy. Process memory is a hot cache and is kept only
+    while its ``fetched_at`` is at least as new as the shared stamp. A dyno
+    that still holds the previous fetch reloads instead of serving it.
+    """
+    stamp = _read_satellite_stamp(group)
+    expected = stamp.get("fetched_at") if stamp else None
     local = _local_satellites.get(group)
-    if isinstance(local, dict) and local.get("satellites") is not None:
+    local_ok = isinstance(local, dict) and local.get("satellites") is not None
+    if local_ok and _fetched_at_ge(local.get("fetched_at"), expected):
         return local
     cached = get_cached_data(_satellite_cache_key(group))
     if isinstance(cached, dict) and cached.get("satellites") is not None:
-        _local_satellites[group] = cached
-        return cached
+        cached_at = cached.get("fetched_at")
+        if expected is None or cached_at == expected or _fetched_at_ge(cached_at, expected):
+            _local_satellites[group] = cached
+            if not stamp or stamp.get("fetched_at") != cached_at:
+                _write_satellite_stamp(group, cached)
+            http = _local_satellite_http.get(group)
+            if isinstance(http, dict) and http.get("fetched_at") != cached_at:
+                _local_satellite_http.pop(group, None)
+            return cached
+    if local_ok:
+        return local
     return None
 
 
@@ -3802,13 +3969,16 @@ def _remember_satellite_http(group: str, payload: dict, persist: bool = True) ->
     return doc
 
 
-def _read_satellite_http(group: str):
-    """Pre-rendered bytes only. Does not parse the satellite array."""
-    doc = _local_satellite_http.get(group)
-    if isinstance(doc, dict) and doc.get("gzip_fresh") and doc.get("gzip_stale"):
-        return doc
+def _http_doc_usable(doc) -> bool:
+    return isinstance(doc, dict) and doc.get("gzip_fresh") and doc.get("gzip_stale")
+
+
+def _load_satellite_http(group: str, expected_fetched_at):
+    """Load pre-rendered bytes. Reject a blob from a different fetch."""
     cached = get_cached_data(_satellite_http_cache_key(group))
     if not isinstance(cached, dict):
+        return None
+    if expected_fetched_at is not None and cached.get("fetched_at") != expected_fetched_at:
         return None
     try:
         gzip_fresh = base64.b64decode(cached["gzip_fresh"])
@@ -3825,6 +3995,60 @@ def _read_satellite_http(group: str):
         return None
     _local_satellite_http[group] = doc
     return doc
+
+
+def _http_doc_matching(group: str, fetched_at):
+    doc = _local_satellite_http.get(group)
+    if _http_doc_usable(doc) and doc.get("fetched_at") == fetched_at:
+        return doc
+    return _load_satellite_http(group, fetched_at)
+
+
+def _http_doc_for_payload(group: str, payload: dict):
+    """Bytes for this payload. A mismatched rendering is rebuilt."""
+    doc = _http_doc_matching(group, payload.get("fetched_at"))
+    if doc is not None:
+        return doc
+    return _remember_satellite_http(group, payload, persist=True)
+
+
+def _read_satellite_http(group: str):
+    """Pre-rendered bytes for the same fetch the catalog cache describes.
+
+    Without Redis, a missing in-process catalog still serves a stored HTTP
+    blob (cold-process fast path). With Redis, bytes are used only when their
+    ``fetched_at`` is the shared stamp; otherwise they are rendered from the
+    payload catalog so meta and the globe cannot disagree.
+    """
+    if not r:
+        local = _local_satellites.get(group)
+        if isinstance(local, dict) and local.get("satellites") is not None:
+            return _http_doc_for_payload(group, local)
+        return _load_satellite_http(group, None)
+
+    stamp = _read_satellite_stamp(group)
+    expected = stamp.get("fetched_at") if stamp else None
+    local = _local_satellites.get(group)
+    # Same rule as the catalog read: process memory wins only when it is not
+    # older than the shared stamp. Otherwise the pre-rendered body has to be
+    # that stamp's fetch, which is what /satellites/meta will describe.
+    if (
+        isinstance(local, dict)
+        and local.get("satellites") is not None
+        and _fetched_at_ge(local.get("fetched_at"), expected)
+    ):
+        return _http_doc_for_payload(group, local)
+    if expected:
+        doc = _http_doc_matching(group, expected)
+        if doc is not None:
+            return doc
+    catalog = _read_satellite_cache(group)
+    if catalog is not None:
+        return _http_doc_for_payload(group, catalog)
+    # No shared generation. A legacy HTTP blob is still the only catalog.
+    if expected:
+        return None
+    return _load_satellite_http(group, None)
 
 
 def _client_accepts_gzip(request: Request) -> bool:
@@ -3875,8 +4099,16 @@ def _schedule_satellite_refresh(group: str):
 
 
 def _write_satellite_cache(group: str, payload: dict):
+    """Publish one catalog. The stamp moves only after the payload is stored.
+
+    Process memory is updated after Redis so a concurrent reader on this dyno
+    reloads the payload that was just written instead of advertising a fetch
+    the other dynos cannot see. The pre-rendered HTTP body is that same fetch.
+    """
+    stored = set_cached_data(_satellite_cache_key(group), payload, ttl=SATELLITES_STALE_TTL)
+    if stored:
+        _write_satellite_stamp(group, payload)
     _local_satellites[group] = payload
-    set_cached_data(_satellite_cache_key(group), payload, ttl=SATELLITES_STALE_TTL)
     _remember_satellite_http(group, payload, persist=True)
 
 
@@ -3984,6 +4216,8 @@ def fetch_space_track_starlink_gp(deadline: float = None) -> list:
         raise _SpaceTrackSkipped("credentials not configured")
     if not _space_track.gp_allowed():
         raise _SpaceTrackSkipped("hourly GP limit")
+    if not _space_track.claim_gp_flight():
+        raise _SpaceTrackSkipped("gp in flight")
     seconds = SATELLITES_GP_DEADLINE_SEC if deadline is None else deadline
 
     def _download():
@@ -4001,14 +4235,21 @@ def fetch_space_track_starlink_gp(deadline: float = None) -> list:
             raise _SpaceTrackError("GP query returned no Starlink records")
         return satellites
 
+    # The claim stays held until the caller publishes the catalog. Releasing
+    # it here would let another dyno fall through to CelesTrak in the gap
+    # before Redis has this fetch.
     try:
-        satellites = _run_with_deadline(_download, seconds)
-    except TimeoutError:
-        print(f"Space-Track GP deadline ({seconds:.0f}s) exceeded for starlink")
+        try:
+            satellites = _run_with_deadline(_download, seconds)
+        except TimeoutError:
+            print(f"Space-Track GP deadline ({seconds:.0f}s) exceeded for starlink")
+            raise
+        _space_track.note_gp_success()
+        print(f"Space-Track GP starlink records={len(satellites)}")
+        return satellites
+    except Exception:
+        _space_track.release_gp_flight()
         raise
-    _space_track.note_gp_success()
-    print(f"Space-Track GP starlink records={len(satellites)}")
-    return satellites
 
 
 def _fetch_satellite_gp(group: str, deadline: float = None):
@@ -4026,7 +4267,13 @@ def _fetch_satellite_gp(group: str, deadline: float = None):
         try:
             return fetch_space_track_starlink_gp(deadline=budget), "space-track"
         except _SpaceTrackSkipped as exc:
-            if "hourly" in str(exc):
+            reason = str(exc)
+            # Another dyno is already using this hour's GP query. A backoff
+            # or hourly skip must not publish a second catalog via CelesTrak
+            # while that download is still in flight.
+            if "in flight" in reason or _space_track.gp_flight_in_progress():
+                raise _SpaceTrackSkipped("gp in flight")
+            if "hourly" in reason:
                 print(f"Space-Track GP skipped for starlink: {exc}")
         except Exception as exc:
             space_error = _redact_space_track_secret(exc)
@@ -4083,21 +4330,29 @@ def fetch_celestrak_gp(group: str, deadline: float = None) -> list:
 def _refresh_satellites_uncached(group: str, force: bool = False, deadline: float = None):
     cached = _read_satellite_cache(group)
     if not force and cached and satellite_cache_is_fresh(cached):
+        # Another dyno may already have published this fetch. Keep the
+        # pre-rendered body on the same fetched_at and do not pull again.
+        _remember_satellite_http(group, cached, persist=False)
         return _present_satellite_payload(cached, stale=False)
 
     try:
-        satellites, source = _fetch_satellite_gp(group, deadline=deadline)
-        payload = _satellite_payload(group, satellites, stale=False, source=source)
-        _write_satellite_cache(group, payload)
-        return payload
-    except Exception as exc:
-        print(f"Error fetching satellite GP for {group}: {_redact_space_track_secret(exc)}")
-        if cached and cached.get("satellites") is not None:
-            _note_satellite_staleness(
-                cached, kind="gp", name=group, refresh_failed=True
-            )
-            return _present_satellite_payload(cached, stale=True)
-        raise
+        try:
+            satellites, source = _fetch_satellite_gp(group, deadline=deadline)
+            payload = _satellite_payload(group, satellites, stale=False, source=source)
+            _write_satellite_cache(group, payload)
+            return payload
+        except Exception as exc:
+            print(f"Error fetching satellite GP for {group}: {_redact_space_track_secret(exc)}")
+            if cached and cached.get("satellites") is not None:
+                _note_satellite_staleness(
+                    cached, kind="gp", name=group, refresh_failed=True
+                )
+                return _present_satellite_payload(cached, stale=True)
+            raise
+    finally:
+        # Cover the success path. Failures release inside the Space-Track
+        # fetch so a CelesTrak fallback is not stuck behind the claim.
+        _space_track.release_gp_flight()
 
 
 def refresh_satellites_internal(
@@ -4106,7 +4361,11 @@ def refresh_satellites_internal(
     wait_timeout: float = None,
     deadline: float = None,
 ):
-    """Load cached GP or refresh from CelesTrak (single-flight per group)."""
+    """Load the shared GP catalog or refresh it (single-flight per group).
+
+    The Redis lock is the cross-dyno flight. A waiter that does not run the
+    refresh re-reads the shared catalog instead of keeping its own memory.
+    """
     group = _normalize_satellite_group(group)
 
     def _do():
@@ -4115,12 +4374,14 @@ def refresh_satellites_internal(
             lambda: _refresh_satellites_uncached(group, force=force, deadline=deadline),
             wait_timeout=wait_timeout,
         )
+        if isinstance(result, dict) and result.get("satellites") is not None:
+            return result
+        cached = _read_satellite_cache(group)
+        if cached and cached.get("satellites") is not None:
+            return _present_satellite_payload(
+                cached, stale=not satellite_cache_is_fresh(cached)
+            )
         if result is None and wait_timeout is not None:
-            cached = _read_satellite_cache(group)
-            if cached and cached.get("satellites") is not None:
-                return _present_satellite_payload(
-                    cached, stale=not satellite_cache_is_fresh(cached)
-                )
             raise TimeoutError(
                 f"Satellite GP refresh for {group} exceeded the request budget"
             )
@@ -4337,12 +4598,14 @@ def get_satellites_gp(
 ):
     """Return slim GP records for satellite.js / SGP4 (not live telemetry).
 
-    Default `group=starlink`. Cached ~1 hour in Redis (in-memory fallback).
-    A stale copy is returned immediately and refreshed in the background.
-    Starlink is fetched from Space-Track when credentials are configured,
-    then CelesTrak if that query fails. Other groups use CelesTrak. Upstream
-    is contacted on the request only when nothing is cached, and that fetch
-    is capped so Heroku's router does not turn it into a 503.
+    Default `group=starlink`. One catalog is cached ~1 hour in Redis and
+    mirrored in process memory; `/satellites/meta` and this route share its
+    `fetched_at`. A stale copy is returned immediately and refreshed in the
+    background. Starlink is fetched from Space-Track when credentials are
+    configured (one GP-class pull per hour across dynos), then CelesTrak if
+    that query fails. Other groups use CelesTrak. Upstream is contacted on
+    the request only when nothing is cached, and that fetch is capped so
+    Heroku's router does not turn it into a 503.
     Clients that send ``Accept-Encoding: gzip`` receive a gzip body.
     """
     if not internal:
@@ -4381,7 +4644,11 @@ def get_satellites_gp(
     if request is None:
         return payload
     doc = _local_satellite_http.get(group)
-    if not isinstance(doc, dict) or not doc.get("gzip_fresh"):
+    if (
+        not isinstance(doc, dict)
+        or not doc.get("gzip_fresh")
+        or doc.get("fetched_at") != payload.get("fetched_at")
+    ):
         doc = _remember_satellite_http(group, payload)
     return _encoded_satellite_response(
         doc,
@@ -4416,7 +4683,7 @@ def get_satellites_meta(
     group: str = Query("starlink", description="CelesTrak GROUP (allowlisted)"),
     internal: bool = False,
 ):
-    """fetched_at / count / ttl without pulling the full GP list from CelesTrak."""
+    """fetched_at / count / ttl for the same catalog `/satellites/gp` serves."""
     if not internal:
         increment_metric("total_requests")
     group = _normalize_satellite_group(group)
