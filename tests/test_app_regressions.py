@@ -332,10 +332,11 @@ class NotifyCopyTests(unittest.TestCase):
     def test_generate_notify_copy_uses_shared_grok_path_and_caches(self):
         calls = []
 
-        def fake_grok(prompt, temperature=0.7, max_tokens=4000):
+        def fake_grok(prompt, temperature=0.7, max_tokens=4000, timeout=None):
             calls.append(prompt)
             self.assertIn("t1h", prompt)
             self.assertIn("70", prompt)
+            self.assertIsNotNone(timeout)
             return '{"title":"T-1h: Starlink 10-20","body":"T-1 hour at SLC-40. 70% go."}'
 
         with patch.object(app, "r", None), \
@@ -417,6 +418,155 @@ class NotifyCopyTests(unittest.TestCase):
         self.assertLessEqual(len(post_body["body"]), 150)
 
         self.assertEqual(bad_event.status_code, 422)
+        self.assertEqual(get_resp.headers.get("x-notify-copy-budget"), "1.5")
+        self.assertEqual(post_resp.headers.get("x-notify-copy-budget"), "1.5")
+
+    def _assert_notify_shape(self, result, event, launch_id):
+        self.assertEqual(
+            set(result),
+            {"title", "body", "launch_id", "event", "cached", "model"},
+        )
+        self.assertEqual(result["event"], event)
+        self.assertEqual(result["launch_id"], launch_id)
+        self.assertIsInstance(result["cached"], bool)
+        self.assertEqual(result["model"], app.GROK_MODEL)
+        self.assertLessEqual(len(result["title"]), app.NOTIFY_TITLE_MAX)
+        self.assertLessEqual(len(result["body"]), app.NOTIFY_BODY_MAX)
+        self.assertTrue(result["title"])
+        self.assertTrue(result["body"])
+
+    def test_notify_copy_cache_hit_returns_same_shape_without_second_grok(self):
+        calls = []
+
+        def fake_grok(prompt, temperature=0.7, max_tokens=4000, timeout=None):
+            calls.append(prompt)
+            return '{"title":"T-1h: Starlink 10-20","body":"T-1 hour at SLC-40. 70% go."}'
+
+        with patch.object(app, "r", None), patch.object(app, "call_grok", side_effect=fake_grok):
+            hits_before = app._local_metrics["cache_hits"]
+            calls_before = app._local_metrics["api_calls"]
+            first = app.generate_notify_copy(self._payload(), increment_metrics=True)
+            started = time.perf_counter()
+            second = app.generate_notify_copy(self._payload(), increment_metrics=True)
+            elapsed = time.perf_counter() - started
+
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(first["title"], second["title"])
+        self.assertEqual(first["body"], second["body"])
+        self._assert_notify_shape(first, "t1h", "launch-notify-1")
+        self._assert_notify_shape(second, "t1h", "launch-notify-1")
+        self.assertEqual(len(calls), 1)
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(app._local_metrics["cache_hits"], hits_before + 1)
+        self.assertEqual(app._local_metrics["api_calls"], calls_before + 1)
+
+    def test_notify_copy_budget_timeout_returns_template_and_fills_cache(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def slow_grok(prompt, temperature=0.7, max_tokens=4000, timeout=None):
+            calls.append(time.perf_counter())
+            started.set()
+            release.wait(timeout=5)
+            return '{"title":"T-1h: RICH COPY","body":"Rich path finished. 70% go."}'
+
+        payload = self._payload()
+        with patch.object(app, "r", None), \
+             patch.object(app, "call_grok", side_effect=slow_grok), \
+             patch.object(app, "fetch_launch_details", side_effect=AssertionError("launch fetch")):
+            t0 = time.perf_counter()
+            result = app.generate_notify_copy(payload)
+            elapsed = time.perf_counter() - t0
+            self.assertTrue(started.wait(1))
+            # A joiner that arrives after the budget must not start another Grok call.
+            late = app.generate_notify_copy(payload)
+            release.set()
+            app._drain_notify_copy_flights(timeout=3)
+            cached = app.generate_notify_copy(payload)
+
+        self.assertLess(elapsed, 2.0)
+        self.assertGreaterEqual(elapsed, 1.0)
+        self.assertFalse(result["cached"])
+        self._assert_notify_shape(result, "t1h", "launch-notify-1")
+        self.assertIn("T-1h", result["title"])
+        self.assertNotIn("RICH", result["title"])
+        self.assertIn("70%", f"{result['title']} {result['body']}")
+        self.assertEqual(result["title"], late["title"])
+        self.assertFalse(late["cached"])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(cached["cached"])
+        self.assertIn("RICH", cached["title"])
+        self._assert_notify_shape(cached, "t1h", "launch-notify-1")
+
+    def test_notify_copy_upstream_error_returns_template_200(self):
+        from fastapi.testclient import TestClient
+
+        with patch.object(app, "r", None), \
+             patch.object(app, "call_grok", side_effect=ConnectionError("upstream down")), \
+             patch.object(app, "fetch_launch_details", side_effect=AssertionError("launch fetch")):
+            t0 = time.perf_counter()
+            result = app.generate_notify_copy(self._payload(event="t24h", probability=55))
+            elapsed = time.perf_counter() - t0
+            client = TestClient(app.app)
+            http_started = time.perf_counter()
+            response = client.post(
+                "/notify/copy",
+                json={
+                    "launch_id": "launch-notify-err",
+                    "event": "scrub",
+                    "mission": "Starlink Group 10-20",
+                    "status": "Hold",
+                    "previous_status": "Go",
+                    "probability": 40,
+                },
+            )
+            http_elapsed = time.perf_counter() - http_started
+            invalid = client.post("/notify/copy", json={"launch_id": "x", "event": "liftoff"})
+
+        self.assertLess(elapsed, 1.0)
+        self.assertFalse(result["cached"])
+        self._assert_notify_shape(result, "t24h", "launch-notify-1")
+        self.assertIn("T-24h", result["title"])
+        self.assertIn("55%", f"{result['title']} {result['body']}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(http_elapsed, 1.0)
+        body = response.json()
+        self._assert_notify_shape(body, "scrub", "launch-notify-err")
+        self.assertFalse(body["cached"])
+        self.assertIn("40%", f"{body['title']} {body['body']}")
+        self.assertIn("plans changed", body["body"].lower())
+        self.assertEqual(invalid.status_code, 422)
+
+    def test_notify_copy_missing_mission_uses_memory_cache_only(self):
+        app._launches_mem["data"] = {
+            "upcoming": [
+                {
+                    "id": "launch-notify-1",
+                    "mission": "Cached Mission",
+                    "name": "Cached Mission",
+                    "pad": "LC-39A",
+                    "net": "2026-09-06T02:15:00Z",
+                    "status": "Go",
+                    "rocket": "Falcon 9",
+                    "orbit": "LEO",
+                }
+            ],
+            "previous": [],
+        }
+        app._launches_mem["at"] = time.time()
+        with patch.object(app, "r", None), \
+             patch.object(app, "call_grok", side_effect=ConnectionError("upstream down")), \
+             patch.object(app, "fetch_launch_details", side_effect=AssertionError("launch fetch")), \
+             patch.object(app, "fetch_launches", side_effect=AssertionError("list fetch")):
+            result = app.generate_notify_copy(
+                app.NotifyCopyRequest(launch_id="launch-notify-1", event="t1h", probability=70)
+            )
+        self._assert_notify_shape(result, "t1h", "launch-notify-1")
+        self.assertIn("Cached Mission", f"{result['title']} {result['body']}")
+        self.assertIn("70%", f"{result['title']} {result['body']}")
 
     def test_openapi_documents_notify_copy_events(self):
         schema = app.app.openapi()

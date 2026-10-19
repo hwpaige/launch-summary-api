@@ -24,9 +24,16 @@ load_dotenv()  # Load environment variables from .env if present
 GROK_MODEL = "grok-4-1-fast-reasoning"
 GROK_API_URL = "https://api.x.ai/v1/chat/completions"
 NOTIFY_COPY_TTL = 3600  # 1 hour; reschedules should not thrash xAI
+# Request-path wait for Grok. Past this, the handler returns template copy
+# and the in-flight call fills the cache. Hard cap for the handler is ~2s.
+NOTIFY_COPY_BUDGET_SEC = 1.5
+# Background Grok socket budget (connect, read). Longer than the request
+# budget so a slow completion can still warm the cache, but a hung socket
+# cannot pin a worker.
+NOTIFY_COPY_GROK_TIMEOUT = (3.0, 12.0)
 NOTIFY_TITLE_MAX = 50
 NOTIFY_BODY_MAX = 150
-NOTIFY_COPY_CACHE_PREFIX = "notify_copy_v1"
+NOTIFY_COPY_CACHE_PREFIX = "notify_copy_v2"
 NotifyEvent = Literal["t1h", "t24h", "scrub"]
 
 app = FastAPI(
@@ -146,6 +153,9 @@ _local_cache = {
     "last_updated": None
 }
 _local_notify_copy = {}
+_notify_copy_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="notify-copy")
+_notify_copy_flights = {}
+_notify_copy_flights_lock = threading.RLock()
 _local_metrics = {
     "total_requests": 0,
     "cache_hits": 0,
@@ -671,7 +681,10 @@ def _reset_cache_coordination_for_tests():
     _local_weather_store.clear()
     _local_raw_launches.clear()
     _local_hot_raw.clear()
-    _local_notify_copy.clear()
+    _drain_notify_copy_flights(timeout=1.0)
+    with _notify_copy_flights_lock:
+        _notify_copy_flights.clear()
+        _local_notify_copy.clear()
     _launches_mem["data"] = None
     _launches_mem["at"] = 0.0
     _local_satellites.clear()
@@ -2357,8 +2370,13 @@ Output as a Python list assignment: launch_descriptions = [...]"""
         raise ValueError(f"Failed to parse Grok response: {str(e)}")
 
 
-def call_grok(prompt, temperature=0.7, max_tokens=4000):
-    """Shared xAI Grok chat-completions path used by narratives and notify copy."""
+def call_grok(prompt, temperature=0.7, max_tokens=4000, timeout=None):
+    """Shared xAI Grok chat-completions path used by narratives and notify copy.
+
+    ``timeout`` is a requests timeout (seconds or ``(connect, read)``).
+    Narrative generation leaves it unset. Notify copy always sets one so a
+    stalled socket cannot outlive the background fill.
+    """
     headers = {
         "Authorization": f"Bearer {os.getenv('XAI_API_KEY')}",
         "Content-Type": "application/json",
@@ -2369,7 +2387,10 @@ def call_grok(prompt, temperature=0.7, max_tokens=4000):
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    response = requests.post(GROK_API_URL, headers=headers, json=payload)
+    request_kwargs = {"headers": headers, "json": payload}
+    if timeout is not None:
+        request_kwargs["timeout"] = timeout
+    response = requests.post(GROK_API_URL, **request_kwargs)
     if response.status_code != 200:
         raise ValueError(f"Grok API call failed: {response.status_code} - {response.text}")
 
@@ -2531,34 +2552,76 @@ def _ensure_probability_in_copy(title, body, probability):
     return title, trimmed + suffix
 
 
-def notify_copy_cache_key(launch_id, event, net, status, probability):
+def notify_copy_cache_key(
+    launch_id,
+    event,
+    net,
+    status,
+    probability,
+    previous_status=None,
+    mission=None,
+    pad=None,
+    rocket=None,
+    orbit=None,
+):
+    """Stable cache identity for every input that changes the copy."""
     prob = _normalize_probability(probability)
-    prob_part = "" if prob is None else str(prob)
-    return (
-        f"{NOTIFY_COPY_CACHE_PREFIX}:"
-        f"{launch_id or ''}|{event or ''}|{net or ''}|{status or ''}|{prob_part}"
+    blob = json.dumps(
+        [
+            launch_id or "",
+            event or "",
+            net or "",
+            status or "",
+            previous_status or "",
+            "" if prob is None else prob,
+            mission or "",
+            pad or "",
+            rocket or "",
+            orbit or "",
+        ],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return f"{NOTIFY_COPY_CACHE_PREFIX}:{blob}"
+
+
+def _notify_copy_cache_key_for(payload: NotifyCopyRequest):
+    return notify_copy_cache_key(
+        payload.launch_id,
+        payload.event,
+        payload.net,
+        payload.status,
+        payload.probability,
+        previous_status=payload.previous_status,
+        mission=payload.mission,
+        pad=payload.pad,
+        rocket=payload.rocket,
+        orbit=payload.orbit,
     )
 
 
 def _get_notify_copy_cached(key):
+    """Local memory first so a warm worker does not wait on Redis."""
+    now = time.time()
+    with _notify_copy_flights_lock:
+        entry = _local_notify_copy.get(key)
+        if entry:
+            data, expires_at = entry
+            if now < expires_at and isinstance(data, dict) and data.get("title") and data.get("body"):
+                return data
+            _local_notify_copy.pop(key, None)
     cached = get_cached_data(key)
     if isinstance(cached, dict) and cached.get("title") and cached.get("body"):
+        with _notify_copy_flights_lock:
+            _local_notify_copy[key] = (cached, time.time() + NOTIFY_COPY_TTL)
         return cached
-    entry = _local_notify_copy.get(key)
-    if not entry:
-        return None
-    data, expires_at = entry
-    if time.time() >= expires_at:
-        _local_notify_copy.pop(key, None)
-        return None
-    if isinstance(data, dict) and data.get("title") and data.get("body"):
-        return data
     return None
 
 
 def _set_notify_copy_cached(key, data):
     set_cached_data(key, data, ttl=NOTIFY_COPY_TTL)
-    _local_notify_copy[key] = (data, time.time() + NOTIFY_COPY_TTL)
+    with _notify_copy_flights_lock:
+        _local_notify_copy[key] = (data, time.time() + NOTIFY_COPY_TTL)
 
 
 def fallback_notify_copy(payload: NotifyCopyRequest):
@@ -2657,38 +2720,79 @@ def _parse_notify_copy_response(generated_text):
     raise ValueError("No valid notify copy JSON found in Grok response")
 
 
-def generate_notify_copy(payload: NotifyCopyRequest, increment_metrics: bool = False):
-    """Generate cached Grok (or fallback) notification title+body for an alert event."""
-    cache_key = notify_copy_cache_key(
-        payload.launch_id,
-        payload.event,
-        payload.net,
-        payload.status,
-        payload.probability,
-    )
-    cached = _get_notify_copy_cached(cache_key)
-    if cached:
-        if increment_metrics:
-            increment_metric("cache_hits")
-        return {
-            "title": _clip_notify_text(cached["title"], NOTIFY_TITLE_MAX),
-            "body": _clip_notify_text(cached["body"], NOTIFY_BODY_MAX),
-            "launch_id": payload.launch_id,
-            "event": payload.event,
-            "cached": True,
-            "model": GROK_MODEL,
-        }
+def _notify_copy_result(payload: NotifyCopyRequest, title, body, cached: bool):
+    title = _clip_notify_text(title, NOTIFY_TITLE_MAX)
+    body = _clip_notify_text(body, NOTIFY_BODY_MAX)
+    title, body = _ensure_probability_in_copy(title, body, payload.probability)
+    return {
+        "title": title,
+        "body": body,
+        "launch_id": payload.launch_id,
+        "event": payload.event,
+        "cached": bool(cached),
+        "model": GROK_MODEL,
+    }
 
-    if increment_metrics:
-        increment_metric("cache_misses")
 
+def _cached_launch_summary(launch_id):
+    """Slim launch already in this process. Never reads Redis and never calls Launch Library."""
+    if not launch_id:
+        return None
+    data = _launches_mem.get("data")
+    if not isinstance(data, dict):
+        return None
+    wanted = str(launch_id)
+    for bucket in ("upcoming", "previous"):
+        rows = data.get(bucket) or []
+        if not isinstance(rows, list):
+            continue
+        for launch in rows:
+            if isinstance(launch, dict) and str(launch.get("id") or "") == wanted:
+                return launch
+    return None
+
+
+def _notify_copy_with_cached_launch(payload: NotifyCopyRequest) -> NotifyCopyRequest:
+    """Fill blank copy fields from the in-memory launch list.
+
+    A request that already has a mission can build template copy by itself.
+    Missing fields use only the warm list cache. This path does not fetch.
+    """
+    if payload.mission:
+        return payload
+    launch = _cached_launch_summary(payload.launch_id)
+    if not launch:
+        return payload
+    updates = {}
+    for field, key in (
+        ("mission", "mission"),
+        ("pad", "pad"),
+        ("net", "net"),
+        ("status", "status"),
+        ("rocket", "rocket"),
+        ("orbit", "orbit"),
+        ("probability", "probability"),
+    ):
+        if getattr(payload, field) is not None:
+            continue
+        value = launch.get(key)
+        if field == "mission" and not value:
+            value = launch.get("name")
+        if value is not None and value != "":
+            updates[field] = value
+    if not updates:
+        return payload
+    return payload.model_copy(update=updates)
+
+
+def _produce_notify_copy(payload: NotifyCopyRequest):
+    """Rich path. Upstream failures become template copy; this does not raise."""
     try:
-        if increment_metrics:
-            increment_metric("api_calls")
         generated_text = call_grok(
             build_notify_copy_prompt(payload),
             temperature=0.7,
             max_tokens=250,
+            timeout=NOTIFY_COPY_GROK_TIMEOUT,
         )
         title, body = _parse_notify_copy_response(generated_text)
         title = _clip_notify_text(title, NOTIFY_TITLE_MAX)
@@ -2697,17 +2801,107 @@ def generate_notify_copy(payload: NotifyCopyRequest, increment_metrics: bool = F
     except Exception as exc:
         print(f"Notify copy Grok fallback: {exc}")
         title, body = fallback_notify_copy(payload)
+    return {"title": title, "body": body}
 
-    result = {
-        "title": title,
-        "body": body,
-        "launch_id": payload.launch_id,
-        "event": payload.event,
-        "cached": False,
-        "model": GROK_MODEL,
-    }
-    _set_notify_copy_cached(cache_key, {"title": title, "body": body})
-    return result
+
+def _run_notify_copy_flight(cache_key, payload: NotifyCopyRequest, increment_metrics: bool):
+    if increment_metrics:
+        increment_metric("api_calls")
+    produced = _produce_notify_copy(payload)
+    _set_notify_copy_cached(cache_key, produced)
+    return produced
+
+
+def _begin_notify_copy_flight(cache_key, payload: NotifyCopyRequest, increment_metrics: bool):
+    """Return the single in-flight future for this key, starting one if needed."""
+    with _notify_copy_flights_lock:
+        state = _notify_copy_flights.get(cache_key)
+        if state is not None:
+            future, started = state
+            if not future.done():
+                return future, started
+        started = time.monotonic()
+        future = _notify_copy_executor.submit(
+            _run_notify_copy_flight,
+            cache_key,
+            payload,
+            increment_metrics,
+        )
+        _notify_copy_flights[cache_key] = (future, started)
+
+        def _clear(done, key=cache_key):
+            with _notify_copy_flights_lock:
+                current = _notify_copy_flights.get(key)
+                if current is not None and current[0] is done:
+                    _notify_copy_flights.pop(key, None)
+
+        future.add_done_callback(_clear)
+        return future, started
+
+
+def _drain_notify_copy_flights(timeout=1.0):
+    """Wait briefly so a test's background fill can finish before the next case."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        with _notify_copy_flights_lock:
+            pending = [state[0] for state in _notify_copy_flights.values() if not state[0].done()]
+        if not pending:
+            return
+        time.sleep(0.02)
+
+
+def _template_notify_result(payload: NotifyCopyRequest):
+    title, body = fallback_notify_copy(payload)
+    return _notify_copy_result(payload, title, body, cached=False)
+
+
+def generate_notify_copy(payload: NotifyCopyRequest, increment_metrics: bool = False):
+    """Cached notification title+body.
+
+    Cache hits return immediately. A miss waits at most ``NOTIFY_COPY_BUDGET_SEC``
+    for Grok. If that budget expires, or Grok/upstream fails, the response is
+    deterministic template copy with the same JSON shape. The rich call keeps
+    running in the background (one flight per cache key) and fills the cache.
+    """
+    try:
+        return _generate_notify_copy_bounded(payload, increment_metrics=increment_metrics)
+    except Exception as exc:
+        print(f"Notify copy failed closed to template: {exc}")
+        return _template_notify_result(payload)
+
+
+def _generate_notify_copy_bounded(payload: NotifyCopyRequest, increment_metrics: bool = False):
+    payload = _notify_copy_with_cached_launch(payload)
+    cache_key = _notify_copy_cache_key_for(payload)
+    cached = _get_notify_copy_cached(cache_key)
+    if cached:
+        if increment_metrics:
+            increment_metric("cache_hits")
+        return _notify_copy_result(payload, cached["title"], cached["body"], cached=True)
+
+    if increment_metrics:
+        increment_metric("cache_misses")
+
+    future, started = _begin_notify_copy_flight(cache_key, payload, increment_metrics)
+    if future.done():
+        produced = future.result()
+        return _notify_copy_result(payload, produced["title"], produced["body"], cached=False)
+
+    remaining = NOTIFY_COPY_BUDGET_SEC - (time.monotonic() - started)
+    if remaining <= 0:
+        return _template_notify_result(payload)
+    try:
+        produced = future.result(timeout=remaining)
+    except FuturesTimeout:
+        print(
+            f"Notify copy budget {NOTIFY_COPY_BUDGET_SEC:.1f}s exceeded "
+            f"for {payload.launch_id} {payload.event}; serving template"
+        )
+        return _template_notify_result(payload)
+    except Exception as exc:
+        print(f"Notify copy flight failed closed to template: {exc}")
+        return _template_notify_result(payload)
+    return _notify_copy_result(payload, produced["title"], produced["body"], cached=False)
 
 
 # --- Ported Fetch Functions from functions.py ---
@@ -6523,12 +6717,18 @@ def _notify_copy_from_params(
     summary="Generate Grok notification copy",
     response_description="Short title+body for a Launch Buddy push/local notification",
 )
-def post_notify_copy(payload: NotifyCopyRequest):
+def post_notify_copy(payload: NotifyCopyRequest, response: Response):
     """Generate short push/local-notification title+body for an upcoming launch.
 
     Uses the same xAI Grok model as past-launch narratives
-    (`grok-4-1-fast-reasoning` via `XAI_API_KEY`). Cached in Redis for ~1 hour
-    keyed by `(launch_id, event, net, status, probability)`.
+    (`grok-4-1-fast-reasoning` via `XAI_API_KEY`). Cached for ~1 hour
+    keyed by launch id, event, NET, status, previous status, probability,
+    and the other copy fields. Cache hits return immediately.
+
+    The request waits at most ~1.5s. If Grok does not finish, or the upstream
+    call fails, the response is template copy (HTTP 200, same JSON shape) and
+    the rich call fills the cache in the background. Invalid input is still 422.
+    No Launch Library fetch is made on this path.
 
     Supported `event` values:
     - **t24h** — 24 hours before NET
@@ -6536,9 +6736,9 @@ def post_notify_copy(payload: NotifyCopyRequest):
     - **scrub** — launch scrubbed / delayed / hold (status change)
 
     Always mentions `probability` when provided (e.g. `70% go` or `weather 40%`).
-    Falls back to a template if Grok fails.
     """
     increment_metric("total_requests")
+    response.headers["X-Notify-Copy-Budget"] = str(NOTIFY_COPY_BUDGET_SEC)
     return generate_notify_copy(payload, increment_metrics=True)
 
 
@@ -6560,8 +6760,12 @@ def get_notify_copy(
     orbit: Optional[str] = Query(default=None, examples=["LEO"]),
     probability: Optional[float] = Query(default=None, ge=0, le=100, examples=[80], description="Launch probability 0-100"),
     previous_status: Optional[str] = Query(default=None, examples=["Go"], description="Prior status for scrub context"),
+    response: Response = None,
 ):
+    if response is None:
+        response = Response()
     """GET variant of `/notify/copy` for easy client testing. Same shape as POST."""
+    response.headers["X-Notify-Copy-Budget"] = str(NOTIFY_COPY_BUDGET_SEC)
     return _notify_copy_from_params(
         launch_id=launch_id,
         event=event,
