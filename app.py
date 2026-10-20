@@ -15,6 +15,7 @@ import time
 import threading
 import zlib
 import base64
+import hashlib
 import pytz
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from dotenv import load_dotenv
@@ -103,15 +104,19 @@ def get_redis_client():
 r = get_redis_client()
 
 
+def _encode_for_cache(data) -> str:
+    """JSON, zlib-compressed and base64 encoded (the Redis string format)."""
+    json_str = json.dumps(data)
+    compressed = zlib.compress(json_str.encode('utf-8'))
+    return base64.b64encode(compressed).decode('utf-8')
+
+
 def set_cached_data(key, data, ttl=None):
     """Set data in Redis with compression and better error handling."""
     if not r:
         return False
     try:
-        json_str = json.dumps(data)
-        # Compress and base64 encode to store as string in the current Redis client
-        compressed = zlib.compress(json_str.encode('utf-8'))
-        encoded = base64.b64encode(compressed).decode('utf-8')
+        encoded = _encode_for_cache(data)
         if ttl:
             r.setex(key, ttl, encoded)
         else:
@@ -756,6 +761,9 @@ def _reset_cache_coordination_for_tests():
     _space_track_unconfigured_logged = False
     _space_track.reset()
     _TRAJECTORY_DATA_CACHE = {}
+    global _trajectory_legacy_checked
+    _trajectory_legacy_checked = False
+    _redis_memory_probe.update({"at": 0.0, "used": None, "max": None})
     _weather_flight.reset()
     _launches_flight.reset()
     _narratives_flight.reset()
@@ -1191,32 +1199,173 @@ logger = Logger()
 
 _TRAJECTORY_DATA_CACHE = None
 TRAJECTORY_CACHE_FILE = "trajectory_cache.json"
+# Bump when the trajectory model changes; older entries are dropped on load.
+TRAJECTORY_CACHE_VERSION = 'v263-along-track'
+# One small Redis key per trajectory, with a TTL. The previous design kept every
+# trajectory ever computed in one ever-growing, never-expiring blob
+# (``trajectory_cache_v2``), which filled the 25 MB Heroku Redis.
+TRAJECTORY_REDIS_PREFIX = "trajectory_cache_v3:"
+TRAJECTORY_LEGACY_REDIS_KEY = "trajectory_cache_v2"
+TRAJECTORY_CACHE_TTL = 14 * 24 * 3600
+TRAJECTORY_LOCAL_MAX = 32  # in-process / disk entries kept per dyno
+# Redis is noeviction. Optional cache writes (trajectories) are skipped unless
+# this much room stays free, so the Starlink GP catalog, its pre-rendered body
+# and the shared stamp can always be written.
+REDIS_CRITICAL_RESERVE_BYTES = int(
+    os.getenv("REDIS_CRITICAL_RESERVE_BYTES", str(7 * 1024 * 1024))
+)
+REDIS_MEMORY_PROBE_SEC = 15
+_redis_memory_probe = {"at": 0.0, "used": None, "max": None}
+_redis_memory_probe_lock = threading.Lock()
+_trajectory_legacy_checked = False
+
+
+def _redis_memory_snapshot(force: bool = False):
+    """(used_memory, maxmemory) from INFO memory, cached for a few seconds."""
+    if not r:
+        return None, None
+    now = time.monotonic()
+    with _redis_memory_probe_lock:
+        if not force and _redis_memory_probe["at"] and (
+            now - _redis_memory_probe["at"] < REDIS_MEMORY_PROBE_SEC
+        ):
+            return _redis_memory_probe["used"], _redis_memory_probe["max"]
+    try:
+        info = r.info("memory")
+        used = int(info.get("used_memory") or 0)
+        maxmem = int(info.get("maxmemory") or 0)
+    except Exception as e:
+        print(f"Redis memory probe failed: {e}")
+        return None, None
+    with _redis_memory_probe_lock:
+        _redis_memory_probe.update({"at": now, "used": used, "max": maxmem})
+    return used, maxmem
+
+
+def _redis_has_room(nbytes: int) -> bool:
+    """True when an optional write of ``nbytes`` leaves the critical reserve.
+
+    The write needs room for the request buffer and the new value at once, so
+    the size counts twice. Unknown limits (no maxmemory, probe failure) allow
+    the write, matching the old behavior.
+    """
+    if not r:
+        return False
+    used, maxmem = _redis_memory_snapshot()
+    if not used or not maxmem:
+        return True
+    return used + 2 * int(nbytes) + REDIS_CRITICAL_RESERVE_BYTES <= maxmem
+
+
+def _trajectory_redis_key(cache_key: str) -> str:
+    digest = hashlib.sha1(str(cache_key).encode("utf-8")).hexdigest()[:24]
+    return f"{TRAJECTORY_REDIS_PREFIX}{digest}"
+
+
+def _prune_trajectory_cache(data, version=None):
+    """Keep only current-model entries, newest last, capped in size."""
+    if not isinstance(data, dict):
+        return {}
+    prefix = f"{version or TRAJECTORY_CACHE_VERSION}:"
+    kept = [(k, v) for k, v in data.items() if str(k).startswith(prefix) and isinstance(v, dict)]
+    if len(kept) > TRAJECTORY_LOCAL_MAX:
+        kept = kept[-TRAJECTORY_LOCAL_MAX:]
+    return dict(kept)
+
+
+def _load_trajectory_entry(cache_key):
+    """One trajectory from the shared Redis store, or None."""
+    if not r:
+        return None
+    cached = get_cached_data(_trajectory_redis_key(cache_key))
+    if isinstance(cached, dict) and cached.get("cache_key") == cache_key:
+        entry = cached.get("entry")
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _save_trajectory_entry(cache_key, entry) -> bool:
+    """Store one trajectory with a TTL, only if Redis keeps its reserve."""
+    if not r or not isinstance(entry, dict):
+        return False
+    try:
+        encoded = _encode_for_cache({"cache_key": cache_key, "entry": entry})
+    except Exception as e:
+        print(f"Trajectory cache encode failed: {e}")
+        return False
+    if not _redis_has_room(len(encoded)):
+        print(
+            "Trajectory cache write skipped: Redis reserve for satellite "
+            f"catalogs ({len(encoded)} bytes)"
+        )
+        return False
+    try:
+        r.setex(_trajectory_redis_key(cache_key), TRAJECTORY_CACHE_TTL, encoded)
+        return True
+    except Exception as e:
+        print(f"Redis write error for trajectory cache: {e}")
+        return False
+
+
+def _migrate_legacy_trajectory_cache():
+    """Move current-model entries out of the old single blob, then delete it.
+
+    The legacy key is no longer read or written by this code. Its stale
+    model versions are dropped. Runs once per process.
+    """
+    global _trajectory_legacy_checked
+    if _trajectory_legacy_checked or not r:
+        return {}
+    _trajectory_legacy_checked = True
+    try:
+        if not r.exists(TRAJECTORY_LEGACY_REDIS_KEY):
+            return {}
+    except Exception:
+        return {}
+    legacy = get_cached_data(TRAJECTORY_LEGACY_REDIS_KEY)
+    try:
+        # Free the space before writing the per-entry keys.
+        r.delete(TRAJECTORY_LEGACY_REDIS_KEY)
+        print("Removed legacy trajectory_cache_v2 blob from Redis")
+    except Exception as e:
+        print(f"Legacy trajectory cache delete failed: {e}")
+        return {}
+    kept = _prune_trajectory_cache(legacy)
+    for key, entry in kept.items():
+        _save_trajectory_entry(key, entry)
+    return kept
 
 
 def load_cache_from_file(filename):
-    """Load cache from Redis instead of file if possible, or fallback to file."""
-    if r:
-        data = get_cached_data("trajectory_cache_v2")
-        if data:
-            return {"data": data}
+    """Load this dyno's trajectory cache from disk (current model only).
 
+    Shared copies live in per-trajectory Redis keys and are read on demand
+    by ``_load_trajectory_entry``.
+    """
+    data = {}
     if os.path.exists(filename):
         try:
             with open(filename, 'r') as f:
-                return {"data": json.load(f)}
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
         except Exception as e:
             print(f"Error loading cache file: {e}")
-    return {"data": {}}
+    legacy = _migrate_legacy_trajectory_cache()
+    for key, entry in legacy.items():
+        data.setdefault(key, entry)
+    return {"data": _prune_trajectory_cache(data)}
 
 
 def save_cache_to_file(filename, data, updated_at=None):
-    """Save cache to Redis and local file."""
-    if r:
-        set_cached_data("trajectory_cache_v2", data)
+    """Save this dyno's (pruned) trajectory cache to the local file.
 
+    Redis is written per entry by ``_save_trajectory_entry``.
+    """
     try:
         with open(filename, 'w') as f:
-            json.dump(data, f)
+            json.dump(_prune_trajectory_cache(data), f)
     except Exception as e:
         print(f"Error saving cache file: {e}")
 
@@ -1916,7 +2065,7 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         launch_site.get('lat', 0.0)
     )
 
-    ORBIT_CACHE_VERSION = 'v263-along-track'
+    ORBIT_CACHE_VERSION = TRAJECTORY_CACHE_VERSION
     landing_type = next_launch.get('landing_type')
     landing_loc = next_launch.get('landing_location')
     landing_lat, landing_lon, landing_downrange_km = _landing_numbers(next_launch)
@@ -1938,6 +2087,11 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
         else:
             # Handle direct dictionary without 'data' wrapper if it exists
             _TRAJECTORY_DATA_CACHE = cache_loaded if isinstance(cache_loaded, dict) else {}
+
+    if cache_key not in _TRAJECTORY_DATA_CACHE:
+        shared = _load_trajectory_entry(cache_key)
+        if isinstance(shared, dict):
+            _TRAJECTORY_DATA_CACHE[cache_key] = shared
 
     if cache_key in _TRAJECTORY_DATA_CACHE:
         cached = _TRAJECTORY_DATA_CACHE[cache_key]
@@ -2121,6 +2275,10 @@ def get_launch_trajectory_data(upcoming_launches, previous_launches=None):
             'booster_ground_track': booster_ground_track,
             'model': 'v15-along-track'
         }
+        pruned = _prune_trajectory_cache(traj_cache, version=ORBIT_CACHE_VERSION)
+        for stale_key in [k for k in list(traj_cache) if k not in pruned]:
+            traj_cache.pop(stale_key, None)
+        _save_trajectory_entry(cache_key, traj_cache.get(cache_key))
         save_cache_to_file(TRAJECTORY_CACHE_FILE, traj_cache, datetime.now(pytz.utc))
     except Exception as e:
         logger.warning(f"Failed to save trajectory cache: {e}")
