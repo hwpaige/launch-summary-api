@@ -145,8 +145,36 @@ class TrajectoryCacheTests(unittest.TestCase):
             app.load_cache_from_file(self.cache_file)
             self.assertIn(app.TRAJECTORY_LEGACY_REDIS_KEY, fake.store)
 
+    def test_migration_rereads_memory_after_freeing_legacy_blob(self):
+        fake = FakeRedis(used=24 * 1024 * 1024)
+        key = f"{app.TRAJECTORY_CACHE_VERSION}:site"
+        fake.store[app.TRAJECTORY_LEGACY_REDIS_KEY] = app._encode_for_cache({key: {"a": 1}})
+        real_delete = fake.delete
+
+        def delete_frees(*keys):
+            fake.used = 19 * 1024 * 1024
+            return real_delete(*keys)
+
+        fake.delete = delete_frees
+        with patch.object(app, "r", fake):
+            app._redis_memory_snapshot()  # cached while the blob still exists
+            app.load_cache_from_file(self.cache_file)
+            self.assertEqual(app._load_trajectory_entry(key), {"a": 1})
+
+    def test_reserve_leaves_room_for_starlink_body_at_current_usage(self):
+        # Production after the fix: ~19.5 MB used of 25 MB.
+        fake = FakeRedis(used=19_500_000, maxmemory=26_214_400)
+        with patch.object(app, "r", fake):
+            self.assertTrue(app._redis_has_room(60_000))
+            # Never eat into the ~3.7 MB a Starlink body rewrite needs.
+            self.assertGreaterEqual(app.REDIS_CRITICAL_RESERVE_BYTES, 2 * 1_835_072)
+        fake.used = 22_000_000
+        app._redis_memory_probe.update({"at": 0.0})
+        with patch.object(app, "r", fake):
+            self.assertFalse(app._redis_has_room(60_000))
+
     def test_trajectory_write_skipped_when_reserve_would_be_used(self):
-        fake = FakeRedis(used=20 * 1024 * 1024)
+        fake = FakeRedis(used=22 * 1024 * 1024)
         with patch.object(app, "r", fake):
             traj = app.get_launch_trajectory_data(dict(LAUNCH))
         self.assertTrue(traj["trajectory"])

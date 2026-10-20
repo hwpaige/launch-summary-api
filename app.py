@@ -1211,8 +1211,10 @@ TRAJECTORY_LOCAL_MAX = 32  # in-process / disk entries kept per dyno
 # Redis is noeviction. Optional cache writes (trajectories) are skipped unless
 # this much room stays free, so the Starlink GP catalog, its pre-rendered body
 # and the shared stamp can always be written.
+# The largest critical write (Starlink pre-rendered body, ~1.8 MB) needs about
+# twice its size free at once (request buffer + new value): ~3.7 MB.
 REDIS_CRITICAL_RESERVE_BYTES = int(
-    os.getenv("REDIS_CRITICAL_RESERVE_BYTES", str(7 * 1024 * 1024))
+    os.getenv("REDIS_CRITICAL_RESERVE_BYTES", str(int(4.5 * 1024 * 1024)))
 )
 REDIS_MEMORY_PROBE_SEC = 15
 _redis_memory_probe = {"at": 0.0, "used": None, "max": None}
@@ -1328,6 +1330,8 @@ def _migrate_legacy_trajectory_cache():
         # Free the space before writing the per-entry keys.
         r.delete(TRAJECTORY_LEGACY_REDIS_KEY)
         print("Removed legacy trajectory_cache_v2 blob from Redis")
+        # The freed space must count before the per-entry writes below.
+        _redis_memory_snapshot(force=True)
     except Exception as e:
         print(f"Legacy trajectory cache delete failed: {e}")
         return {}
