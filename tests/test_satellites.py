@@ -918,7 +918,7 @@ class ManifestEphemerisTests(unittest.TestCase):
 
         # A launch well outside the roll-forward window must not inherit this file.
         self.assertIsNone(
-            app.meme_state_from_lines(_MEME_SAMPLE.splitlines(), "2026-08-01", when)
+            app.meme_state_from_lines(_MEME_SAMPLE.splitlines(), "2026-06-01", when)
         )
         self.assertIsNone(
             app.meme_state_from_lines(_MEME_OLD.splitlines(), "2026-09-28", when)
@@ -1101,6 +1101,117 @@ class ManifestEphemerisTests(unittest.TestCase):
         self.assertEqual(len(body["satellites"][0]["tle_line1"]), 69)
         self.assertTrue(any(url == app.SPACEX_MANIFEST_URL for url, _params in calls))
 
+
+    # --- Regression: Flight 14 V3 dots vanished once MEMEs rolled >21 days ---
+
+    _DEPLOYED_BODY_KEYS = {
+        "launch_date", "generation", "mission", "fetched_at", "ttl_seconds",
+        "count", "catalog_count", "stale", "empty", "source", "note",
+        "satellites",
+    }
+
+    @staticmethod
+    def _rolled_meme(start_day, start_doy):
+        """_MEME_SAMPLE re-stamped to start on ``start_day`` (YYYY-MM-DD)."""
+        return _MEME_SAMPLE.replace(
+            "created:2026-09-28 17:01:25 UTC",
+            f"created:{start_day} 09:01:10 UTC",
+        ).replace(
+            "ephemeris_start:2026-09-28 16:58:42 UTC ephemeris_stop:2026-09-30 16:57:42 UTC step_size:60",
+            f"ephemeris_start:{start_day} 08:58:42 UTC ephemeris_stop:{start_day} 23:58:42 UTC step_size:60",
+        ).replace(
+            "2026271165842.000", f"2026{start_doy:03d}085842.000",
+        ).replace(
+            "2026271165942.000", f"2026{start_doy:03d}085942.000",
+        )
+
+    @staticmethod
+    def _frozen_at(year, month, day, hour, minute, second):
+        from datetime import datetime, timezone
+
+        class _Now(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                stamp = cls(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+                if tz is not None:
+                    return stamp.astimezone(tz)
+                return stamp
+
+        return _Now
+
+    def test_window_rolled_more_than_21_days_still_matches_launch(self):
+        from datetime import datetime, timezone
+
+        # Live MANIFEST on 2026-10-23: Flight 14 files start 25 days after launch.
+        rolled = {
+            "created": datetime(2026, 10, 23, 9, 1, 10, tzinfo=timezone.utc),
+            "start": datetime(2026, 10, 23, 8, 58, 42, tzinfo=timezone.utc),
+            "stop": datetime(2026, 10, 26, 8, 58, 42, tzinfo=timezone.utc),
+        }
+        now = datetime(2026, 10, 23, 20, 40, tzinfo=timezone.utc)
+        self.assertTrue(app._meme_window_covers(rolled, "2026-09-28", now))
+        # Still bounded: a launch more than MEME_ROLL_FORWARD_DAYS earlier
+        # must not claim today's post-Falcon set.
+        self.assertFalse(app._meme_window_covers(rolled, "2026-07-01", now))
+
+    def test_manifest_rolled_25_days_after_launch_fills_flight_14(self):
+        rolled = self._rolled_meme("2026-10-23", 296)
+        manifest_lines = []
+        ephemerides = {}
+        for sid in F14_STARLINK_IDS:
+            name = _f14_filename(sid)
+            manifest_lines.append(name)
+            ephemerides[name] = rolled
+        router = DeployedSatelliteTests()
+        fake_get, calls = router._route_celestrak(
+            [_satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-09-20")],
+            manifest="\n".join(manifest_lines) + "\n",
+            ephemerides=ephemerides,
+        )
+        launches = {"upcoming": [], "previous": [FLIGHT_14], "last_updated": None}
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", self._frozen_at(2026, 10, 23, 8, 59, 12)), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(set(body), self._DEPLOYED_BODY_KEYS)
+        self.assertEqual(body["source"], "spacex-manifest-ephemeris")
+        self.assertEqual(body["count"], 26)
+        self.assertFalse(body["empty"])
+        self.assertFalse(body["stale"])
+        self.assertEqual(
+            [sat["name"] for sat in body["satellites"]],
+            [f"STARLINK-{sid}" for sid in F14_STARLINK_IDS],
+        )
+        self.assertTrue(all(sat["generation"] == "v3" for sat in body["satellites"]))
+
+    def test_manifest_candidates_all_rejected_is_stale_not_fresh_empty(self):
+        # Window starts >90 days after launch: every post-Falcon file is rejected.
+        rolled = self._rolled_meme("2027-01-05", 5).replace("2026005", "2027005")
+        name = _f14_filename(40075)
+        router = DeployedSatelliteTests()
+        fake_get, _calls = router._route_celestrak(
+            [_satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-09-20")],
+            manifest=name + "\n",
+            ephemerides={name: rolled},
+        )
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", self._frozen_at(2027, 1, 5, 8, 59, 12)), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+            # A cache hit inside the empty TTL must stay stale too.
+            again = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        for payload in (body, again):
+            self.assertEqual(set(payload), self._DEPLOYED_BODY_KEYS)
+            self.assertEqual(payload["satellites"], [])
+            self.assertEqual(payload["count"], 0)
+            self.assertTrue(payload["empty"])
+            self.assertTrue(payload["stale"])
+            self.assertIsInstance(payload["stale"], bool)
+            self.assertEqual(payload["source"], "celestrak-satcat")
+            self.assertNotIn("unavailable", payload["note"].lower())
 
 _SPACE_TRACK_ENV = {
     "SPACE_TRACK_IDENTITY": "operator@example.com",
