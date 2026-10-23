@@ -260,9 +260,13 @@ SPACEX_EPHEM_CONCURRENCY = 8
 SPACEX_EPHEM_FETCH_TIMEOUT = 20
 SPACEX_EPHEM_BUDGET_SEC = 22
 # SpaceX republishes MEME files daily, so the window can start after the
-# launch calendar day. Still treat the file as this flight for a few weeks;
-# a much older launch date must not pick up today's post-Falcon set.
-MEME_ROLL_FORWARD_DAYS = 21
+# launch calendar day. The manifest is only consulted while SATCAT has no
+# plottable rows for the launch date, and only post-Falcon ids (>= 40000) are
+# candidates, so keep treating rolled-forward files as this flight for ~90 days.
+# 21 days dropped all 26 Flight 14 (2026-09-28) sats once the files rolled past
+# 2026-10-19 while SATCAT still had not catalogued the flight. A much older
+# launch date must still not pick up today's post-Falcon set.
+MEME_ROLL_FORWARD_DAYS = 90
 SPACEX_EPHEM_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -5887,12 +5891,25 @@ def _download_meme_satellite(filename, starlink_id, launch_date, when, generatio
 
 def _manifest_satellites_for_launch(launch_date: str, generation, when: datetime = None) -> list:
     """Download and parse post-Falcon MEME files whose window covers ``launch_date``."""
+    satellites, _candidate_count = _manifest_scan_for_launch(
+        launch_date, generation, when
+    )
+    return satellites
+
+
+def _manifest_scan_for_launch(launch_date: str, generation, when: datetime = None):
+    """``(satellites, candidate_count)`` from the SpaceX public manifest.
+
+    ``candidate_count`` is the number of post-Falcon files the manifest listed,
+    so a caller can tell "manifest had nothing" from "manifest had files but
+    none matched this launch".
+    """
     when = when or datetime.now(timezone.utc)
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     candidates = manifest_starlink_filenames(_download_manifest_text())
     if not candidates:
-        return []
+        return [], 0
     satellites = []
     workers = min(SPACEX_EPHEM_CONCURRENCY, len(candidates))
     pool = ThreadPoolExecutor(max_workers=workers)
@@ -5921,7 +5938,7 @@ def _manifest_satellites_for_launch(launch_date: str, generation, when: datetime
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     satellites.sort(key=lambda record: record.get("id") or "")
-    return satellites
+    return satellites, len(candidates)
 
 
 def _deployed_note_empty(launch_date: str) -> str:
@@ -6182,7 +6199,10 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
     launch_date = target["launch_date"]
     cached = None if force else _read_deployed_cache(launch_date)
     if cached and _deployed_cache_is_fresh(cached):
-        return _mark_deployed_cached(cached, stale=False)
+        # A cached manifest filter miss stays stale for its whole TTL.
+        return _mark_deployed_cached(
+            cached, stale=bool(cached.get("manifest_rejected"))
+        )
 
     satcat_failed = False
     index = None
@@ -6244,13 +6264,23 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
     # gap until the catalog lists this launch date.
     manifest_failed = False
     manifest_sats = []
+    manifest_candidates = 0
     try:
-        manifest_sats = _manifest_satellites_for_launch(
+        manifest_sats, manifest_candidates = _manifest_scan_for_launch(
             launch_date, target.get("generation")
         )
     except Exception as exc:
         print(f"Deployed SpaceX MANIFEST refresh failed for {launch_date}: {exc}")
         manifest_failed = True
+    # The manifest listed post-Falcon files but none matched this launch. That
+    # is a filter miss, not an honest empty catalog, so it must not be
+    # reported as fresh (stale:false) data.
+    manifest_rejected_all = bool(manifest_candidates) and not manifest_sats
+    if manifest_rejected_all:
+        print(
+            f"Deployed SpaceX MANIFEST had {manifest_candidates} post-Falcon "
+            f"file(s) but none matched {launch_date}"
+        )
     if manifest_sats:
         payload = _deployed_payload(
             target,
@@ -6284,10 +6314,12 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
         target,
         catalog_rows,
         [],
-        stale=bool(index_stale or manifest_failed),
+        stale=bool(index_stale or manifest_failed or manifest_rejected_all),
         note=note,
     )
     payload["manifest_checked"] = True
+    if manifest_rejected_all:
+        payload["manifest_rejected"] = True
     if index_stale:
         payload["fetched_at"] = (index or {}).get("fetched_at") or payload["fetched_at"]
         payload["stale"] = True
@@ -6365,6 +6397,7 @@ def _finish_deployed_response(payload, *, cache_hit: bool):
     if isinstance(payload, dict):
         payload = dict(payload)
         payload.pop("manifest_checked", None)
+        payload.pop("manifest_rejected", None)
         _note_satellite_staleness(
             payload,
             kind="deployed",
