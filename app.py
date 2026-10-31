@@ -72,6 +72,29 @@ app = FastAPI(
 )
 
 
+# Heroku Redis mini allows 18 connections for the whole add-on. Procfile is
+# one uvicorn process per web dyno (no --workers), so this process stops at
+# 12 and leaves headroom. BlockingConnectionPool waits instead of opening
+# another socket past that cap.
+REDIS_MAX_CONNECTIONS = 12
+REDIS_POOL_TIMEOUT_SEC = 2
+
+
+def _redis_client_from_url(url):
+    kwargs = {
+        "decode_responses": True,
+        "max_connections": REDIS_MAX_CONNECTIONS,
+        "timeout": REDIS_POOL_TIMEOUT_SEC,
+    }
+    # Heroku Redis uses rediss:// with a self-signed certificate.
+    if url.startswith("rediss://"):
+        kwargs["ssl_cert_reqs"] = None
+    pool = redis.BlockingConnectionPool.from_url(url, **kwargs)
+    client = redis.Redis(connection_pool=pool)
+    client.ping()
+    return client
+
+
 # Redis Configuration for persistence across Heroku builds
 def get_redis_client():
     # List of potential Redis environment variables used by various Heroku add-ons
@@ -86,12 +109,7 @@ def get_redis_client():
         url = os.getenv(var)
         if url:
             try:
-                # Heroku Redis often requires SSL with cert verification disabled for self-signed certs
-                if url.startswith("rediss://"):
-                    client = redis.from_url(url, decode_responses=True, ssl_cert_reqs=None)
-                else:
-                    client = redis.from_url(url, decode_responses=True)
-                client.ping()
+                client = _redis_client_from_url(url)
                 print(f"Connected to Redis via {var}")
                 return client
             except Exception as e:
@@ -127,8 +145,13 @@ def set_cached_data(key, data, ttl=None):
         return False
 
 
-def get_cached_data(key):
-    """Get data from Redis with decompression support."""
+def get_cached_data(key, *, _strict=False):
+    """Get data from Redis with decompression support.
+
+    A missing key and a decode miss are ``None``. A transport error is also
+    ``None`` unless ``_strict`` — launch reads use that so a reset connection
+    is not mistaken for an empty cache.
+    """
     if not r:
         return None
     try:
@@ -149,6 +172,8 @@ def get_cached_data(key):
                 return None
     except Exception as e:
         print(f"Redis read error for {key}: {e}")
+        if _strict:
+            raise
         return None
 
 
@@ -402,7 +427,7 @@ _weather_last_result = None
 _local_weather_store = {}
 _local_raw_launches = {}
 _local_hot_raw = {}
-_launches_mem = {"data": None, "at": 0.0}
+_launches_mem = {"data": None, "at": 0.0, "stale": False}
 _local_satellites = {}
 _local_satellite_http = {}
 _satellite_flights = {}
@@ -786,6 +811,7 @@ def _reset_cache_coordination_for_tests():
         _local_notify_copy.clear()
     _launches_mem["data"] = None
     _launches_mem["at"] = 0.0
+    _launches_mem["stale"] = False
     _local_satellites.clear()
     _local_satellite_http.clear()
     with _satellite_refresh_lock:
@@ -1051,13 +1077,29 @@ def _hydrate_launch_payload(data):
             if raw is not None:
                 item["all_data"] = raw
             out[bucket].append(item)
-    return out
+    return _attach_launch_stale_flag(out)
 
 
-def _remember_launches(data):
+def _launch_lists_present(data) -> bool:
+    return isinstance(data, dict) and bool(data.get("upcoming") or data.get("previous"))
+
+
+def _empty_launch_payload():
+    return {"upcoming": [], "previous": [], "last_updated": None}
+
+
+def _remember_launches(data, stale=False):
     _launches_mem["data"] = data
     _launches_mem["at"] = time.time()
+    _launches_mem["stale"] = bool(stale)
     return data
+
+
+def _attach_launch_stale_flag(body):
+    """Additive flag only. A fresh payload keeps the previous key set."""
+    if isinstance(body, dict) and _launches_mem.get("stale"):
+        body["stale"] = True
+    return body
 
 
 def _set_weather_loc(location, data, ttl=WEATHER_CACHE_TTL):
@@ -3790,13 +3832,31 @@ def refresh_narratives_internal():
     return _narratives_flight.do(_do)
 
 
+def _launch_cache_for_refresh():
+    """Last non-empty list to keep when Launch Library returns nothing.
+
+    A Redis read error must not look like a missing key, or the refresh
+    would replace a good list with the empty one LL2 returns on timeout.
+    """
+    cached = None
+    try:
+        cached = get_cached_data(LAUNCHES_CACHE_KEY, _strict=True)
+    except Exception:
+        cached = None
+    if _launch_lists_present(cached):
+        return cached
+    mem = _launches_mem.get("data")
+    if _launch_lists_present(mem):
+        return mem
+    return cached if isinstance(cached, dict) else None
+
+
 def _refresh_launches_uncached():
     """Fetch launches and write a slim cache. Not concurrency-safe on its own."""
     print("Refreshing launches cache...")
+    cached_data = _launch_cache_for_refresh()
     existing_previous = None
     existing_upcoming = None
-
-    cached_data = get_cached_data(LAUNCHES_CACHE_KEY)
     if cached_data:
         _sanitize_launch_list_cache(cached_data)
         existing_previous = cached_data.get('previous')
@@ -3805,9 +3865,18 @@ def _refresh_launches_uncached():
     try:
         data = fetch_launches(existing_previous=existing_previous, existing_upcoming=existing_upcoming)
 
-        # Add trajectory data to the first upcoming launch only
-        upcoming = data.get("upcoming", [])
-        previous = data.get("previous", [])
+        # An empty LL2 body (timeout caught inside fetch_launches, or a 200
+        # with no results) must not replace a list we already have.
+        fetched_upcoming = list(data.get("upcoming") or [])
+        fetched_previous = list(data.get("previous") or [])
+        if not fetched_upcoming and not fetched_previous:
+            if _launch_lists_present(cached_data):
+                return _remember_launches(cached_data, stale=True)
+            return None
+        upcoming = fetched_upcoming if fetched_upcoming else (existing_upcoming or [])
+        previous = fetched_previous if fetched_previous else (existing_previous or [])
+        if not upcoming and not previous:
+            return None
         if upcoming:
             traj = get_launch_trajectory_data(upcoming[0], previous)
             if traj:
@@ -3826,9 +3895,11 @@ def _refresh_launches_uncached():
         }
         _sanitize_launch_list_cache(result)
         set_cached_data(LAUNCHES_CACHE_KEY, result)
-        return _remember_launches(result)
+        return _remember_launches(result, stale=False)
     except Exception as e:
         print(f"Error in refresh_launches_internal: {e}")
+        if _launch_lists_present(cached_data):
+            return _remember_launches(cached_data, stale=True)
         return None
 
 
@@ -3837,10 +3908,10 @@ def refresh_launches_internal():
     def _do():
         result = _redis_single_flight("launches", _refresh_launches_uncached)
         if result is None:
-            cached = get_cached_data(LAUNCHES_CACHE_KEY)
-            if cached:
+            cached = _launch_cache_for_refresh()
+            if _launch_lists_present(cached):
                 _sanitize_launch_list_cache(cached, persist=True)
-                return _remember_launches(cached)
+                return _remember_launches(cached, stale=True)
         return result
 
     return _launches_flight.do(_do)
@@ -4821,10 +4892,10 @@ def get_launches(
     if not internal:
         increment_metric("total_requests")
     data = _load_launch_payload(force)
-    if data and (data.get("upcoming") or data.get("previous")):
-        increment_metric("cache_hits" if not force else "cache_misses")
-    else:
+    if not _launch_lists_present(data):
         increment_metric("cache_misses")
+        raise HTTPException(status_code=503, detail="Launch data unavailable")
+    increment_metric("cache_hits" if not force else "cache_misses")
     if full or include_raw:
         return _hydrate_launch_payload(data)
     return _slim_launch_payload(data, keep_next_trajectory=True)
@@ -4836,11 +4907,11 @@ def get_launches_slim(force: bool = False, internal: bool = False):
     if not internal:
         increment_metric("total_requests")
     data = _load_launch_payload(force)
-    if data and (data.get("upcoming") or data.get("previous")):
-        increment_metric("cache_hits" if not force else "cache_misses")
-        return _slim_launch_payload(data, keep_next_trajectory=True)
-    increment_metric("cache_misses")
-    return {"upcoming": [], "previous": [], "last_updated": None}
+    if not _launch_lists_present(data):
+        increment_metric("cache_misses")
+        raise HTTPException(status_code=503, detail="Launch data unavailable")
+    increment_metric("cache_hits" if not force else "cache_misses")
+    return _slim_launch_payload(data, keep_next_trajectory=True)
 
 
 @app.get("/launch_raw/{launch_id}")
@@ -6576,23 +6647,38 @@ def _load_launch_payload(force=False):
     now = time.time()
     if not force and _launches_mem["data"] is not None and (now - _launches_mem["at"]) < LAUNCHES_MEM_TTL:
         return _launches_mem["data"]
+    data = None
     if force:
         data = refresh_launches_internal()
+        if _launch_lists_present(data):
+            # Refresh already recorded fresh vs stale. Repair only a real LL2 write.
+            if not _launches_mem.get("stale") and _repair_mismatched_trajectory(data):
+                set_cached_data(LAUNCHES_CACHE_KEY, data)
+            return data
     else:
-        data = get_cached_data(LAUNCHES_CACHE_KEY)
-        if data:
+        try:
+            data = get_cached_data(LAUNCHES_CACHE_KEY, _strict=True)
+        except Exception:
+            # get_cached_data already logged the transport error.
+            data = None
+        if _launch_lists_present(data):
             _sanitize_launch_list_cache(data, persist=True)
-    if not data:
-        return {"upcoming": [], "previous": [], "last_updated": None}
-    if _repair_mismatched_trajectory(data):
-        set_cached_data(LAUNCHES_CACHE_KEY, data)
-    return _remember_launches(data)
+            if _repair_mismatched_trajectory(data):
+                set_cached_data(LAUNCHES_CACHE_KEY, data)
+            return _remember_launches(data, stale=False)
+    # Redis missed, failed, or LL2 produced nothing. Keep the last good copy
+    # past LAUNCHES_MEM_TTL. Callers turn a truly empty result into 503.
+    good = _launches_mem.get("data")
+    if _launch_lists_present(good):
+        return _remember_launches(good, stale=True)
+    _launches_mem["stale"] = False
+    return _empty_launch_payload()
 
 
 def _slim_launch_payload(data, keep_next_trajectory=True):
     upcoming = data.get("upcoming", []) or []
     previous = data.get("previous", []) or []
-    return {
+    body = {
         "upcoming": [
             _slim_launch(launch, keep_trajectory=(keep_next_trajectory and i == 0))
             for i, launch in enumerate(upcoming)
@@ -6606,6 +6692,7 @@ def _slim_launch_payload(data, keep_next_trajectory=True):
         ],
         "last_updated": data.get("last_updated"),
     }
+    return _attach_launch_stale_flag(body)
 
 
 def _load_narratives(force=False):

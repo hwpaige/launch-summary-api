@@ -1195,5 +1195,161 @@ class LaunchSiteTrajectoryTests(unittest.TestCase):
         self.assertTrue(any(key == app.LAUNCHES_CACHE_KEY for key in persisted))
 
 
+class LaunchCacheFailureTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def _payload(self):
+        return {
+            "upcoming": [_sample_launch("u1", "Next", with_raw=False, with_traj=True)],
+            "previous": [_sample_launch("p1", "Past", with_raw=False)],
+            "last_updated": "2026-09-02T14:21:21Z",
+        }
+
+    def _age_memory(self, payload):
+        app._launches_mem["data"] = payload
+        app._launches_mem["at"] = time.time() - app.LAUNCHES_MEM_TTL - 5
+        app._launches_mem["stale"] = False
+
+    def test_fresh_launch_payload_omits_stale_flag(self):
+        payload = self._payload()
+        with patch.object(app, "get_cached_data", return_value=payload), \
+             patch.object(app, "set_cached_data", return_value=True):
+            slim = app.get_launches_slim(internal=True)
+        self.assertNotIn("stale", slim)
+        self.assertEqual(slim["upcoming"][0]["mission"], "Next")
+        self.assertEqual(slim["previous"][0]["id"], "p1")
+        self.assertNotIn("all_data", slim["upcoming"][0])
+        self.assertIn("trajectory_data", slim["upcoming"][0])
+        self.assertFalse(app._launches_mem["stale"])
+
+    def test_redis_read_failure_serves_last_good_past_ttl(self):
+        payload = self._payload()
+        self._age_memory(payload)
+
+        def boom(key, _strict=False):
+            raise app.redis.ConnectionError("SSL EOF / connection reset")
+
+        with patch.object(app, "get_cached_data", side_effect=boom):
+            slim = app.get_launches_slim(internal=True)
+            full = app.get_launches(internal=True)
+
+        self.assertEqual(slim["upcoming"][0]["id"], "u1")
+        self.assertEqual(slim["previous"][0]["id"], "p1")
+        self.assertEqual(slim["last_updated"], "2026-09-02T14:21:21Z")
+        self.assertTrue(slim["stale"])
+        self.assertNotIn("all_data", slim["upcoming"][0])
+        self.assertTrue(full["stale"])
+        self.assertEqual(full["upcoming"][0]["mission"], "Next")
+        self.assertTrue(app._launches_mem["stale"])
+
+    def test_redis_miss_still_serves_aged_memory(self):
+        payload = self._payload()
+        self._age_memory(payload)
+        with patch.object(app, "get_cached_data", return_value=None):
+            slim = app.get_launches_slim(internal=True)
+        self.assertEqual(slim["upcoming"][0]["id"], "u1")
+        self.assertTrue(slim["stale"])
+
+    def test_redis_down_with_nothing_cached_is_503(self):
+        def boom(key, _strict=False):
+            raise app.redis.ConnectionError("max number of clients reached")
+
+        from fastapi.testclient import TestClient
+
+        with patch.object(app, "get_cached_data", side_effect=boom):
+            client = TestClient(app.app)
+            slim = client.get("/launches_slim")
+            launches = client.get("/launches")
+
+        self.assertEqual(slim.status_code, 503)
+        self.assertEqual(launches.status_code, 503)
+        self.assertNotIn("upcoming", slim.json())
+        self.assertEqual(slim.json()["detail"], "Launch data unavailable")
+
+    def test_empty_ll2_fetch_does_not_overwrite_nonempty_cache(self):
+        cached = self._payload()
+        written = []
+
+        def fake_set(key, data, ttl=None):
+            written.append((key, data))
+            return True
+
+        with patch.object(app, "get_cached_data", return_value=cached), \
+             patch.object(app, "set_cached_data", side_effect=fake_set), \
+             patch.object(app, "fetch_launches", return_value={"upcoming": [], "previous": []}):
+            result = app._refresh_launches_uncached()
+
+        self.assertEqual(result["upcoming"][0]["id"], "u1")
+        self.assertEqual(result["previous"][0]["id"], "p1")
+        self.assertTrue(app._launches_mem["stale"])
+        self.assertEqual(
+            [item for item in written if item[0] == app.LAUNCHES_CACHE_KEY],
+            [],
+        )
+
+    def test_empty_upcoming_fetch_keeps_cached_upcoming(self):
+        cached = self._payload()
+        written = []
+
+        def fake_set(key, data, ttl=None):
+            written.append((key, data))
+            return True
+
+        fresh_previous = [_sample_launch("p2", "Newer", with_raw=False)]
+        with patch.object(app, "get_cached_data", return_value=cached), \
+             patch.object(app, "set_cached_data", side_effect=fake_set), \
+             patch.object(app, "fetch_launches", return_value={"upcoming": [], "previous": fresh_previous}), \
+             patch.object(app, "get_launch_trajectory_data", return_value=None):
+            result = app._refresh_launches_uncached()
+
+        self.assertEqual(result["upcoming"][0]["id"], "u1")
+        self.assertEqual(result["previous"][0]["id"], "p2")
+        self.assertFalse(app._launches_mem["stale"])
+        list_writes = [item for item in written if item[0] == app.LAUNCHES_CACHE_KEY]
+        self.assertEqual(len(list_writes), 1)
+        self.assertEqual(list_writes[0][1]["upcoming"][0]["id"], "u1")
+        self.assertTrue(list_writes[0][1]["previous"])
+
+    def test_ll2_exception_does_not_write_empty_cache(self):
+        cached = self._payload()
+        written = []
+
+        def fake_set(key, data, ttl=None):
+            written.append((key, data))
+            return True
+
+        with patch.object(app, "get_cached_data", return_value=cached), \
+             patch.object(app, "set_cached_data", side_effect=fake_set), \
+             patch.object(app, "fetch_launches", side_effect=RuntimeError("LL2 timeout")):
+            result = app._refresh_launches_uncached()
+
+        self.assertEqual(result["upcoming"][0]["id"], "u1")
+        self.assertTrue(app._launches_mem["stale"])
+        self.assertEqual(
+            [item for item in written if item[0] == app.LAUNCHES_CACHE_KEY],
+            [],
+        )
+
+    def test_redis_client_uses_bounded_blocking_pool(self):
+        with patch.dict(os.environ, {"REDIS_URL": "redis://127.0.0.1:6399/0"}, clear=False), \
+             patch.object(app.redis.Redis, "ping", return_value=True):
+            client = app.get_redis_client()
+        pool = client.connection_pool
+        self.assertIsInstance(pool, app.redis.BlockingConnectionPool)
+        self.assertEqual(pool.max_connections, 12)
+        self.assertEqual(pool.max_connections, app.REDIS_MAX_CONNECTIONS)
+        self.assertEqual(pool.timeout, app.REDIS_POOL_TIMEOUT_SEC)
+        self.assertLess(pool.max_connections, 18)
+
+        with patch.dict(os.environ, {"REDIS_URL": "rediss://127.0.0.1:6399/0"}, clear=False), \
+             patch.object(app.redis.Redis, "ping", return_value=True):
+            tls_client = app.get_redis_client()
+        tls_pool = tls_client.connection_pool
+        self.assertIsInstance(tls_pool, app.redis.BlockingConnectionPool)
+        self.assertEqual(tls_pool.max_connections, 12)
+        self.assertIsNone(tls_pool.connection_kwargs.get("ssl_cert_reqs"))
+
+
 if __name__ == "__main__":
     unittest.main()
