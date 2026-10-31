@@ -2,9 +2,15 @@
 
 Launch Buddy requests each Live Activity with a push token and POSTs it
 here. This process sends an APNs ``liveactivity`` ``event: end`` at the
-flight milestone (later of SECO-1 and stage-1 landing, else T+9, never
-past T+20) and on scrub/failure, plus an ``update`` when NET or that
-milestone changes.
+flight milestone (later of the last ascent SECO and the last
+first-stage recovery, else T+9, never past T+80) once Launch Library
+shows the vehicle flew, and promptly on scrub/failure. Ascent SECO is
+SECO-1, or SECO-2 when that cutoff is at or before T+75; SECO-3 and
+later burns are ignored. A hold is not terminal. Every end is
+re-checked against a fresh Launch Library read before it is sent, so a
+recycled T0 reschedules instead of ending early. An ``update`` goes out
+when NET or that milestone changes. The content state carries
+``milestoneSource`` (for example ``SECO-2``) with the milestone time.
 
 If the APNs env vars are missing the routes still store tokens and every
 send is a no-op. Nothing in here reads a key file off disk.
@@ -36,11 +42,21 @@ from pydantic import BaseModel, Field
 # APNs `timestamp` / `stale-date` / `dismissal-date` are Unix seconds.
 SWIFT_REFERENCE_UNIX = 978307200
 
-HARD_CAP_SEC = 20 * 60
+HARD_CAP_SEC = 80 * 60
+# SECO-2 at or before this counts as ascent (Starlink deorbit ~T+53,
+# GTO ~T+27–30). Later than this, and SECO-3+, fall back to SECO-1
+# or first-stage recovery. The hard cap above still clips the push.
+ASCENT_SECO_LIMIT_SEC = 75 * 60
 DEFAULT_END_SEC = 9 * 60
 FINAL_LINGER_SEC = 2 * 60
 PROMPT_LINGER_SEC = 60
 LATE_DISMISS_SEC = 15
+# No In Flight / Success seen this long after NET: end anyway so a stale
+# Launch Library status cannot strand the activity. Never applies to a hold.
+UNCONFIRMED_END_SEC = 30 * 60
+# LL2 status ids: 3 Success, 4 Failure, 6 In Flight, 7 Partial Failure,
+# 9 Payload Deployed.
+FLOWN_STATUS_IDS = (3, 4, 6, 7, 9)
 NET_CHANGE_SEC = 2
 STORE_KEY = "live_activity_push_v1"
 MAX_RECORDS = 40
@@ -51,7 +67,21 @@ _memory: dict = {}
 _logged_disabled = False
 _jwt_cache: dict = {"token": None, "exp": 0}
 
-_SECO1 = re.compile(r"seco[\s-]*1\b", re.IGNORECASE)
+# SECO-1 / bare SECO only. SECO-2 is selected in ``activity_end_plan``
+# when it falls at or before ``ASCENT_SECO_LIMIT_SEC``. Ship SECO on
+# Starship is labelled SECO-1 in Launch Library; a bare ``SECO`` still counts.
+_SECO1 = re.compile(r"\bseco(?:[\s-]*1)?(?![\s-]*\d)", re.IGNORECASE)
+# Group 1 is the cutoff number when present (``SECO-2`` → 2, ``SECO-10`` → 10).
+_SECO_NUMBER = re.compile(r"\bseco(?:[\s-]*(\d+))?\b", re.IGNORECASE)
+# First-stage recovery: F9 ``Stage 1 Landing``, FH ``Boosters Landing`` and a
+# core landing, Super Heavy ``Stage 1 Landing``/``Splashdown``/catch.
+_RECOVERY_STAGE = re.compile(
+    r"\b(stage[\s-]*1|first[\s-]*stage|boosters?|side[\s-]*boosters?|"
+    r"(center[\s-]*)?core|super[\s-]*heavy)\b",
+    re.IGNORECASE,
+)
+_RECOVERY_EVENT = re.compile(r"\b(landing|landed|splashdown|catch|caught|touchdown)\b", re.IGNORECASE)
+_NOT_RECOVERY = re.compile(r"burn|flip|starship|\bship\b|dragon|capsule|fairing", re.IGNORECASE)
 
 
 class LiveActivityTokenIn(BaseModel):
@@ -172,9 +202,14 @@ def decide(record: dict, launch: Optional[dict], raw: Optional[dict], now: datet
     plan = activity_end_plan(net, events)
     content = record.get("content_state") if isinstance(record.get("content_state"), dict) else None
 
-    if _is_prompt_terminal(status, status_id, net, now):
+    if _is_prompt_terminal(status, status_id, net, now) and not (
+        _is_success(status, status_id) and now < plan["milestone"]
+    ):
         label = _terminal_text(status, status_id)
         dismissal = now + timedelta(seconds=PROMPT_LINGER_SEC)
+        if _is_success(status, status_id) and plan["dismissal"] > dismissal:
+            # Success past the milestone keeps the planned linger.
+            dismissal = plan["dismissal"]
         return {
             "kind": "end",
             "priority": 10,
@@ -183,7 +218,12 @@ def decide(record: dict, launch: Optional[dict], raw: Optional[dict], now: datet
             "payload": _end_payload(record, launch, content, net, plan, label, dismissal, now),
         }
 
-    if now >= plan["milestone"]:
+    flown = _has_flown(status, status_id)
+    unconfirmed_due = (
+        not _is_hold(status)
+        and now.timestamp() >= net.timestamp() + UNCONFIRMED_END_SEC
+    )
+    if now >= plan["milestone"] and (flown or unconfirmed_due):
         if now >= plan["dismissal"]:
             dismissal = now + timedelta(seconds=LATE_DISMISS_SEC)
         else:
@@ -238,24 +278,41 @@ def decide(record: dict, launch: Optional[dict], raw: Optional[dict], now: datet
 
 
 def activity_end_plan(net: datetime, events: list) -> dict:
-    """Later of SECO-1 and stage-1 landing. T+9 when neither is present."""
-    seco1 = None
-    landing = None
+    """Later of the last ascent SECO and the last first-stage recovery.
+
+    Ascent SECO is SECO-1 (or a bare SECO), and SECO-2 when that cutoff
+    is at or before T+75. Starlink's deorbit SECO-2 (~T+53) and a GTO
+    SECO-2 (~T+27–30) both count. SECO-3 and later, including a direct-GEO
+    coast such as GOES-U SECO-3, are ignored, as is any SECO past T+75;
+    the milestone then falls back to SECO-1 or recovery. Falcon Heavy
+    lists side boosters and (when recovered) the core separately, so
+    recoveries take the latest. T+9 when neither is present. The
+    milestone and the two-minute dismissal never run past T+80.
+
+    ``milestone_source`` is the winning timeline label (``SECO-2``,
+    ``Center Core Landing``, …) or ``T+9`` for the fallback. ``label``
+    stays the short Live Activity string (``SECO ✓`` or ``Booster landed``);
+    core and side-booster landings share that text.
+    """
+    seco = None
+    recovery = None
     for label, seconds in events:
         if seconds < 0:
             continue
-        if _is_seco1(label):
-            seco1 = seconds if seco1 is None else min(seco1, seconds)
+        if _is_ascent_seco(label, seconds):
+            if seco is None or seconds > seco[0]:
+                seco = (seconds, label)
         if _is_stage1_landing(label):
-            landing = seconds if landing is None else min(landing, seconds)
-    if seco1 is not None and landing is not None and landing > seco1:
-        seconds, label = landing, "Booster landed"
-    elif seco1 is not None:
-        seconds, label = seco1, "SECO \u2713"
-    elif landing is not None:
-        seconds, label = landing, "Booster landed"
+            if recovery is None or seconds > recovery[0]:
+                recovery = (seconds, label)
+    if seco is not None and recovery is not None and recovery[0] > seco[0]:
+        seconds, milestone_source, label = recovery[0], recovery[1], "Booster landed"
+    elif seco is not None:
+        seconds, milestone_source, label = seco[0], seco[1], "SECO \u2713"
+    elif recovery is not None:
+        seconds, milestone_source, label = recovery[0], recovery[1], "Booster landed"
     else:
-        seconds, label = DEFAULT_END_SEC, "SECO \u2713"
+        seconds, milestone_source, label = DEFAULT_END_SEC, "T+9", "SECO \u2713"
     clamped = min(max(seconds, 0), HARD_CAP_SEC)
     milestone = net + timedelta(seconds=clamped)
     dismissal = min(
@@ -266,6 +323,7 @@ def activity_end_plan(net: datetime, events: list) -> dict:
         "milestone": milestone,
         "dismissal": dismissal,
         "label": label,
+        "milestone_source": milestone_source,
         "milestone_unix": milestone.timestamp(),
         "dismissal_unix": dismissal.timestamp(),
     }
@@ -342,6 +400,7 @@ def _end_payload(record, launch, content, net, plan, label, dismissal, now) -> d
     state["finalPhaseLabel"] = label
     state["activityMilestone"] = _unix_to_swift(plan["milestone"].timestamp())
     state["activityDismissAt"] = _unix_to_swift(dismissal.timestamp())
+    state["milestoneSource"] = plan.get("milestone_source")
     state = _fit_content(state)
     return {
         "aps": {
@@ -365,6 +424,7 @@ def _update_content(content: dict, net: datetime, plan: dict) -> dict:
     updated["activityMilestone"] = _unix_to_swift(plan["milestone"].timestamp())
     updated["activityDismissAt"] = _unix_to_swift(plan["dismissal"].timestamp())
     updated["finalPhaseLabel"] = plan["label"]
+    updated["milestoneSource"] = plan.get("milestone_source")
     return _fit_content(updated)
 
 
@@ -398,8 +458,19 @@ def _note_action_applied(records, activity_id, action) -> None:
     stored["pushed_dismiss_unix"] = action.get("dismiss_unix")
 
 
-def tick(now: Optional[datetime] = None, lookup: Optional[Callable] = None, sender: Optional[Callable] = None) -> dict:
-    """Send due end/update pushes. No-ops when APNs is not configured."""
+def tick(
+    now: Optional[datetime] = None,
+    lookup: Optional[Callable] = None,
+    sender: Optional[Callable] = None,
+    refresh: Optional[Callable] = None,
+) -> dict:
+    """Send due end/update pushes. No-ops when APNs is not configured.
+
+    The cached lookup can be ~10 minutes old (list refresh cadence). Before
+    any ``end`` goes out, ``refresh`` re-reads the launch from Launch Library
+    and the decision is re-run, so a recycled T0 or a scrub seen late turns
+    into an update instead of an early end.
+    """
     global _logged_disabled
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
@@ -412,6 +483,7 @@ def tick(now: Optional[datetime] = None, lookup: Optional[Callable] = None, send
         return {"push": "disabled", "sent": 0, "stored": _count()}
 
     find = lookup or _default_lookup
+    fresh = refresh or (_default_refresh if lookup is None else None)
     send = sender or send_push
     sent = 0
     with _lock:
@@ -423,6 +495,12 @@ def tick(now: Optional[datetime] = None, lookup: Optional[Callable] = None, send
             continue
         launch, raw = find(record.get("launch_id"))
         action = decide(record, launch, raw, moment)
+        if action is not None and action["kind"] == "end" and fresh is not None:
+            try:
+                launch, raw = fresh(record.get("launch_id"))
+            except Exception as exc:
+                print(f"Live Activity fresh lookup error: {exc}")
+            action = decide(record, launch, raw, moment)
         if action is None:
             continue
         kind = action["kind"]
@@ -458,25 +536,70 @@ def _is_seco1(label: str) -> bool:
     return _SECO1.search(label or "") is not None
 
 
-def _is_stage1_landing(label: str) -> bool:
-    text = (label or "").lower()
-    if "burn" in text or "starship" in text:
+def _seco_number(label: str) -> Optional[int]:
+    """1 for bare SECO / SECO-1, 2 for SECO-2, and so on. None when it is not a SECO."""
+    match = _SECO_NUMBER.search(label or "")
+    if match is None:
+        return None
+    digits = match.group(1)
+    if not digits:
+        return 1
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _is_ascent_seco(label: str, seconds: float) -> bool:
+    """SECO-1, or SECO-2 at or before T+75. SECO-3+ and anything later are not ascent."""
+    number = _seco_number(label)
+    if number not in (1, 2):
         return False
-    if "stage 1 landing" in text or "first stage landing" in text:
-        return True
-    if "booster landing" in text or "boosters landing" in text:
-        return True
-    return False
+    return seconds <= ASCENT_SECO_LIMIT_SEC
+
+
+def _is_stage1_landing(label: str) -> bool:
+    text = label or ""
+    if _NOT_RECOVERY.search(text):
+        return False
+    return bool(_RECOVERY_STAGE.search(text) and _RECOVERY_EVENT.search(text))
 
 
 def _is_scrub(status: Optional[str]) -> bool:
+    """Scrub-like and terminal. A hold is not: it can recycle and fly."""
     text = (status or "").lower()
-    return any(word in text for word in ("scrub", "hold", "delay", "postpone"))
+    return any(word in text for word in ("scrub", "delay", "postpone"))
+
+
+def _is_hold(status: Optional[str]) -> bool:
+    return "hold" in (status or "").lower()
+
+
+def _is_success(status: Optional[str], status_id) -> bool:
+    try:
+        if int(status_id) == 3:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "success" in (status or "").lower()
+
+
+def _has_flown(status: Optional[str], status_id) -> bool:
+    """Launch Library shows liftoff happened (In Flight or a final status)."""
+    if _is_hold(status) or _is_scrub(status):
+        return False
+    try:
+        if int(status_id) in FLOWN_STATUS_IDS:
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = (status or "").lower()
+    return any(word in text for word in ("in flight", "success", "fail", "deployed"))
 
 
 def _is_complete(status: Optional[str], status_id) -> bool:
     text = (status or "").lower()
-    if any(word in text for word in ("go", "in flight", "liftoff")) or _is_scrub(status):
+    if any(word in text for word in ("go", "in flight", "liftoff")) or _is_scrub(status) or _is_hold(status):
         return False
     try:
         if int(status_id) in (3, 4, 7):
@@ -708,6 +831,19 @@ def _default_lookup(launch_id):
     except Exception:
         raw = None
     return launch, raw
+
+
+def _default_refresh(launch_id):
+    """Same as the cached lookup, but raw comes from the ~20s hot single-flight."""
+    launch, raw = _default_lookup(launch_id)
+    app_module = _app()
+    if app_module is None or not launch_id:
+        return launch, raw
+    try:
+        hot = app_module._refresh_hot_launch_raw(launch_id)
+    except Exception:
+        hot = None
+    return launch, (hot if isinstance(hot, dict) else raw)
 
 
 def _app():
