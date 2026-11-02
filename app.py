@@ -59,8 +59,8 @@ app = FastAPI(
             "name": "Satellites",
             "description": (
                 "Cached GP/OMM element sets (Starlink, stations, and a "
-                "small allowlist) plus deployed Starlink TLEs for the recent "
-                "Starship V3 flight. Starlink GP is loaded from Space-Track "
+                "small allowlist) plus deployed Starlink TLEs for every "
+                "launched Starship V3 flight. Starlink GP is loaded from Space-Track "
                 "when SPACE_TRACK_IDENTITY and SPACE_TRACK_PASSWORD are set, "
                 "and from CelesTrak otherwise. SATCAT is preferred once "
                 "cataloged; until then, SpaceX public MEME ephemerides fill "
@@ -127,8 +127,13 @@ def set_cached_data(key, data, ttl=None):
         return False
 
 
-def get_cached_data(key):
-    """Get data from Redis with decompression support."""
+def get_cached_data(key, strict=False):
+    """Get data from Redis with decompression support.
+
+    ``strict`` re-raises a Redis transport error so a caller can avoid
+    writing an empty value over a key it failed to read. Decode failures
+    still return None: the bytes were not a catalog.
+    """
     if not r:
         return None
     try:
@@ -149,6 +154,8 @@ def get_cached_data(key):
                 return None
     except Exception as e:
         print(f"Redis read error for {key}: {e}")
+        if strict:
+            raise
         return None
 
 
@@ -243,7 +250,8 @@ CELESTRAK_SUP_GP_URL = "https://celestrak.org/NORAD/elements/supplemental/sup-gp
 DEPLOYED_CACHE_PREFIX = "satellites_deployed_v2:"
 SATCAT_RECENT_CACHE_KEY = "satellites_satcat_starlink_recent_v1"
 SATCAT_RECENT_DAYS = 45
-DEPLOYED_SAT_CAP = 128  # matches the globe Points-shell append cap
+DEPLOYED_SAT_CAP = 128  # per flight; the globe Points shell also stops at 128
+DEPLOYED_UNION_SOURCE_MIXED = "mixed"
 DEPLOYED_INTDES_CAP = 4
 DEPLOYED_SOURCE = "celestrak-satcat"
 # Pre-catalog bridge. SATCAT is still preferred once it lists the launch date.
@@ -412,6 +420,9 @@ _satellite_refresh_inflight = set()
 _satellite_refresh_after = {}
 _local_deployed = {}
 _local_satcat_index = None
+# Dates whose Redis read raised. An empty fetch must not SET over a value
+# this process could not see, and must not shadow it with an empty local copy.
+_deployed_redis_failed = set()
 _deployed_flights = {}
 _deployed_flights_lock = threading.Lock()
 _deployed_refresh_lock = threading.Lock()
@@ -802,6 +813,7 @@ def _reset_cache_coordination_for_tests():
         for flight in _deployed_flights.values():
             flight.reset()
         _deployed_flights.clear()
+        _deployed_redis_failed.clear()
     with _deployed_refresh_lock:
         _deployed_refresh_inflight.clear()
         _deployed_refresh_after.clear()
@@ -5077,29 +5089,32 @@ def _is_starship_launch_row(launch) -> bool:
     return "starship" in _launch_blob(launch)
 
 
-def select_v3_starship(upcoming, previous=None, now=None):
-    """Starship whose text marks V3 / Group 31, closest to ``now``.
+def launched_v3_starships(upcoming, previous=None, now=None):
+    """V3 / Group 31 Starship flights whose NET is at or before ``now``.
 
-    Upcoming and previous copies of the same flight are both eligible.
-    A Starship that is not a V3 / Group 31 Starlink deployment is ignored
-    so an older flight cannot select a Falcon launch date.
+    A flight still in the future is excluded even when it is the closest NET.
+    The same flight listed under both upcoming and previous is returned once,
+    keyed by UTC launch date; the previous copy wins. Oldest NET first.
+    A Starship that is not a V3 / Group 31 deployment is ignored.
     """
     now_utc = now or datetime.now(timezone.utc)
-    best = None
-    best_delta = None
-    for launch in list(upcoming or []) + list(previous or []):
-        if not _is_starship_launch_row(launch):
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+    by_date = {}
+    for launch in list(previous or []) + list(upcoming or []):
+        if not isinstance(launch, dict) or not _is_starship_launch_row(launch):
             continue
         if deployed_generation(_launch_blob(launch)) != "v3":
             continue
         net = _parse_net_dt(launch.get("net"))
-        if net is None:
+        if net is None or net > now_utc:
             continue
-        delta = abs((net - now_utc).total_seconds())
-        if best is None or delta < best_delta:
-            best = launch
-            best_delta = delta
-    return best
+        date = net.date().isoformat()
+        if date not in by_date:
+            by_date[date] = launch
+    return sorted(by_date.values(), key=lambda launch: _parse_net_dt(launch.get("net")))
 
 
 def _parse_launch_date_param(value) -> str:
@@ -6015,8 +6030,8 @@ def _no_v3_launch_payload() -> dict:
         "empty": True,
         "source": DEPLOYED_SOURCE,
         "note": (
-            "No Starship V3 or Group 31 launch is in the launch cache, "
-            "so no SATCAT launch date was queried. "
+            "No Starship V3 or Group 31 flight has launched "
+            "(NET at or before now), so no SATCAT launch date was queried. "
             + SATELLITE_NOTE
         ),
         "satellites": [],
@@ -6061,20 +6076,66 @@ def _deployed_cache_key(launch_date: str) -> str:
     return f"{DEPLOYED_CACHE_PREFIX}{launch_date}"
 
 
+def _mark_deployed_redis_failed(launch_date: str):
+    with _deployed_flights_lock:
+        _deployed_redis_failed.add(launch_date)
+
+
+def _clear_deployed_redis_failed(launch_date: str):
+    with _deployed_flights_lock:
+        _deployed_redis_failed.discard(launch_date)
+
+
+def _deployed_redis_read_failed(launch_date: str) -> bool:
+    with _deployed_flights_lock:
+        return launch_date in _deployed_redis_failed
+
+
+def _remember_deployed_local(launch_date: str, payload: dict) -> bool:
+    """Keep a payload in-process.
+
+    An empty fetch must not replace satellites already stored for this date,
+    and must not occupy the local slot when Redis could not be read (that
+    would hide another dyno's good copy for the rest of the process).
+    """
+    new_sats = (payload or {}).get("satellites") or []
+    existing = _local_deployed.get(launch_date)
+    if (
+        not new_sats
+        and isinstance(existing, dict)
+        and (existing.get("satellites") or [])
+    ):
+        return False
+    if not new_sats and _deployed_redis_read_failed(launch_date):
+        return False
+    _local_deployed[launch_date] = payload
+    return True
+
+
 def _read_deployed_cache(launch_date: str):
     local = _local_deployed.get(launch_date)
     if isinstance(local, dict) and local.get("satellites") is not None:
         return local
-    cached = get_cached_data(_deployed_cache_key(launch_date))
+    key = _deployed_cache_key(launch_date)
+    try:
+        cached = get_cached_data(key, strict=True)
+    except Exception:
+        # get_cached_data already logged the Redis error.
+        _mark_deployed_redis_failed(launch_date)
+        return None
+    _clear_deployed_redis_failed(launch_date)
     if isinstance(cached, dict) and cached.get("satellites") is not None:
         _local_deployed[launch_date] = cached
         return cached
     return None
 
 
-def _write_deployed_cache(launch_date: str, payload: dict):
-    _local_deployed[launch_date] = payload
-    set_cached_data(_deployed_cache_key(launch_date), payload, ttl=SATELLITES_STALE_TTL)
+def _write_deployed_cache(launch_date: str, payload: dict) -> bool:
+    if not _remember_deployed_local(launch_date, payload):
+        return False
+    if set_cached_data(_deployed_cache_key(launch_date), payload, ttl=SATELLITES_STALE_TTL):
+        _clear_deployed_redis_failed(launch_date)
+    return True
 
 
 def _get_deployed_flight(launch_date: str) -> _SingleFlight:
@@ -6087,45 +6148,41 @@ def _get_deployed_flight(launch_date: str) -> _SingleFlight:
 
 
 def _resolve_deployed_target(launch_date_param):
-    """Date, generation, and mission for this request. ``query`` is false when no V3 flight is known."""
-    explicit = _parse_launch_date_param(launch_date_param) if launch_date_param else None
-    data = _load_launch_payload(False) or {}
-    upcoming = data.get("upcoming") or []
-    previous = data.get("previous") or []
-    if explicit:
-        mission = None
-        generation = None
-        for launch in list(upcoming) + list(previous):
-            if not isinstance(launch, dict) or not _is_starship_launch_row(launch):
-                continue
-            net = _parse_net_dt(launch.get("net"))
-            if net is None or net.date().isoformat() != explicit:
-                continue
-            gen = deployed_generation(_launch_blob(launch))
-            mission = launch.get("mission") or launch.get("name")
-            generation = gen
-            if gen == "v3":
-                break
-        return {
-            "launch_date": explicit,
-            "generation": generation,
-            "mission": mission,
-            "query": True,
-        }
-    chosen = select_v3_starship(upcoming, previous)
-    if chosen is None:
+    """Date, generation, and mission for an explicit ``launch_date``.
+
+    The default union does not use this. ``query`` is false when no date was
+    given. An explicit date is still queried when the launch cache has no
+    matching Starship; generation and mission are filled when it does.
+    """
+    if not launch_date_param:
         return {
             "launch_date": None,
             "generation": None,
             "mission": None,
             "query": False,
         }
-    net = _parse_net_dt(chosen.get("net"))
+    explicit = _parse_launch_date_param(launch_date_param)
+    data = _load_launch_payload(False) or {}
+    upcoming = data.get("upcoming") or []
+    previous = data.get("previous") or []
+    mission = None
+    generation = None
+    for launch in list(upcoming) + list(previous):
+        if not isinstance(launch, dict) or not _is_starship_launch_row(launch):
+            continue
+        net = _parse_net_dt(launch.get("net"))
+        if net is None or net.date().isoformat() != explicit:
+            continue
+        gen = deployed_generation(_launch_blob(launch))
+        mission = launch.get("mission") or launch.get("name")
+        generation = gen
+        if gen == "v3":
+            break
     return {
-        "launch_date": net.date().isoformat() if net else None,
-        "generation": "v3",
-        "mission": chosen.get("mission") or chosen.get("name"),
-        "query": net is not None,
+        "launch_date": explicit,
+        "generation": generation,
+        "mission": mission,
+        "query": True,
     }
 
 
@@ -6197,12 +6254,23 @@ def _rejoin_stale_deployed(target, index, cached):
 
 def _refresh_deployed_uncached(target: dict, force: bool = False):
     launch_date = target["launch_date"]
-    cached = None if force else _read_deployed_cache(launch_date)
+    # ``previous`` is the last stored copy, including when ``force`` skips the
+    # fresh-cache short circuit. A failed or empty fetch must not replace it.
+    previous = _read_deployed_cache(launch_date)
+    cached = None if force else previous
     if cached and _deployed_cache_is_fresh(cached):
         # A cached manifest filter miss stays stale for its whole TTL.
         return _mark_deployed_cached(
             cached, stale=bool(cached.get("manifest_rejected"))
         )
+
+    def _keep_previous_good():
+        if not previous or not (previous.get("satellites") or []):
+            return None
+        _note_satellite_staleness(
+            previous, kind="deployed", name=launch_date, refresh_failed=True
+        )
+        return _mark_deployed_cached(previous, stale=True)
 
     satcat_failed = False
     index = None
@@ -6223,16 +6291,15 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
     if (
         not satcat_failed
         and index_stale
-        and cached
-        and (cached.get("satellites") or [])
+        and previous
+        and (previous.get("satellites") or [])
     ):
-        rebuilt = _rejoin_stale_deployed(target, index, cached)
+        rebuilt = _rejoin_stale_deployed(target, index, previous)
         if rebuilt is not None:
             return rebuilt
-        _note_satellite_staleness(
-            cached, kind="deployed", name=launch_date, refresh_failed=True
-        )
-        return _mark_deployed_cached(cached, stale=True)
+        kept = _keep_previous_good()
+        if kept is not None:
+            return kept
 
     catalog_rows = [] if satcat_failed else _catalog_rows_for_date(index, launch_date)
     satellites = []
@@ -6249,16 +6316,15 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
         if index_stale:
             payload["fetched_at"] = index.get("fetched_at") or payload["fetched_at"]
             payload["stale"] = True
-            _local_deployed[launch_date] = payload
+            _remember_deployed_local(launch_date, payload)
             return payload
         _write_deployed_cache(launch_date, payload)
         return payload
 
-    if satcat_failed and cached and (cached.get("satellites") or []):
-        _note_satellite_staleness(
-            cached, kind="deployed", name=launch_date, refresh_failed=True
-        )
-        return _mark_deployed_cached(cached, stale=True)
+    if satcat_failed:
+        kept = _keep_previous_good()
+        if kept is not None:
+            return kept
 
     # SATCAT has nothing plottable yet. SpaceX public ephemerides cover the
     # gap until the catalog lists this launch date.
@@ -6294,6 +6360,10 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
         _write_deployed_cache(launch_date, payload)
         return payload
 
+    kept = _keep_previous_good()
+    if kept is not None:
+        return kept
+
     if satcat_failed:
         payload = _deployed_payload(
             target,
@@ -6323,14 +6393,21 @@ def _refresh_deployed_uncached(target: dict, force: bool = False):
     if index_stale:
         payload["fetched_at"] = (index or {}).get("fetched_at") or payload["fetched_at"]
         payload["stale"] = True
-        _local_deployed[launch_date] = payload
+        # Refuses to shadow a good copy or a Redis value this process could not read.
+        _remember_deployed_local(launch_date, payload)
         return payload
     _write_deployed_cache(launch_date, payload)
     return payload
 
 
 def refresh_deployed_satellites_internal(launch_date: str = None, force: bool = False):
-    """Load the deployed-sat feed for the V3 Starship date (single-flight)."""
+    """Load one launch date, or every launched V3 flight when the date is omitted.
+
+    The no-date form is the background worker. It walks flights one at a time
+    so a manifest scan cannot fan out across the Redis pool.
+    """
+    if not launch_date:
+        return _refresh_launched_v3_flights(force=force)
     target = _resolve_deployed_target(launch_date)
     if not target.get("query") or not target.get("launch_date"):
         return _no_v3_launch_payload()
@@ -6356,6 +6433,277 @@ def _deployed_last_good(payload) -> bool:
     if not isinstance(payload, dict) or not payload.get("fetched_at"):
         return False
     return bool(payload.get("satellites"))
+
+
+def _deployed_sat_key(sat):
+    """NORAD when cataloged, otherwise the SpaceX name (manifest-only objects)."""
+    if not isinstance(sat, dict):
+        return None
+    norad = _norad_int(sat.get("norad_id"))
+    if norad:
+        return ("norad", norad)
+    name = str(sat.get("name") or sat.get("id") or "").strip().upper()
+    if name:
+        return ("name", name)
+    return None
+
+
+def _launched_v3_targets(now=None):
+    """Newest-last list of launched V3 flights from the launch cache."""
+    data = _load_launch_payload(False) or {}
+    targets = []
+    for launch in launched_v3_starships(
+        data.get("upcoming"), data.get("previous"), now=now
+    ):
+        net = _parse_net_dt(launch.get("net"))
+        if net is None:
+            continue
+        targets.append({
+            "launch_date": net.date().isoformat(),
+            "generation": "v3",
+            "mission": launch.get("mission") or launch.get("name"),
+            "query": True,
+        })
+    return targets
+
+
+def _flight_public_summary(target, payload, deferred=False):
+    sats = [] if deferred else list((payload or {}).get("satellites") or [])
+    catalog = 0 if deferred else (payload or {}).get("catalog_count")
+    if catalog is None:
+        catalog = len(sats)
+    summary = {
+        "launch_date": (payload or {}).get("launch_date") or target.get("launch_date"),
+        "mission": (
+            (payload or {}).get("mission")
+            if isinstance(payload, dict) and payload.get("mission") is not None
+            else target.get("mission")
+        ),
+        "count": len(sats),
+        "catalog_count": catalog,
+        "source": None if deferred else (payload or {}).get("source") or DEPLOYED_SOURCE,
+        "stale": True if deferred else bool((payload or {}).get("stale")),
+        "empty": len(sats) == 0,
+    }
+    if deferred:
+        summary["deferred"] = True
+    return summary
+
+
+def _deferred_flight_payload(target):
+    """Placeholder for a launched flight this request did not have time to fetch."""
+    return _deployed_payload(
+        target,
+        [],
+        [],
+        stale=True,
+        note=(
+            f"Launch date {target.get('launch_date')} was not fetched on this "
+            "request (time budget). "
+            + SATELLITE_NOTE
+        ),
+    )
+
+
+def _assemble_deployed_union(entries):
+    """Merge per-flight payloads. ``entries`` are newest flight first.
+
+    One flight keeps that flight's payload (plus ``flights``) so a single
+    launched V3 still looks like the historical single-date response.
+    Across flights, ``launch_date`` / ``mission`` are the newest launched
+    flight. ``source`` is that shared source, or ``mixed`` when flights that
+    contributed satellites disagree. ``stale`` is true when any flight is
+    stale or was deferred. ``count`` is after NORAD/name dedupe; ``catalog_count``
+    is the sum of the per-flight catalog counts before dedupe. ``fetched_at``
+    is the oldest component timestamp.
+    """
+    if (
+        len(entries) == 1
+        and not entries[0].get("deferred")
+        and isinstance(entries[0].get("payload"), dict)
+    ):
+        payload = entries[0]["payload"]
+        body = dict(payload)
+        body.pop("manifest_checked", None)
+        body.pop("manifest_rejected", None)
+        body.pop("deferred", None)
+        body["flights"] = [_flight_public_summary(entries[0]["target"], payload)]
+        return body
+
+    seen = set()
+    satellites = []
+    catalog_count = 0
+    stale = False
+    sources = []
+    fetched = []
+    ttls = []
+    flights = []
+    for entry in entries:
+        target = entry["target"]
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        deferred = bool(entry.get("deferred"))
+        flights.append(_flight_public_summary(target, payload, deferred=deferred))
+        if deferred:
+            stale = True
+            continue
+        catalog_count += int(payload.get("catalog_count") or 0)
+        if payload.get("stale"):
+            stale = True
+        if payload.get("fetched_at"):
+            fetched.append(str(payload["fetched_at"]))
+        ttls.append(int(payload.get("ttl_seconds") or _deployed_ttl_seconds(payload)))
+        if payload.get("satellites"):
+            sources.append(payload.get("source") or DEPLOYED_SOURCE)
+        for sat in payload.get("satellites") or []:
+            key = _deployed_sat_key(sat)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            satellites.append(sat)
+
+    latest = entries[0]
+    latest_target = latest["target"]
+    latest_payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
+    if sources and all(src == sources[0] for src in sources):
+        source = sources[0]
+    elif sources:
+        source = DEPLOYED_UNION_SOURCE_MIXED
+    else:
+        source = latest_payload.get("source") or DEPLOYED_SOURCE
+    dates = [
+        entry["target"]["launch_date"]
+        for entry in entries
+        if entry["target"].get("launch_date")
+    ]
+    real = [entry for entry in entries if not entry.get("deferred")]
+    notes = [
+        str((entry.get("payload") or {}).get("note") or "")
+        for entry in real
+        if isinstance(entry.get("payload"), dict)
+    ]
+    if (
+        not satellites
+        and notes
+        and all("unavailable" in note.lower() for note in notes)
+    ):
+        note = _deployed_note_unavailable()
+    else:
+        note = (
+            "Starlink objects from launched Starship V3 flights ("
+            + ", ".join(dates)
+            + "), deduped by NORAD id, or by name when NORAD is missing. "
+            + SATELLITE_NOTE
+        )
+    return {
+        "launch_date": latest_target.get("launch_date"),
+        "generation": "v3",
+        "mission": latest_payload.get("mission") or latest_target.get("mission"),
+        "fetched_at": min(fetched) if fetched else _utc_isoformat(),
+        "ttl_seconds": min(ttls) if ttls else DEPLOYED_EMPTY_TTL,
+        "count": len(satellites),
+        "catalog_count": catalog_count,
+        "stale": stale,
+        "empty": len(satellites) == 0,
+        "source": source,
+        "note": note,
+        "satellites": satellites,
+        "flights": flights,
+    }
+
+
+def _refresh_deployed_flight_safely(target, force=False):
+    """One flight. A raised fetch or an empty result keeps that flight's last good copy."""
+    date = target["launch_date"]
+    try:
+        payload = refresh_deployed_satellites_internal(date, force=force)
+    except Exception as exc:
+        print(
+            f"Deployed refresh failed for {date}: {_redact_space_track_secret(exc)}"
+        )
+        payload = None
+    if isinstance(payload, dict) and (payload.get("satellites") or []):
+        return payload
+    cached = _read_deployed_cache(date)
+    if _deployed_last_good(cached):
+        _note_satellite_staleness(
+            cached, kind="deployed", name=date, refresh_failed=True
+        )
+        return _mark_deployed_cached(cached, stale=True)
+    if isinstance(payload, dict):
+        return payload
+    return _deployed_payload(
+        target, [], [], stale=True, note=_deployed_note_unavailable()
+    )
+
+
+def _refresh_launched_v3_flights(force=False):
+    """Background refresh of every launched V3 flight, sequentially."""
+    targets = list(reversed(_launched_v3_targets()))
+    if not targets:
+        body = _no_v3_launch_payload()
+        body["flights"] = []
+        return body
+    entries = []
+    for target in targets:
+        payload = _refresh_deployed_flight_safely(target, force=force)
+        entries.append({"target": target, "payload": payload, "deferred": False})
+    return _assemble_deployed_union(entries)
+
+
+def _serve_launched_v3_union(force=False):
+    """Default ``/satellites/deployed``: union of launched V3 flights.
+
+    Cached flights are served immediately. At most the time budget is spent
+    on blocking refreshes, newest flight first, and only one cold flight is
+    started once the budget is already gone. Further dates refresh in the
+    background. Returns ``(payload, cache_hit)``.
+    """
+    targets = list(reversed(_launched_v3_targets()))
+    if not targets:
+        body = _no_v3_launch_payload()
+        body["flights"] = []
+        return body, False
+
+    deadline = time.monotonic() + SATELLITES_REQUEST_BUDGET_SEC
+    entries = []
+    background_dates = []
+    blocking = 0
+    cache_hit = True
+    for target in targets:
+        date = target["launch_date"]
+        cached = None if force else _read_deployed_cache(date)
+        if cached and not force and (
+            _deployed_cache_is_fresh(cached) or _deployed_last_good(cached)
+        ):
+            fresh = _deployed_cache_is_fresh(cached)
+            rejected = bool(cached.get("manifest_rejected"))
+            if not fresh:
+                cache_hit = False
+                background_dates.append(date)
+            entries.append({
+                "target": target,
+                "payload": _mark_deployed_cached(
+                    cached, stale=(not fresh) or rejected
+                ),
+                "deferred": False,
+            })
+            continue
+        if blocking > 0 and time.monotonic() >= deadline:
+            cache_hit = False
+            background_dates.append(date)
+            entries.append({
+                "target": target,
+                "payload": _deferred_flight_payload(target),
+                "deferred": True,
+            })
+            continue
+        blocking += 1
+        cache_hit = False
+        payload = _refresh_deployed_flight_safely(target, force=force)
+        entries.append({"target": target, "payload": payload, "deferred": False})
+    if background_dates:
+        _schedule_deployed_refresh_many(background_dates)
+    return _assemble_deployed_union(entries), cache_hit
 
 
 def _schedule_deployed_refresh(launch_date: str):
@@ -6389,6 +6737,43 @@ def _schedule_deployed_refresh(launch_date: str):
     ).start()
 
 
+def _schedule_deployed_refresh_many(launch_dates):
+    """Refresh several dates on one background thread. Never on the request."""
+    if not _background_enabled:
+        return
+    now = time.monotonic()
+    pending = []
+    with _deployed_refresh_lock:
+        for launch_date in launch_dates:
+            if not launch_date or launch_date in _deployed_refresh_inflight:
+                continue
+            if now < _deployed_refresh_after.get(launch_date, 0):
+                continue
+            _deployed_refresh_inflight.add(launch_date)
+            _deployed_refresh_after[launch_date] = now + SATELLITES_REFRESH_COOLDOWN_SEC
+            pending.append(launch_date)
+    if not pending:
+        return
+
+    def _run():
+        for launch_date in pending:
+            try:
+                print(f"Background deployed satellite refresh starting for {launch_date}")
+                refresh_deployed_satellites_internal(launch_date)
+            except Exception as exc:
+                print(
+                    "Background deployed satellite refresh failed for "
+                    f"{launch_date}: {_redact_space_track_secret(exc)}"
+                )
+            finally:
+                with _deployed_refresh_lock:
+                    _deployed_refresh_inflight.discard(launch_date)
+
+    threading.Thread(
+        target=_run, daemon=True, name="deployed-refresh-union"
+    ).start()
+
+
 def _finish_deployed_response(payload, *, cache_hit: bool):
     if cache_hit:
         increment_metric("cache_hits")
@@ -6409,14 +6794,14 @@ def _finish_deployed_response(payload, *, cache_hit: bool):
 @app.get(
     "/satellites/deployed",
     tags=["Satellites"],
-    summary="Starlink sats deployed by the recent Starship V3 flight",
+    summary="Starlink sats from every launched Starship V3 flight",
 )
 def get_satellites_deployed(
     launch_date: Optional[str] = Query(
         None,
         description=(
-            "UTC calendar date YYYY-MM-DD. Omit to use the Starship V3 / "
-            "Group 31 NET date from the launch cache."
+            "UTC calendar date YYYY-MM-DD. Omit to union every launched "
+            "Starship V3 / Group 31 flight (NET at or before now)."
         ),
     ),
     force: bool = False,
@@ -6443,10 +6828,30 @@ def get_satellites_deployed(
       ``spacex-manifest-ephemeris`` when public MEME files cover the date.
     - ``empty`` / ``stale``: honest empty catalog vs. a stale cached copy.
 
-    The default date is the UTC NET date of the Starship launch whose mission
-    text contains ``v3`` or ``group 31-``. Same-day Starlink SATCAT rows are
-    included. Decayed objects are not. Positions are never invented: if SATCAT
-    and the SpaceX manifest are both empty, ``satellites`` is ``[]``.
+    With no ``launch_date``, the body is the union of every Starship flight
+    whose text contains ``v3`` or ``group 31-`` and whose NET is at or before
+    now. Upcoming flights are omitted until that NET. Satellites are deduped
+    by NORAD id, or by name when NORAD is missing (manifest rows). Each flight
+    keeps its own cache: a bad, empty, or failed fetch for one date does not
+    replace that date's last good satellites or any other flight's.
+
+    Top-level ``launch_date`` and ``mission`` are the newest launched flight
+    in the union (a headline, not a filter). ``source`` is the shared source
+    of flights that contributed satellites, or ``mixed`` when those sources
+    differ. ``stale`` is true when any included flight is stale or a flight
+    was deferred past the request budget. ``count`` is after dedupe;
+    ``catalog_count`` is the sum of per-flight catalog counts before dedupe.
+    ``fetched_at`` is the oldest component. ``flights`` lists each flight
+    (newest first) with ``launch_date``, ``mission``, ``count``,
+    ``catalog_count``, ``source``, ``stale``, and ``empty``. A deferred
+    flight has ``deferred: true`` and ``source: null`` and contributed no
+    satellites. ``?launch_date=`` is still one flight and does not add
+    ``flights``.
+
+    Same-day Starlink SATCAT rows are included. Decayed objects are not.
+    Positions are never invented: if SATCAT and the SpaceX manifest are both
+    empty for a flight, that flight contributes ``[]`` unless it still has a
+    last good copy.
     """
     if not internal:
         increment_metric("total_requests")
@@ -6454,6 +6859,17 @@ def get_satellites_deployed(
     # default object is not a date string.
     if not isinstance(launch_date, str) or not launch_date.strip():
         launch_date = None
+    if launch_date is None:
+        try:
+            payload, cache_hit = _serve_launched_v3_union(force=force)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Deployed satellite feed failed: {exc}",
+            )
+        return _finish_deployed_response(payload, cache_hit=cache_hit)
     cached_before = None
     try:
         target = _resolve_deployed_target(launch_date)
@@ -7388,8 +7804,9 @@ def start_background_worker():
                 # Starlink GP hourly from Space-Track (1/hour class limit), then
                 # CelesTrak if that query fails. Stations stay on CelesTrak.
                 # Request handlers serve the cached catalog immediately; this
-                # refresh stays off the Heroku request path. The deployed feed
-                # is included; a manifest-backed copy expires sooner.
+                # refresh stays off the Heroku request path. Every launched V3
+                # flight is refreshed one date at a time; a manifest-backed
+                # copy expires sooner.
                 if now - last_run["satellites"] >= SATELLITES_CACHE_TTL:
                     try:
                         refresh_satellites_internal("starlink")
