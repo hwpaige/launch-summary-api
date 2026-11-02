@@ -527,19 +527,36 @@ class DeployedSatelliteTests(unittest.TestCase):
     def setUp(self):
         app._reset_cache_coordination_for_tests()
 
-    def test_flight_14_group_31_is_the_v3_launch(self):
+    def test_launched_v3_flights_skip_upcoming_and_non_v3(self):
         from datetime import datetime, timezone
 
-        now = datetime(2026, 9, 28, 16, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
         flight_13 = {
             "id": "flight-13",
             "mission": "Starship | Flight 13",
             "rocket": "Starship",
             "net": "2026-07-24T22:51:00Z",
         }
-        chosen = app.select_v3_starship([FLIGHT_14], [flight_13, FLIGHT_14], now=now)
-        self.assertEqual(chosen["id"], "flight-14")
-        self.assertEqual(app.deployed_generation(app._launch_blob(chosen)), "v3")
+        flight_15 = {
+            "id": "flight-15",
+            "mission": "Starship | Flight 15",
+            "rocket": "Starship",
+            "description": "V3 Starlink",
+            "net": "2026-11-30T00:00:00Z",
+        }
+        older = {
+            "id": "flight-older",
+            "mission": "Starship | Group 31-0",
+            "rocket": "Starship",
+            "net": "2026-08-01T00:00:00Z",
+        }
+        chosen = app.launched_v3_starships(
+            [FLIGHT_14, flight_15],
+            [flight_13, FLIGHT_14, older],
+            now=now,
+        )
+        self.assertEqual([row["id"] for row in chosen], ["flight-older", "flight-14"])
+        self.assertEqual(app.deployed_generation(app._launch_blob(chosen[-1])), "v3")
         self.assertIsNone(app.deployed_generation(app._launch_blob(flight_13)))
 
     def test_slim_satcat_index_skips_decayed_debris_and_other_dates(self):
@@ -1844,6 +1861,363 @@ class SharedSatelliteCatalogTests(unittest.TestCase):
         self.assertEqual(refreshed["fetched_at"], "2020-01-01T00:00:00Z")
         self.assertEqual(len(refreshed["satellites"]), 1)
         self.assertEqual(refreshed["satellites"][0]["norad_id"], 44714)
+
+
+FLIGHT_15 = {
+    "id": "flight-15",
+    "mission": "Starship | Flight 15",
+    "name": "Starship | Flight 15",
+    "rocket": "Starship",
+    "description": "V3 Starlink",
+    "net": "2026-11-30T00:00:00Z",
+}
+
+FLIGHT_OLDER = {
+    "id": "flight-older",
+    "mission": "Starship | Group 31-0",
+    "name": "Starship | Group 31-0",
+    "rocket": "Starship",
+    "net": "2026-08-01T00:00:00Z",
+}
+
+
+def _deployed_sat(name, norad=None):
+    sat = {
+        "name": name,
+        "tle_line1": "1" * 69,
+        "tle_line2": "2" * 69,
+        "generation": "v3",
+    }
+    if norad is None:
+        sat["id"] = name
+    else:
+        sat["norad_id"] = norad
+    return sat
+
+
+def _store_deployed(date, mission, sats, source="celestrak-satcat", fetched_at="2026-11-02T12:00:00Z"):
+    payload = {
+        "launch_date": date,
+        "generation": "v3",
+        "mission": mission,
+        "fetched_at": fetched_at,
+        "ttl_seconds": app.SATELLITES_CACHE_TTL,
+        "count": len(sats),
+        "catalog_count": len(sats),
+        "stale": False,
+        "empty": not sats,
+        "source": source,
+        "note": f"cached {date}",
+        "satellites": [dict(sat) for sat in sats],
+    }
+    app._local_deployed[date] = payload
+    return payload
+
+
+class DeployedUnionTests(unittest.TestCase):
+    """Default /satellites/deployed unions every launched V3 flight."""
+
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def _frozen(self, hour=12, minute=0, second=0):
+        return ManifestEphemerisTests._frozen_at(2026, 11, 2, hour, minute, second)
+
+    def _launches(self, previous, upcoming=None):
+        return {
+            "upcoming": list(upcoming or []),
+            "previous": list(previous),
+            "last_updated": None,
+        }
+
+    def test_union_dedupes_by_norad_then_name_and_skips_upcoming(self):
+        _store_deployed("2026-08-01", FLIGHT_OLDER["mission"], [
+            _deployed_sat("STARLINK-OLDER", 1001),
+            _deployed_sat("STARLINK-DUP-OLD", 1002),
+            _deployed_sat("STARLINK-40075"),
+        ])
+        _store_deployed(
+            "2026-09-28",
+            FLIGHT_14["mission"],
+            [
+                _deployed_sat("STARLINK-DUP-NEW", 1002),
+                _deployed_sat("STARLINK-NEW", 1003),
+                _deployed_sat("STARLINK-40075"),
+                _deployed_sat("STARLINK-40076"),
+            ],
+            source="spacex-manifest-ephemeris",
+        )
+        _store_deployed("2026-11-30", FLIGHT_15["mission"], [
+            _deployed_sat("STARLINK-FUTURE", 9999),
+        ])
+        launches = self._launches([FLIGHT_OLDER, FLIGHT_14], [FLIGHT_15])
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", self._frozen()), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=AssertionError("upstream")):
+            body = app.get_satellites_deployed(internal=True)
+
+        self.assertEqual(
+            [sat["name"] for sat in body["satellites"]],
+            [
+                "STARLINK-DUP-NEW",
+                "STARLINK-NEW",
+                "STARLINK-40075",
+                "STARLINK-40076",
+                "STARLINK-OLDER",
+            ],
+        )
+        self.assertEqual(body["count"], 5)
+        self.assertEqual(body["catalog_count"], 7)
+        self.assertEqual(body["launch_date"], "2026-09-28")
+        self.assertIn("Group 31-1", body["mission"])
+        self.assertEqual(body["generation"], "v3")
+        self.assertEqual(body["source"], "mixed")
+        self.assertFalse(body["stale"])
+        self.assertFalse(body["empty"])
+        self.assertNotIn(9999, [sat.get("norad_id") for sat in body["satellites"]])
+        self.assertEqual(
+            [flight["launch_date"] for flight in body["flights"]],
+            ["2026-09-28", "2026-08-01"],
+        )
+        self.assertEqual(body["flights"][0]["count"], 4)
+        self.assertEqual(body["flights"][0]["source"], "spacex-manifest-ephemeris")
+        self.assertFalse(body["flights"][0]["stale"])
+        self.assertEqual(body["flights"][1]["mission"], FLIGHT_OLDER["mission"])
+        self.assertEqual(body["flights"][1]["count"], 3)
+        # The newer flight's copy of a shared NORAD wins.
+        dup = next(sat for sat in body["satellites"] if sat["norad_id"] == 1002)
+        self.assertEqual(dup["name"], "STARLINK-DUP-NEW")
+
+    def test_launch_date_query_stays_single_flight(self):
+        _store_deployed("2026-08-01", FLIGHT_OLDER["mission"], [
+            _deployed_sat("STARLINK-OLDER", 1001),
+        ])
+        _store_deployed("2026-09-28", FLIGHT_14["mission"], [
+            _deployed_sat("STARLINK-NEW", 1003),
+        ])
+        launches = self._launches([FLIGHT_OLDER, FLIGHT_14], [FLIGHT_15])
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", self._frozen()), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=AssertionError("upstream")):
+            body = app.get_satellites_deployed(launch_date="2026-08-01", internal=True)
+
+        self.assertEqual(set(body), ManifestEphemerisTests._DEPLOYED_BODY_KEYS)
+        self.assertNotIn("flights", body)
+        self.assertEqual(body["launch_date"], "2026-08-01")
+        self.assertEqual(body["mission"], FLIGHT_OLDER["mission"])
+        self.assertEqual([sat["norad_id"] for sat in body["satellites"]], [1001])
+        self.assertEqual(body["count"], 1)
+        self.assertFalse(body["stale"])
+
+    def test_cold_failure_does_not_drop_a_sibling_flight(self):
+        stored = _store_deployed("2026-08-01", FLIGHT_OLDER["mission"], [
+            _deployed_sat("STARLINK-OLDER", 1001),
+            _deployed_sat("STARLINK-40075"),
+        ])
+        snapshot = [dict(sat) for sat in stored["satellites"]]
+        launches = self._launches([FLIGHT_OLDER, FLIGHT_14])
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", self._frozen()), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=RuntimeError("celestrak down")):
+            body = app.get_satellites_deployed(internal=True)
+
+        self.assertEqual(
+            [sat["name"] for sat in body["satellites"]],
+            ["STARLINK-OLDER", "STARLINK-40075"],
+        )
+        self.assertTrue(body["stale"])
+        self.assertEqual(body["launch_date"], "2026-09-28")
+        self.assertEqual(app._local_deployed["2026-08-01"]["satellites"], snapshot)
+        failed = next(flight for flight in body["flights"] if flight["launch_date"] == "2026-09-28")
+        kept = next(flight for flight in body["flights"] if flight["launch_date"] == "2026-08-01")
+        self.assertEqual(failed["count"], 0)
+        self.assertTrue(failed["stale"])
+        self.assertEqual(kept["count"], 2)
+        self.assertFalse(kept["stale"])
+        self.assertNotIn("unavailable", body["note"].lower())
+
+    def test_manifest_rejection_does_not_wipe_last_good(self):
+        f14 = _store_deployed(
+            "2026-09-28",
+            FLIGHT_14["mission"],
+            [_deployed_sat("STARLINK-40075"), _deployed_sat("STARLINK-40076")],
+            source="spacex-manifest-ephemeris",
+            fetched_at="2020-01-01T00:00:00Z",
+        )
+        older = _store_deployed(
+            "2026-08-01",
+            FLIGHT_OLDER["mission"],
+            [_deployed_sat("STARLINK-OLDER", 1001)],
+            fetched_at="2020-01-01T00:00:00Z",
+        )
+        f14_names = [sat["name"] for sat in f14["satellites"]]
+        older_ids = [sat["norad_id"] for sat in older["satellites"]]
+        name = _f14_filename(40075)
+        router = DeployedSatelliteTests()
+        fake_get, _calls = router._route_celestrak(
+            [_satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-01-01")],
+            manifest=name + "\n",
+            ephemerides={name: _MEME_OLD},
+        )
+        launches = self._launches([FLIGHT_OLDER, FLIGHT_14])
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", self._frozen()), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(force=True, internal=True)
+
+        self.assertEqual(
+            sorted(sat["name"] for sat in body["satellites"]),
+            ["STARLINK-40075", "STARLINK-40076", "STARLINK-OLDER"],
+        )
+        self.assertTrue(body["stale"])
+        self.assertTrue(all(flight["stale"] for flight in body["flights"]))
+        self.assertEqual(
+            [sat["name"] for sat in app._local_deployed["2026-09-28"]["satellites"]],
+            f14_names,
+        )
+        self.assertEqual(
+            [sat["norad_id"] for sat in app._local_deployed["2026-08-01"]["satellites"]],
+            older_ids,
+        )
+        self.assertEqual(app._local_deployed["2026-09-28"]["source"], "spacex-manifest-ephemeris")
+
+    def test_redis_read_failure_does_not_wipe_either_flight(self):
+        redis = _FakeRedis()
+        redis._boom_key = None
+
+        def _get(key):
+            if key == redis._boom_key:
+                raise RuntimeError("redis blip")
+            return _FakeRedis.get(redis, key)
+
+        redis.get = _get
+        launches = self._launches([FLIGHT_OLDER, FLIGHT_14])
+        with patch.object(app, "r", redis), \
+             patch.object(app, "datetime", self._frozen()):
+            _store_deployed("2026-08-01", FLIGHT_OLDER["mission"], [
+                _deployed_sat("STARLINK-OLDER", 1001),
+            ])
+            _store_deployed("2026-09-28", FLIGHT_14["mission"], [
+                _deployed_sat("STARLINK-40075"),
+                _deployed_sat("STARLINK-40076"),
+            ], source="spacex-manifest-ephemeris")
+            app._write_deployed_cache("2026-08-01", app._local_deployed["2026-08-01"])
+            app._write_deployed_cache("2026-09-28", app._local_deployed["2026-09-28"])
+            before = dict(redis.store)
+            app._local_deployed.clear()
+            redis._boom_key = app._deployed_cache_key("2026-09-28")
+            with patch.object(app, "_load_launch_payload", return_value=launches), \
+                 patch.object(app.requests, "get", side_effect=RuntimeError("upstream down")):
+                body = app.get_satellites_deployed(internal=True)
+            redis._boom_key = None
+            kept = app.get_cached_data(app._deployed_cache_key("2026-09-28"))
+            sibling = app.get_cached_data(app._deployed_cache_key("2026-08-01"))
+
+        self.assertEqual(redis.store, before)
+        self.assertEqual(
+            [sat["name"] for sat in kept["satellites"]],
+            ["STARLINK-40075", "STARLINK-40076"],
+        )
+        self.assertEqual(sibling["satellites"][0]["norad_id"], 1001)
+        self.assertEqual([sat["norad_id"] for sat in body["satellites"]], [1001])
+        self.assertTrue(body["stale"])
+        self.assertNotIn("2026-11-30", [flight["launch_date"] for flight in body["flights"]])
+
+    def test_second_cold_flight_is_deferred_past_the_request_budget(self):
+        rows = [
+            _satcat_row("STARLINK-38381", 100753, "2026-219A", "2026-09-28"),
+            _satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-08-01"),
+        ]
+        router = DeployedSatelliteTests()
+        fake_get, calls = router._route_celestrak(
+            rows,
+            gp_by_intdes={
+                "2026-219": [_v3_omm()],
+                "2026-200": [_v3_omm(100700, "STARLINK-OLD", "2026-200A")],
+            },
+        )
+        launches = self._launches([FLIGHT_OLDER, FLIGHT_14])
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", self._frozen()), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=fake_get), \
+             patch.object(app, "SATELLITES_REQUEST_BUDGET_SEC", -1):
+            body = app.get_satellites_deployed(internal=True)
+
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["satellites"][0]["norad_id"], 100753)
+        self.assertEqual(body["launch_date"], "2026-09-28")
+        self.assertTrue(body["stale"])
+        self.assertEqual(
+            [flight["launch_date"] for flight in body["flights"]],
+            ["2026-09-28", "2026-08-01"],
+        )
+        deferred = body["flights"][1]
+        self.assertTrue(deferred["deferred"])
+        self.assertTrue(deferred["stale"])
+        self.assertEqual(deferred["count"], 0)
+        self.assertIsNone(deferred["source"])
+        self.assertFalse(body["flights"][0].get("deferred"))
+        intdes = [
+            params.get("INTDES")
+            for url, params in calls
+            if url == app.CELESTRAK_GP_URL
+        ]
+        self.assertEqual(intdes, ["2026-219"])
+        self.assertNotIn("2026-08-01", app._local_deployed)
+
+    def test_flight_14_launched_and_flight_15_upcoming_returns_26(self):
+        rolled = ManifestEphemerisTests._rolled_meme("2026-11-02", 306)
+        manifest_lines = []
+        ephemerides = {}
+        for sid in F14_STARLINK_IDS:
+            name = _f14_filename(sid)
+            manifest_lines.append(name)
+            ephemerides[name] = rolled
+        router = DeployedSatelliteTests()
+        fake_get, _calls = router._route_celestrak(
+            [_satcat_row("STARLINK-OLD", 100700, "2026-200A", "2026-08-01")],
+            manifest="\n".join(manifest_lines) + "\n",
+            ephemerides=ephemerides,
+        )
+        _store_deployed("2026-11-30", FLIGHT_15["mission"], [
+            _deployed_sat("STARLINK-FUTURE", 9999),
+        ], fetched_at="2026-11-02T08:59:12Z")
+        launches = self._launches([FLIGHT_14], [FLIGHT_15])
+        with patch.object(app, "r", None), \
+             patch.object(app, "datetime", self._frozen(8, 59, 12)), \
+             patch.object(app, "_load_launch_payload", return_value=launches), \
+             patch.object(app.requests, "get", side_effect=fake_get):
+            body = app.get_satellites_deployed(internal=True)
+            single = app.get_satellites_deployed(launch_date="2026-09-28", internal=True)
+
+        self.assertEqual(body["count"], 26)
+        self.assertEqual(body["catalog_count"], 26)
+        self.assertEqual(
+            [sat["name"] for sat in body["satellites"]],
+            [f"STARLINK-{sid}" for sid in F14_STARLINK_IDS],
+        )
+        self.assertEqual(body["source"], "spacex-manifest-ephemeris")
+        self.assertEqual(body["launch_date"], "2026-09-28")
+        self.assertIn("Group 31-1", body["mission"])
+        self.assertEqual(body["generation"], "v3")
+        self.assertFalse(body["stale"])
+        self.assertFalse(body["empty"])
+        self.assertEqual(len(body["flights"]), 1)
+        self.assertEqual(body["flights"][0]["launch_date"], "2026-09-28")
+        self.assertEqual(body["flights"][0]["count"], 26)
+        self.assertEqual(body["flights"][0]["source"], "spacex-manifest-ephemeris")
+        self.assertNotIn(9999, [sat.get("norad_id") for sat in body["satellites"]])
+        self.assertNotIn("STARLINK-FUTURE", [sat["name"] for sat in body["satellites"]])
+        self.assertEqual(set(single), ManifestEphemerisTests._DEPLOYED_BODY_KEYS)
+        self.assertEqual(single["count"], 26)
+        self.assertEqual(single["launch_date"], "2026-09-28")
+        self.assertEqual(single["source"], "spacex-manifest-ephemeris")
+        self.assertNotIn("flights", single)
 
 
 def requests_ssl_error():
