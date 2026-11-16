@@ -357,6 +357,133 @@ Cached CelesTrak General Perturbations (GP / OMM) for the SpaceX dashboard Three
 
 ---
 
+### 13. Starship live tracker and closures (Launch Buddy)
+
+Cached ship and booster positions, plus FAA / maritime closure polygons, for the Launch Buddy globe. A single background poller on the web dyno reads the public feeds. These routes only return the last document: they do not call upstream, and they do not invent a vehicle position.
+
+No new Heroku config is required. Optional variables:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `STARSHIP_POLLER` | `1` | Set to `0` to disable the background poller. |
+| `STARSHIP_TRACKER_TEST` | unset | `once`, `loop`, or `laps` makes `GET /starship/tracker` serve the flight-test fixture instead of the live feeds. Leave unset in production. |
+| `STARSHIP_CACHE_DIR` | `/tmp/launch-narrative-starship` | On-dyno trail log. A restart backfills from history. |
+
+If `REDIS_URL` (or the existing Heroku Redis URL) is already set, one dyno holds the poll lock and the others serve that published document. No new addon. Without Redis, the web dyno polls in memory. The poller needs ordinary outbound HTTPS to `content.spacex.com`, `sxcontent9668.azureedge.us`, `starship.beyondstagezero.com`, `stardash.live`, `tfr.faa.gov`, and `msi.nga.mil`.
+
+**Poll cadence.** Official feeds first (`https://content.spacex.com/cms-assets/starship_tracker_public.json`, then `https://sxcontent9668.azureedge.us/cms-assets/starship_tracker_public.json`). Hobby feeds (Beyond Stage Zero `/api/tracker` and `/api/ship-trail`, then StarDash `/api/feed` and `/api/history`) run only after both SpaceX hosts have no vehicle fix and only after NET, at 30 seconds. Fast poll is 10 seconds plus jitter from T−30 minutes until the mission ends (post-catch hold or the 48 hour cap). Idle poll is 5 minutes. `Retry-After` on 429/503 is honored. The User-Agent identifies this service.
+
+**Positions.** `vehicles[].lat` / `lon` / `alt_km` / `speed_kmh` are the latest feed fix. `trail[]` points are flown samples (`kind: "flown"`). `predicted[]` points are the feed's future path (`kind: "predicted"`) and are not copied into `lat` / `lon`. `planned` describes the modeled pad path from `GET /trajectory`; it is not a vehicle. `live_positions` is true only when those coordinates came from a real feed. An empty or failed poll leaves the last feed fix in place (with `stale` / `down`) or returns `vehicles: []` and `position_source: "none"`. Nothing is synthesized to look live.
+
+**Liftoff and mission.** The liftoff latch is two airborne samples (altitude above 1 km, speed above 100 m/s, or the coast band) inside the window. `hide_planned` becomes true at T−0 (NET, or the motion latch if that is earlier) and never before. A scrub that moves NET later clears an unconfirmed latch and restores the planned path. A vehicle is down after 10 minutes grounded or 30 minutes missing. The post-catch hold is 1 hour from the landing time, not from process start, and the whole mission stops at 48 hours. A mid-flight restart reloads the trail and backfills earlier samples from history. A mission clock that jumps backward starts a new flight.
+
+#### `GET /starship/tracker`
+
+*   **Parameters:** `fixture=flight_test` (optional, dev only). Serves `FlightTestRun` through this same shape so the iOS Simulator can be exercised without a launch. The body has `test: true`, `position_source: "fixture"`, `live_positions: false`, and vehicle names ending in `TEST`.
+*   **Caching:** Pre-rendered JSON. Clients that send `Accept-Encoding: gzip` get `Content-Encoding: gzip`. `Cache-Control: public, max-age=5` on the live document, `no-store` on the fixture. `X-Starship-Source` is `cache` or `fixture`.
+*   **Sample (no fix yet):**
+
+```json
+{
+  "show": false,
+  "stale": true,
+  "hold": false,
+  "hide_planned": false,
+  "launch_active": false,
+  "vehicles": [],
+  "position_source": "none",
+  "live_positions": false,
+  "generated_at": "2026-11-16T00:00:00+00:00",
+  "feed": {"kind": "none", "url": null},
+  "planned": {
+    "kind": "planned",
+    "hidden": false,
+    "endpoint": "/trajectory",
+    "note": "Modeled pad ground track from GET /trajectory. Not a vehicle position. Hidden from T-0 until the mission ends."
+  },
+  "orbit": {
+    "kind": "derived",
+    "in_orbit": false,
+    "orbit_label": "",
+    "orbit_number": 0,
+    "completed_laps": 0,
+    "apsis_label": ""
+  },
+  "telemetry": {
+    "show": false,
+    "stale": true,
+    "in_orbit": false,
+    "position_source": "none"
+  }
+}
+```
+
+*   **Fields:**
+    *   `show` (bool) — at least one vehicle marker is on.
+    *   `stale` (bool) — the latest official document is older than the fresh window.
+    *   `hold` (bool) — post-catch hold is still up.
+    *   `hide_planned` (bool) — hide the modeled pad path. True from T−0 until the mission ends. Never true before T−0.
+    *   `launch_active` (bool) — two airborne samples have confirmed liftoff and the mission has not ended.
+    *   `position_source` — `feed`, `fixture`, or `none`.
+    *   `live_positions` (bool) — true only when `position_source` is `feed` and `vehicles` is non-empty.
+    *   `generated_at` (string) — UTC timestamp of this document.
+    *   `feed.kind` — `official`, `hobby`, `fixture`, or `none`. `feed.url` is the feed that produced the current fixes, or null.
+    *   `planned.kind` — always `planned`. `planned.hidden` mirrors `hide_planned`. `planned.endpoint` is `/trajectory`.
+    *   `orbit` — derived from the ship fix. Not a position. `kind` is `derived`. `in_orbit`, `orbit_label` (for example `ORBIT 7`), `orbit_number`, `completed_laps`, `apsis_label`.
+    *   `telemetry` — webcast strip built from the same fixes: `show`, `clock`, `clock_base_s`, `flight_label`, `apsis_label`, `stale`, `booster`, `ship`, `in_orbit`, `orbit_label`, `orbit_number`, `completed_laps`, `position_source`. Each of `booster` and `ship` has `title`, `code`, `speed_kmh` (string with commas, or `—`), `alt_km` (string, kilometres only), `stale`, `present`, `color`, and the lerp fields `alt_m`, `speed_mps`, `alt_m_next`, `speed_mps_next`, `motion_span_s`, `motion_age_s`.
+    *   `vehicles[]` — one object per ship or booster that is on the globe:
+        *   `id` / `key` — `ship*` or `booster*` (for example `ship42`).
+        *   `kind` — `ship`, `booster`, or `other`.
+        *   `name` — `Ship 42`. Fixture names end with `TEST`.
+        *   `position_kind` — `feed` or `fixture`. Never `predicted`.
+        *   `lat`, `lon` — feed fix, decimal degrees.
+        *   `alt_m`, `alt_km` — altitude from that fix. Labels use kilometres only (`altitude_text`, `labels.altitude`).
+        *   `speed_mps`, `speed_kmh` — speed from that fix. `speed_text` / `labels.speed` are km/h with thousands separators, for example `26,816 km/h`.
+        *   `gps_s` / `gps_time` — GPS seconds of the fix.
+        *   `sample_age_s` — how old the fix already is, capped at 180.
+        *   `mission_time_s`, `mission_text`, `labels.mission` — mission clock.
+        *   `labels.apsis`, `apsis_label` — ship apogee / perigee text, or empty.
+        *   `moving`, `missing`, `stale`, `down` — motion, vanished-from-feed, stale fix, and the landed/vanished-done latch.
+        *   `trail[]` — flown samples `{lat, lon, alt_m, kind: "flown"}`.
+        *   `predicted[]` — feed prediction `{lat, lon, alt_m, t, kind: "predicted"}`. `t` is GPS seconds. These points are not the current position.
+
+#### `GET /starship/closures`
+
+Closure polygons for the same globe. Visible from about T−24 hours until the tracker says the mission is over. Live FAA TFRs and NGA broadcast warnings are preferred. When a side fails, the hardcoded Starship Flight 15 notices (FDC 6/7129 and the NAVAREA / HYDROPAC rings) fill that side. The planned path is never rewritten to fit a polygon.
+
+*   **Caching:** gzip when the client accepts it. `Cache-Control: public, max-age=60`.
+*   **Fields:**
+    *   `show` (bool)
+    *   `source` — `live`, `mixed`, `fallback`, or `cache`
+    *   `fallback` (bool) — true when `source` is `fallback`
+    *   `kind` — `closure`
+    *   `generated_at` (string)
+    *   `areas` — empty when `show` is false. Otherwise each area has `notice_id`, `also` (sibling NOTAM ids), `kind` (`airspace` or `maritime`), `role` (`airspace`, `corridor`, `high_risk`, or `debris`), `name`, `effective_start`, `effective_end`, and `points` (`{lat, lon}`).
+
+```json
+{
+  "show": true,
+  "source": "fallback",
+  "fallback": true,
+  "kind": "closure",
+  "generated_at": "2026-11-13T12:00:00+00:00",
+  "areas": [
+    {
+      "notice_id": "FDC 6/7129",
+      "also": ["FDC 6/7130", "FDC 6/7131", "FDC 6/7132"],
+      "kind": "airspace",
+      "role": "airspace",
+      "name": "Starbase airspace",
+      "effective_start": "2026-11-13T22:30:00+00:00",
+      "effective_end": "2026-11-14T00:40:00+00:00",
+      "points": [{"lat": 25.933333, "lon": -97.166667}]
+    }
+  ]
+}
+```
+
+---
+
 ## Interactive Dashboard
 
 Access the root URL (`/`) in any web browser to view the **API Status Dashboard**.
@@ -403,7 +530,8 @@ The API utilizes a **Timer-Based Refresh Strategy** to ensure stability and spee
 2.  **Hot raw (opt-in):** `GET /launch_raw/{id}?hot=1` refreshes **only the current/next launch** from Launch Library on a ~20s stale-while-revalidate TTL (single-flight per id). This is not a full-list refresh. Other ids, and `/launch_raw/{id}` without `hot`, keep the long-lived side store.
 3.  **Manual Force:** Users can trigger an immediate refresh via the dashboard buttons or by appending `?force=true` to API requests.
 4.  **Incremental History:** Previous launch data is never fully replaced; new launches are appended to the existing historical cache to preserve a continuous record.
-5.  **Satellite GP:** `/satellites/gp`, `/satellites/starlink`, and `/satellites/meta` are a CelesTrak proxy with a 1-hour freshness window. A stale Starlink catalog is returned immediately (gzip when the client accepts it) and refreshed in the background, so a cold dyno does not rebuild the catalog on the request. `/satellites/deployed` unions every launched Starship V3 flight (SATCAT join, then SpaceX public ephemerides), each with its own last-good cache. Element sets are GP/TLE; globe dots are SGP4 predictions, not live positions. An empty deployed list means no launched V3 flight had plottable sats or a last good copy.
+5.  **Starship tracker:** `/starship/tracker` and `/starship/closures` are served from memory. A background poller owns the SpaceX, hobby, FAA, and NGA requests. Phones do not wait on those hosts.
+6.  **Satellite GP:** `/satellites/gp`, `/satellites/starlink`, and `/satellites/meta` are a CelesTrak proxy with a 1-hour freshness window. A stale Starlink catalog is returned immediately (gzip when the client accepts it) and refreshed in the background, so a cold dyno does not rebuild the catalog on the request. `/satellites/deployed` unions every launched Starship V3 flight (SATCAT join, then SpaceX public ephemerides), each with its own last-good cache. Element sets are GP/TLE; globe dots are SGP4 predictions, not live positions. An empty deployed list means no launched V3 flight had plottable sats or a last good copy.
 
 ---
 
