@@ -56,6 +56,15 @@ app = FastAPI(
             ),
         },
         {
+            "name": "Starship",
+            "description": (
+                "Cached live Starship ship and booster positions and FAA / "
+                "maritime closure polygons. A background poller reads the "
+                "public feeds. These routes serve that document and do not "
+                "call upstream on the request."
+            ),
+        },
+        {
             "name": "Satellites",
             "description": (
                 "Cached GP/OMM element sets (Starlink, stations, and a "
@@ -1598,6 +1607,7 @@ _PAD_SITE_ALIASES = (
             'olm-',
             'olm ',
             'boca chica',
+            'boca',
             'starbase',
         ),
         STARBASE_LAUNCH_SITE,
@@ -7741,6 +7751,10 @@ def stop_seeding():
     return {"status": "Stop signal sent"}
 
 
+import starship_http
+
+starship_http.install(app)
+
 _background_enabled = True
 
 
@@ -7750,6 +7764,11 @@ def start_background_worker():
         time.sleep(5)
         if not _background_enabled:
             return
+
+        try:
+            starship_http.start_starship_poller()
+        except Exception as e:
+            print(f"Starship poller start error: {e}")
 
         # Initial bootstrap (populate empty caches)
         print("Starting background worker bootstrap...")
