@@ -7779,6 +7779,7 @@ def start_background_worker():
             refresh_narratives_internal()
             refresh_launches_internal()
             refresh_weather_internal()
+            launch_insights.warm_upcoming_insights()
 
         except Exception as e:
             print(f"Bootstrap error: {e}")
@@ -7812,10 +7813,15 @@ def start_background_worker():
                     refresh_narratives_internal()
                     last_run["narratives"] = now
 
-                # Launches (every 10m)
+                # Launches (every 10m). Insights warming uses only the surplus
+                # left after this list refresh and skips launches still cached.
                 if now - last_run["launches"] >= 600:
                     refresh_launches_internal()
                     last_run["launches"] = now
+                    try:
+                        launch_insights.warm_upcoming_insights()
+                    except Exception as e:
+                        print(f"Insights warm error: {e}")
 
                 # Weather (every 2m for higher frequency wind updates)
                 if now - last_run["weather"] >= 120:

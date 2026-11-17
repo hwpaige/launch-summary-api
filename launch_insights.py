@@ -11,6 +11,10 @@ Event times are Launch Library timeline rows only. A miss, HTTP error, or
 Insights calls stay inside the free-tier surplus left after the main list
 refresh (``LL_HOURLY_BUDGET`` minus ``LL_RESERVED_FOR_MAIN_FEED``). Booster
 history is skipped when that surplus is down to its last call.
+
+The background worker warms the next 12 upcoming launches from the stored
+list. ``INSIGHTS_WARM=0`` turns that pass off. It uses the same surplus and
+does not refresh ``/launches``.
 """
 
 from __future__ import annotations
@@ -41,6 +45,9 @@ BOOSTER_MIN_REMAINING = 2
 LAUNCH_TIMEOUT = (3.05, 8)
 BOOSTER_TIMEOUT = (3.05, 15)
 BUDGET_TTL = 3700
+WARM_LIMIT = 12
+WARM_LOCK_KEY = "launch_insights_warm_lock_v1"
+WARM_LOCK_TTL = 600
 
 _SKIP_STAGE = (
     "second",
@@ -68,6 +75,7 @@ _serial_locks = {}
 _launch_locks = {}
 _session_lock = threading.Lock()
 _session = None
+_warm_lock = threading.Lock()
 
 
 class _Budget:
@@ -104,6 +112,14 @@ class _Budget:
                 self._rollback()
                 return False
             return True
+
+    def remaining(self) -> int:
+        """Surplus calls left this hour. Zero after a 429."""
+        with self.lock:
+            self._roll()
+            if self._blocked():
+                return 0
+            return max(0, _allowance() - self._used_count())
 
     def block(self):
         """A 429 stops further insights calls until the hour changes."""
@@ -221,6 +237,150 @@ def install(fastapi_app: FastAPI) -> None:
         body, cache_hit = build_insights(ll2_launch_id)
         app_module.increment_metric("cache_hits" if cache_hit else "cache_misses")
         return body
+
+
+def insights_warm_enabled() -> bool:
+    """``INSIGHTS_WARM=0`` disables the background warmer. Anything else is on."""
+    flag = os.getenv("INSIGHTS_WARM", "1").strip().lower()
+    return flag not in ("0", "false", "no", "off")
+
+
+def warm_upcoming_insights():
+    """Fill insights for the next 12 stored upcoming launches.
+
+    Reads the list cache only. Soonest net first. A launch that is already
+    fresh, including booster history for every core on that document, is
+    skipped. One Redis lock (or the in-process lock when Redis is down)
+    keeps a second dyno or a restart from running a second pass. The lock
+    expires so a dead worker does not hold it.
+    """
+    if not insights_warm_enabled():
+        return {"status": "disabled", "considered": 0, "warmed": 0, "skipped": 0}
+    if not _warm_lock.acquire(blocking=False):
+        return {"status": "busy", "considered": 0, "warmed": 0, "skipped": 0}
+    client = _redis()
+    token = None
+    try:
+        if client is not None:
+            token = f"{time.time()}:{os.getpid()}:{threading.get_ident()}"
+            try:
+                acquired = client.set(WARM_LOCK_KEY, token, nx=True, ex=WARM_LOCK_TTL)
+            except Exception as exc:
+                print(f"Insights warm lock failed: {exc.__class__.__name__}")
+                return {"status": "lock-error", "considered": 0, "warmed": 0, "skipped": 0}
+            if not acquired:
+                return {"status": "busy", "considered": 0, "warmed": 0, "skipped": 0}
+        try:
+            return _warm_pass(client, token)
+        finally:
+            _release_warm_lock(client, token)
+    finally:
+        _warm_lock.release()
+
+
+def _warm_pass(client, token) -> dict:
+    ids = _stored_upcoming_ids(WARM_LIMIT)
+    warmed = 0
+    skipped = 0
+    for launch_id in ids:
+        _touch_warm_lock(client, token)
+        if _insights_fresh(launch_id):
+            skipped += 1
+            continue
+        doc_fresh = _launch_doc_fresh(launch_id)
+        remaining = _budget.remaining()
+        if doc_fresh and remaining < BOOSTER_MIN_REMAINING:
+            skipped += 1
+            continue
+        if not doc_fresh and remaining < 1:
+            skipped += 1
+            continue
+        try:
+            build_insights(launch_id)
+        except Exception as exc:
+            print(f"Insights warm failed for {launch_id}: {exc.__class__.__name__}")
+        warmed += 1
+    return {"status": "ok", "considered": len(ids), "warmed": warmed, "skipped": skipped}
+
+
+def _stored_upcoming_ids(limit: int) -> list:
+    """Soonest upcoming ids from the list cache. Does not call Launch Library."""
+    import app as app_module
+
+    data = app_module._launches_mem.get("data")
+    if not isinstance(data, dict):
+        try:
+            data = app_module.get_cached_data(app_module.LAUNCHES_CACHE_KEY)
+        except Exception:
+            data = None
+    upcoming = []
+    if isinstance(data, dict):
+        for launch in data.get("upcoming") or []:
+            if isinstance(launch, dict) and launch.get("id"):
+                upcoming.append(launch)
+    upcoming.sort(key=_upcoming_sort_key)
+    ids = []
+    seen = set()
+    for launch in upcoming:
+        launch_id = str(launch.get("id"))
+        if not launch_id or launch_id in seen:
+            continue
+        seen.add(launch_id)
+        ids.append(launch_id)
+        if len(ids) >= limit:
+            break
+    return ids
+
+
+def _upcoming_sort_key(launch: dict):
+    parsed = _parse_dt(launch.get("net")) if isinstance(launch.get("net"), str) else None
+    if parsed is None:
+        return (1, 0.0)
+    return (0, parsed.timestamp())
+
+
+def _launch_doc_fresh(launch_id: str) -> bool:
+    cached = _cache_get(_launch_key(launch_id), LAUNCH_TTL)
+    return isinstance(cached, dict) and bool(cached.get("_detailed"))
+
+
+def _booster_cache_fresh(serial: str) -> bool:
+    cached = _cache_get(_booster_key(serial), BOOSTER_TTL)
+    return isinstance(cached, dict) and isinstance(cached.get("flights"), list)
+
+
+def _insights_fresh(launch_id: str) -> bool:
+    """Launch document and every core's flight list are still inside their TTL."""
+    cached = _cache_get(_launch_key(launch_id), LAUNCH_TTL)
+    if not isinstance(cached, dict) or not cached.get("_detailed"):
+        return False
+    for stub in cached.get("booster") or []:
+        if not isinstance(stub, dict):
+            continue
+        serial = stub.get("serial")
+        if isinstance(serial, str) and serial and not _booster_cache_fresh(serial):
+            return False
+    return True
+
+
+def _touch_warm_lock(client, token):
+    if client is None or not token:
+        return
+    try:
+        if client.get(WARM_LOCK_KEY) == token:
+            client.expire(WARM_LOCK_KEY, WARM_LOCK_TTL)
+    except Exception:
+        pass
+
+
+def _release_warm_lock(client, token):
+    if client is None or not token:
+        return
+    try:
+        if client.get(WARM_LOCK_KEY) == token:
+            client.delete(WARM_LOCK_KEY)
+    except Exception:
+        pass
 
 
 def build_insights(ll2_launch_id: str):
