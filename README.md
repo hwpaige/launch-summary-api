@@ -484,6 +484,32 @@ Closure polygons for the same globe. Visible from about T−24 hours until the t
 
 ---
 
+### 14. Launch insights (Launch Buddy launch detail charts)
+
+Chart data for **one** launch. Pad cadence and yearly vehicle totals stay off this payload. Sections that Launch Library does not actually have are left out. There is no `ascent_profile`: the globe's planned path is a ground track, and this route does not turn it into an altitude or velocity curve.
+
+*   **Endpoint:** `GET /launch/{ll2_launch_id}/insights`
+*   **`ll2_launch_id`:** Launch Library 2 launch UUID, the same id `/launches` already returns.
+*   **Response:** JSON, HTTP 200. A Launch Library error or HTTP 429 omits the section that call would have filled. That call is not retried.
+*   **Caching:** The launch record (timeline, orbit, landing, booster stats) is cached 6 hours (`launch_insights_v1:{id}`). Each booster's flight list is cached 24 hours (`launch_insights_booster_v1:{SERIAL}`). A hit does not call Launch Library. The route never refreshes `/launches`.
+*   **Budget:** Insights only spends the surplus above the main list refresh. Defaults are `LL_HOURLY_BUDGET=15` and `LL_RESERVED_FOR_MAIN_FEED=12` (two list calls every 10 minutes). Booster history is skipped when fewer than 2 surplus calls remain, so a launch-detail miss can still run. A 429 blocks further insights calls until the next UTC hour. Set the env vars if the token's real cap is higher.
+*   **`cached`:** `true` when this response did not call Launch Library.
+
+Sections, included only when the source has them:
+
+*   **`booster`:** one object per first-stage core (Falcon Heavy side boosters included; second stages omitted).
+    *   `serial`, `flight_number_this_launch`, `total_flights`, `landing_success_count`, `landing_attempt_count`, `first_flight_date` from that launch's launcher record.
+    *   `flights`: past flights of that serial, oldest first, from `GET /2.3.0/launches/?serial_number={serial}&mode=detailed`. Each flight has `date`, `mission_name`, `ll2_launch_id`, `landing_location_abbrev`, `landing_success` (`true`, `false`, or `null`), `turnaround_days` (whole days since that booster's previous flight, else `null`), and `is_current`. Omitted when the history call is skipped or fails. This launch is included and marked `is_current`.
+*   **`events`:** `[{name, t_plus_s, source}]` from the Launch Library timeline, `source` `"ll2"`. Countdown rows (negative T) are left out. Times are not taken from the trajectory model. Omitted when the launch has no flight timeline.
+*   **`orbit`:** `{name, apogee_km, perigee_km, inclination_deg}` from `mission.orbit`. Numeric fields are included only when Launch Library sends them. The rocket configuration's performance `apogee` is not the payload orbit and is not used.
+*   **`landing`:** `{type, location_name, location_abbrev, location_successful_landings, location_attempted_landings, downrange_km}`. `type` is `ASDS`, `RTLS`, `expendable`, or the Launch Library abbrev when it is something else (for example an ocean splashdown). `downrange_km` is included when Launch Library publishes a range of at least 30 km, the same cutoff the globe uses so a pad offset is not drawn as a droneship range.
+
+```text
+GET /launch/6208f972-18ec-490f-bbe5-6f5c6cfcd48c/insights
+```
+
+---
+
 ## Interactive Dashboard
 
 Access the root URL (`/`) in any web browser to view the **API Status Dashboard**.

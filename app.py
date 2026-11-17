@@ -7752,8 +7752,10 @@ def stop_seeding():
 
 
 import starship_http
+import launch_insights
 
 starship_http.install(app)
+launch_insights.install(app)
 
 _background_enabled = True
 
