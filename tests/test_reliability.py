@@ -93,8 +93,20 @@ class RedisPoolTests(unittest.TestCase):
         self.assertEqual(pool.connection_kwargs["socket_timeout"], app.REDIS_SOCKET_TIMEOUT_SEC)
         self.assertEqual(pool.connection_kwargs["health_check_interval"], app.REDIS_HEALTH_CHECK_SEC)
         self.assertIsNone(pool.connection_kwargs["ssl_cert_reqs"])
-        # Comfortably under the 20-connection add-on, with room for a second dyno.
-        self.assertLessEqual(app.REDIS_MAX_CONNECTIONS, 9)
+
+    def test_the_connection_budget_is_split_between_worker_processes(self):
+        # Heroku's buildpack starts four uvicorn workers on this dyno size, each with
+        # its own pool; together they must stay under the add-on's 18 usable connections.
+        self.assertLessEqual(app.REDIS_CONNECTION_BUDGET, 18)
+        for workers in (1, 2, 4, 8):
+            share = app._redis_connections_per_process(workers=workers, budget=16)
+            self.assertGreaterEqual(share, 2)
+            self.assertLessEqual(share * workers, 16)
+        self.assertEqual(app._redis_connections_per_process(workers=4, budget=16), 4)
+        with patch.dict("os.environ", {"WEB_CONCURRENCY": "4"}):
+            self.assertEqual(app._redis_connections_per_process(budget=16), 4)
+        with patch.dict("os.environ", {"WEB_CONCURRENCY": "not-a-number"}):
+            self.assertEqual(app._redis_connections_per_process(budget=16), 16)
 
     def test_a_burst_of_threads_never_holds_more_connections_than_the_cap(self):
         server = _CountingRedisServer()

@@ -82,13 +82,34 @@ app = FastAPI(
 )
 
 
-# One process may hold at most this many Redis connections. The default client pool
-# has no useful cap (100), and every thread that talks to Redis at the same moment
-# opens its own connection: a burst of 40+ concurrent requests went past the add-on's
-# 20-connection limit, after which every read failed. A thread that cannot get one of
-# these waits for REDIS_POOL_WAIT_SEC; Redis calls take milliseconds, so the wait is
-# short. Keep (dynos x REDIS_MAX_CONNECTIONS) under the add-on's limit.
-REDIS_MAX_CONNECTIONS = max(1, int(os.getenv("REDIS_MAX_CONNECTIONS", "8")))
+# Redis connections this dyno may hold in total. The add-on (Heroku Redis Mini) allows
+# 20 and reports 18 as usable. The default client pool has no useful cap (100), and
+# every thread that talks to Redis at the same moment opens its own connection: a
+# burst of 40+ concurrent requests went past the limit, after which every read failed.
+# With more than one dyno, lower this so that dynos x budget stays under the limit.
+REDIS_CONNECTION_BUDGET = max(1, int(os.getenv("REDIS_CONNECTION_BUDGET", "16")))
+
+
+def _redis_connections_per_process(workers=None, budget=None):
+    """This process's share of the budget.
+
+    uvicorn starts WEB_CONCURRENCY worker processes (the Python buildpack sets it from
+    the dyno's memory, 4 on Standard-2X), and each has its own pool.
+    """
+    if workers is None:
+        try:
+            workers = int(os.getenv("WEB_CONCURRENCY") or 1)
+        except ValueError:
+            workers = 1
+    budget = REDIS_CONNECTION_BUDGET if budget is None else budget
+    return max(2, budget // max(1, workers))
+
+
+# A thread that cannot get one of these waits for REDIS_POOL_WAIT_SEC; Redis calls take
+# milliseconds, so the wait is short.
+REDIS_MAX_CONNECTIONS = max(
+    1, int(os.getenv("REDIS_MAX_CONNECTIONS") or _redis_connections_per_process())
+)
 REDIS_POOL_WAIT_SEC = float(os.getenv("REDIS_POOL_WAIT_SEC", "2"))
 REDIS_CONNECT_TIMEOUT_SEC = float(os.getenv("REDIS_CONNECT_TIMEOUT_SEC", "3"))
 REDIS_SOCKET_TIMEOUT_SEC = float(os.getenv("REDIS_SOCKET_TIMEOUT_SEC", "10"))
