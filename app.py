@@ -25,7 +25,12 @@ load_dotenv()  # Load environment variables from .env if present
 
 GROK_MODEL = "grok-4-1-fast-reasoning"
 GROK_API_URL = "https://api.x.ai/v1/chat/completions"
-NOTIFY_COPY_TTL = 3600  # 1 hour; reschedules should not thrash xAI
+# The cache key holds every field the text is written from (NET, status, probability,
+# pad...), so a change regenerates at once. The TTL only bounds how often unchanged
+# text is rewritten, and each rewrite is one Grok call per launch and alert.
+NOTIFY_COPY_TTL = 6 * 3600
+# Countdown alerts whose text is shipped on each upcoming launch in the list.
+LIST_NOTIFY_EVENTS = ("t24h", "t1h", "t5m")
 # Request-path wait for Grok. Past this, the handler returns template copy
 # and the in-flight call fills the cache. Hard cap for the handler is ~2s.
 NOTIFY_COPY_BUDGET_SEC = 1.5
@@ -957,6 +962,9 @@ def _reset_cache_coordination_for_tests():
     _launches_mem["retry_at"] = 0.0
     _narratives_mem.update({"payload": None, "at": 0.0, "retry_at": 0.0})
     _raw_launch_mem.clear()
+    with _user_weather_lock:
+        _user_weather_mem.clear()
+        _user_weather_flights.clear()
     with _metric_pending_lock:
         _metric_pending.clear()
     _local_satellites.clear()
@@ -3361,6 +3369,63 @@ def _begin_notify_copy_flight(cache_key, payload: NotifyCopyRequest, increment_m
         return future, started
 
 
+def _list_notify_request(launch, event):
+    """The /notify/copy request a client would send for this launch and alert."""
+    probability = launch.get("probability")
+    if not isinstance(probability, (int, float)) or isinstance(probability, bool) or not 0 <= probability <= 100:
+        probability = None
+
+    def text(key):
+        value = launch.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return NotifyCopyRequest(
+        launch_id=str(launch["id"]),
+        event=event,
+        mission=text("mission") or text("name"),
+        net=text("net"),
+        status=text("status"),
+        pad=text("pad"),
+        rocket=text("rocket"),
+        orbit=text("orbit"),
+        probability=probability,
+    )
+
+
+def attach_notify_copy(data):
+    """Put the countdown alert text on every upcoming launch: `notify_copy[event]`.
+
+    The text is the same for every device, but each client asked `/notify/copy` for it
+    once per launch and alert, about 45 requests per device per refresh. With it on
+    the list a client needs none. Cached Grok text when there is some, else the
+    template; a miss starts one Grok call (same key a client's request would use) and
+    its text is on the list at the next refresh.
+    """
+    if not isinstance(data, dict):
+        return data
+    for launch in data.get("upcoming") or []:
+        if not isinstance(launch, dict) or not launch.get("id"):
+            continue
+        copies = {}
+        for event in LIST_NOTIFY_EVENTS:
+            try:
+                payload = _list_notify_request(launch, event)
+                cache_key = _notify_copy_cache_key_for(payload)
+                cached = _get_notify_copy_cached(cache_key)
+                if cached:
+                    title, body = cached["title"], cached["body"]
+                else:
+                    title, body = fallback_notify_copy(payload)
+                    if _background_enabled:
+                        _begin_notify_copy_flight(cache_key, payload, False)
+            except Exception as exc:
+                print(f"Notify copy for list skipped ({launch.get('id')} {event}): {exc}")
+                continue
+            copies[event] = {"title": title, "body": body}
+        launch["notify_copy"] = copies
+    return data
+
+
 def _drain_notify_copy_flights(timeout=1.0):
     """Wait briefly so a test's background fill can finish before the next case."""
     deadline = time.monotonic() + max(0.0, timeout)
@@ -4094,6 +4159,7 @@ def _refresh_launches_uncached():
             "last_updated": last_updated
         }
         _sanitize_launch_list_cache(result)
+        attach_notify_copy(result)
         set_cached_data(LAUNCHES_CACHE_KEY, result)
         return _remember_launches(result)
     except Exception as e:
@@ -5175,24 +5241,109 @@ def get_weather(location: str, force: bool = False, internal: bool = False):
     return res
 
 
-@app.get("/user_weather")
-def get_user_weather(lat: float, lon: float, station_id: str = None, internal: bool = False):
-    """Retrieve weather (METAR + forecast) for a user-specified location."""
-    if not internal:
-        increment_metric("total_requests")
+# Nearby weather is cached per cell of this many degrees (0.1 is about 11 km), so
+# devices in the same area share one METAR and forecast fetch per USER_WEATHER_TTL.
+# Each request used to call both upstream services.
+USER_WEATHER_CELL_DECIMALS = 1
+USER_WEATHER_TTL = WEATHER_CACHE_TTL
+USER_WEATHER_MEM_MAX = 512
+_user_weather_mem = {}
+_user_weather_lock = threading.Lock()
+_user_weather_flights = {}
 
-    # Always a cache miss as we don't cache user-specific locations by default
-    increment_metric("cache_misses")
 
-    # Fetch METAR
+def _user_weather_key(lat, lon, station_id):
+    station = (station_id or "").strip().upper()
+    cell_lat = round(float(lat), USER_WEATHER_CELL_DECIMALS) + 0.0
+    cell_lon = round(float(lon), USER_WEATHER_CELL_DECIMALS) + 0.0
+    return f"user_weather_v1:{cell_lat:.{USER_WEATHER_CELL_DECIMALS}f}:{cell_lon:.{USER_WEATHER_CELL_DECIMALS}f}:{station}"
+
+
+def _user_weather_held(key, allow_expired=False):
+    with _user_weather_lock:
+        entry = _user_weather_mem.get(key)
+    if entry and (allow_expired or entry[1] > time.time()):
+        return entry[0]
+    return None
+
+
+def _remember_user_weather(key, data):
+    now = time.time()
+    with _user_weather_lock:
+        _user_weather_mem.pop(key, None)
+        _user_weather_mem[key] = (data, now + USER_WEATHER_TTL)
+        if len(_user_weather_mem) > USER_WEATHER_MEM_MAX:
+            for stale in [k for k, (_d, expires) in _user_weather_mem.items() if expires <= now]:
+                _user_weather_mem.pop(stale, None)
+            while len(_user_weather_mem) > USER_WEATHER_MEM_MAX:
+                _user_weather_mem.pop(next(iter(_user_weather_mem)))
+
+
+def _fetch_user_weather(lat, lon, station_id):
     weather_data = fetch_weather(station_id=station_id, lat=lat, lon=lon)
-
-    # Fetch forecast
     forecast = fetch_forecast(lat=lat, lon=lon)
     weather_data['forecast'] = forecast
     weather_data['last_updated'] = _utc_isoformat()
-    weather_data = _finalize_weather(weather_data)
+    return _finalize_weather(weather_data)
 
+
+def _load_user_weather(lat, lon, station_id):
+    """(weather, cache_hit) for the cell this location falls in."""
+    key = _user_weather_key(lat, lon, station_id)
+    held = _user_weather_held(key)
+    if held is not None:
+        return held, True
+    shared = get_cached_data(key)
+    if isinstance(shared, dict) and shared:
+        _remember_user_weather(key, shared)
+        return shared, True
+
+    def _do():
+        again = _user_weather_held(key)
+        if again is not None:
+            return again
+        data = _fetch_user_weather(lat, lon, station_id)
+        if isinstance(data, dict) and not data.get("error"):
+            _remember_user_weather(key, data)
+            set_cached_data(key, data, ttl=USER_WEATHER_TTL)
+        return data
+
+    with _user_weather_lock:
+        flight = _user_weather_flights.get(key)
+        if flight is None:
+            if len(_user_weather_flights) > USER_WEATHER_MEM_MAX:
+                _user_weather_flights.clear()
+            flight = _SingleFlight()
+            _user_weather_flights[key] = flight
+    try:
+        fresh = flight.do(_do, wait_timeout=20)
+    except Exception as exc:
+        print(f"User weather fetch error for {key}: {exc}")
+        fresh = None
+    if fresh is not None:
+        return fresh, False
+    # An upstream failure or a fetch still running: the last answer for this cell
+    # beats an error.
+    expired = _user_weather_held(key, allow_expired=True)
+    if expired is not None:
+        return expired, True
+    raise HTTPException(
+        status_code=503,
+        detail="Weather temporarily unavailable",
+        headers={"Retry-After": CACHE_UNAVAILABLE_RETRY_AFTER},
+    )
+
+
+@app.get("/user_weather")
+def get_user_weather(lat: float, lon: float, station_id: str = None, internal: bool = False):
+    """Retrieve weather (METAR + forecast) for a user-specified location.
+
+    Answers are shared by everyone in the same ~11 km cell for five minutes.
+    """
+    if not internal:
+        increment_metric("total_requests")
+    weather_data, hit = _load_user_weather(lat, lon, station_id)
+    increment_metric("cache_hits" if hit else "cache_misses")
     return weather_data
 
 
@@ -7824,6 +7975,22 @@ def get_narratives(force: bool = False, internal: bool = False):
         descriptions = refresh_narratives_internal()
         return {"descriptions": descriptions, "last_updated": _utc_isoformat()}
 
+    try:
+        payload = _load_narratives_payload()
+    except CacheUnavailable:
+        increment_metric("cache_misses")
+        raise _cache_unavailable_response("Narratives")
+    increment_metric("cache_hits" if payload["descriptions"] else "cache_misses")
+    return payload
+
+
+def _load_narratives_payload():
+    """Narratives: this process's copy while it is fresh, else Redis.
+
+    Old narratives beat an empty list: the copy in memory outlives its TTL when Redis
+    cannot be read or no longer has the key. `CacheUnavailable` when the read failed
+    and nothing is held.
+    """
     # This process's copy while it is fresh, or while Redis is being left alone
     # after a failed read.
     now = time.time()
@@ -7831,7 +7998,6 @@ def get_narratives(force: bool = False, internal: bool = False):
     if held is not None and (
         (now - _narratives_mem["at"]) < LAUNCHES_MEM_TTL or now < _narratives_mem["retry_at"]
     ):
-        increment_metric("cache_hits")
         return held
 
     read_failed = False
@@ -7843,28 +8009,23 @@ def get_narratives(force: bool = False, internal: bool = False):
         read_failed = True
 
     if data and time_str:
-        increment_metric("cache_hits")
         payload = {"descriptions": data, "last_updated": _utc_isoformat(time_str)}
         _narratives_mem.update({"payload": payload, "at": now, "retry_at": 0.0})
         return payload
 
-    # What this process generated itself, then whatever it last served: old
-    # narratives beat an empty list.
+    # What this process generated itself, then whatever it last served.
     cached_narratives = _local_cache["launch_narratives"]
     last_updated = _local_cache["last_updated"]
 
     if cached_narratives and last_updated:
-        increment_metric("cache_hits")
         return {"descriptions": cached_narratives, "last_updated": _utc_isoformat(last_updated)}
 
     if held is not None:
         _narratives_mem["retry_at"] = now + CACHE_READ_BACKOFF_SEC
-        increment_metric("cache_hits")
         return held
 
-    increment_metric("cache_misses")
     if read_failed:
-        raise _cache_unavailable_response("Narratives")
+        raise CacheUnavailable("narratives")
     return {"descriptions": [], "last_updated": None}
 
 
@@ -8088,6 +8249,76 @@ launch_insights.install(app)
 
 _background_enabled = True
 
+# How often a process that is not the background leader checks whether the leader is
+# gone, and re-reads the shared lists so it holds a copy if Redis later fails.
+BACKGROUND_FOLLOWER_INTERVAL_SEC = 30.0
+_background_leader_lock = threading.Lock()
+_background_leader_handle = None
+
+
+def _background_leader_lock_path():
+    import tempfile
+
+    return os.getenv("BACKGROUND_LEADER_LOCK") or os.path.join(
+        tempfile.gettempdir(), "launch-api-background.lock"
+    )
+
+
+def is_background_leader():
+    """True in the one process on this dyno that runs the scheduled jobs.
+
+    uvicorn starts several worker processes (four on this dyno size) and each used to
+    run every job: four copies of each Launch Library, weather, Grok and Space-Track
+    call, and four push senders acting on the same tokens. The first process to take
+    an exclusive lock on a file in the dyno's temp directory is the leader. The OS
+    drops the lock when that process exits, and another process takes it at its next
+    check. The lock is local to the dyno, so it does not depend on Redis; across
+    dynos the Redis single-flight locks still apply.
+    """
+    global _background_leader_handle
+    with _background_leader_lock:
+        if _background_leader_handle is not None:
+            return True
+        try:
+            import fcntl
+        except ImportError:
+            return True
+        handle = None
+        try:
+            handle = open(_background_leader_lock_path(), "a+")
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if handle is not None:
+                handle.close()
+            return False
+        _background_leader_handle = handle
+        print(f"Background leader: pid {os.getpid()}")
+        return True
+
+
+def _release_background_leadership_for_tests():
+    global _background_leader_handle
+    with _background_leader_lock:
+        if _background_leader_handle is not None:
+            _background_leader_handle.close()
+            _background_leader_handle = None
+
+
+def warm_shared_lists():
+    """Read the launch list and narratives from Redis into this process's memory.
+
+    A process that does not run the scheduled jobs still has to hold a copy of each:
+    it is what the list routes serve when Redis cannot be read. No upstream calls.
+    """
+    try:
+        _load_launch_payload(force=False)
+    except Exception as e:
+        print(f"Launch list warm error: {e}")
+    try:
+        _load_narratives_payload()
+    except Exception as e:
+        print(f"Narratives warm error: {e}")
+
 
 def start_background_worker():
     def run():
@@ -8096,10 +8327,18 @@ def start_background_worker():
         if not _background_enabled:
             return
 
+        # Every process: the Starship poller elects its own leader through Redis and
+        # the others pull what the leader publishes.
         try:
             starship_http.start_starship_poller()
         except Exception as e:
             print(f"Starship poller start error: {e}")
+
+        while _background_enabled and not is_background_leader():
+            warm_shared_lists()
+            time.sleep(BACKGROUND_FOLLOWER_INTERVAL_SEC)
+        if not _background_enabled:
+            return
 
         # Initial bootstrap (populate empty caches)
         print("Starting background worker bootstrap...")
