@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
@@ -961,6 +962,8 @@ def _reset_cache_coordination_for_tests():
     _launches_mem["at"] = 0.0
     _launches_mem["retry_at"] = 0.0
     _narratives_mem.update({"payload": None, "at": 0.0, "retry_at": 0.0})
+    with _prebuilt_json_lock:
+        _prebuilt_json.clear()
     _ll_backoff["until"] = 0.0
     _raw_launch_mem.clear()
     with _user_weather_lock:
@@ -4808,6 +4811,42 @@ def _read_satellite_http(group: str):
     return _load_satellite_http(group, None)
 
 
+# The big list responses are the same bytes for every client until their data changes,
+# but each request used to rebuild, JSON-encode and gzip them: about 60 ms of CPU for
+# the 170 KB launch list on this dyno, which capped it near 120 requests a second
+# while the small routes managed 600. The bytes are now built once per version of the
+# data and for at most PREBUILT_JSON_MAX_AGE_SEC, so a change made in place still
+# shows up within that time.
+PREBUILT_JSON_MAX_AGE_SEC = 15
+_prebuilt_json = {}
+_prebuilt_json_lock = threading.Lock()
+
+
+def _prebuilt_json_response(name, version, build, request: Request):
+    """The JSON for `build()`, serialized and gzipped once per `(version, time window)`."""
+    version = (version, int(time.time() // PREBUILT_JSON_MAX_AGE_SEC))
+    entry = _prebuilt_json.get(name)
+    if entry is None or entry[0] != version:
+        with _prebuilt_json_lock:
+            entry = _prebuilt_json.get(name)
+            if entry is None or entry[0] != version:
+                body = json.dumps(
+                    jsonable_encoder(build()),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                entry = (version, body, gzip.compress(body, compresslevel=6))
+                _prebuilt_json[name] = entry
+    headers = {}
+    content = entry[1]
+    if _client_accepts_gzip(request):
+        # The gzip middleware leaves an already encoded response alone, Vary included.
+        headers = {"Content-Encoding": "gzip", "Vary": "Accept-Encoding"}
+        content = entry[2]
+    return Response(content=content, media_type="application/json", headers=headers)
+
+
 def _client_accepts_gzip(request: Request) -> bool:
     if request is None:
         return False
@@ -5203,6 +5242,7 @@ def get_launches(
     full: bool = False,
     slim: bool = False,
     internal: bool = False,
+    request: Request = None,
 ):
     """Launch list. Default payload is slim (no raw LL `all_data`).
 
@@ -5224,17 +5264,31 @@ def get_launches(
         increment_metric("cache_misses")
     if full or include_raw:
         return _hydrate_launch_payload(data)
+    if request is not None and not force:
+        return _prebuilt_json_response(
+            "launches_slim",
+            (id(data), data.get("last_updated")),
+            lambda: _slim_launch_payload(data, keep_next_trajectory=True),
+            request,
+        )
     return _slim_launch_payload(data, keep_next_trajectory=True)
 
 
 @app.get("/launches_slim")
-def get_launches_slim(force: bool = False, internal: bool = False):
+def get_launches_slim(force: bool = False, internal: bool = False, request: Request = None):
     """Dashboard-optimized endpoint that strips 'all_data'."""
     if not internal:
         increment_metric("total_requests")
     data = _load_launch_payload_or_503(force)
     if data and (data.get("upcoming") or data.get("previous")):
         increment_metric("cache_hits" if not force else "cache_misses")
+        if request is not None and not force:
+            return _prebuilt_json_response(
+                "launches_slim",
+                (id(data), data.get("last_updated")),
+                lambda: _slim_launch_payload(data, keep_next_trajectory=True),
+                request,
+            )
         return _slim_launch_payload(data, keep_next_trajectory=True)
     increment_metric("cache_misses")
     return {"upcoming": [], "previous": [], "last_updated": None}
@@ -5410,21 +5464,34 @@ def get_user_weather(lat: float, lon: float, station_id: str = None, internal: b
 
 
 @app.get("/weather_all")
-def get_all_weather(force: bool = False, internal: bool = False):
+def get_all_weather(force: bool = False, internal: bool = False, request: Request = None):
     if not internal:
         increment_metric("total_requests")
     if force:
         increment_metric("cache_misses")
         return refresh_weather_internal(force=True)
 
-    weather_payload = _load_weather_all(force=False)
-    locations = list(weather_payload.get("weather", {}).keys())
-    hit_count = sum(1 for loc in locations if weather_payload["weather"].get(loc, {}).get("last_updated"))
-    if locations and hit_count == len(locations):
+    built = []
+
+    def assemble():
+        weather_payload = _load_weather_all(force=False)
+        locations = list(weather_payload.get("weather", {}).keys())
+        hit_count = sum(1 for loc in locations if weather_payload["weather"].get(loc, {}).get("last_updated"))
+        if locations and hit_count == len(locations):
+            increment_metric("cache_hits")
+        else:
+            increment_metric("cache_misses")
+        built.append(True)
+        return weather_payload
+
+    if request is None:
+        return assemble()
+    # Site weather refreshes every two minutes; assembling it reads Redis once per
+    # site, so the response is reused for PREBUILT_JSON_MAX_AGE_SEC.
+    response = _prebuilt_json_response("weather_all", None, assemble, request)
+    if not built:
         increment_metric("cache_hits")
-    else:
-        increment_metric("cache_misses")
-    return weather_payload
+    return response
 
 
 @app.get(
