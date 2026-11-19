@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 import requests
@@ -35,7 +36,7 @@ NOTIFY_COPY_GROK_TIMEOUT = (3.0, 12.0)
 NOTIFY_TITLE_MAX = 50
 NOTIFY_BODY_MAX = 150
 NOTIFY_COPY_CACHE_PREFIX = "notify_copy_v2"
-NotifyEvent = Literal["t1h", "t24h", "scrub"]
+NotifyEvent = Literal["t5m", "t1h", "t24h", "scrub"]
 
 app = FastAPI(
     title="SpaceX Launch Summary API",
@@ -51,7 +52,7 @@ app = FastAPI(
             "name": "Notifications",
             "description": (
                 "Grok-powered push/local-notification title+body for Launch Buddy "
-                "upcoming-launch alerts (`t24h`, `t1h`, `scrub`). "
+                "upcoming-launch alerts (`t24h`, `t1h`, `t5m`, `scrub`). "
                 "Includes launch probability in the copy when provided."
             ),
         },
@@ -81,6 +82,139 @@ app = FastAPI(
 )
 
 
+# Redis connections this dyno may hold in total. The add-on (Heroku Redis Mini) allows
+# 20 and reports 18 as usable. The default client pool has no useful cap (100), and
+# every thread that talks to Redis at the same moment opens its own connection: a
+# burst of 40+ concurrent requests went past the limit, after which every read failed.
+# The budget leaves room for one-off dynos and for the old and new release overlapping
+# during a deploy. With more than one dyno, lower it so that dynos x budget stays
+# under the limit.
+REDIS_CONNECTION_BUDGET = max(1, int(os.getenv("REDIS_CONNECTION_BUDGET", "12")))
+
+
+def _redis_connections_per_process(workers=None, budget=None):
+    """This process's share of the budget.
+
+    uvicorn starts WEB_CONCURRENCY worker processes (the Python buildpack sets it from
+    the dyno's memory, 4 on Standard-2X), and each has its own pool.
+    """
+    if workers is None:
+        try:
+            workers = int(os.getenv("WEB_CONCURRENCY") or 1)
+        except ValueError:
+            workers = 1
+    budget = REDIS_CONNECTION_BUDGET if budget is None else budget
+    return max(2, budget // max(1, workers))
+
+
+# A thread that cannot get one of these waits for REDIS_POOL_WAIT_SEC; Redis calls take
+# milliseconds, so the wait is short.
+REDIS_MAX_CONNECTIONS = max(
+    1, int(os.getenv("REDIS_MAX_CONNECTIONS") or _redis_connections_per_process())
+)
+REDIS_POOL_WAIT_SEC = float(os.getenv("REDIS_POOL_WAIT_SEC", "2"))
+REDIS_CONNECT_TIMEOUT_SEC = float(os.getenv("REDIS_CONNECT_TIMEOUT_SEC", "3"))
+REDIS_SOCKET_TIMEOUT_SEC = float(os.getenv("REDIS_SOCKET_TIMEOUT_SEC", "10"))
+# Heroku Redis drops a connection idle for 300s; a ping before reuse replaces a dead
+# one instead of failing the command that got it.
+REDIS_HEALTH_CHECK_SEC = 30
+
+
+def _build_redis_client(url):
+    """A client on a bounded, blocking pool with timeouts and one quick retry."""
+    from redis.backoff import ExponentialBackoff
+    from redis.retry import Retry
+
+    kwargs = {
+        "decode_responses": True,
+        "max_connections": REDIS_MAX_CONNECTIONS,
+        "timeout": REDIS_POOL_WAIT_SEC,
+        "socket_connect_timeout": REDIS_CONNECT_TIMEOUT_SEC,
+        "socket_timeout": REDIS_SOCKET_TIMEOUT_SEC,
+        "socket_keepalive": True,
+        "health_check_interval": REDIS_HEALTH_CHECK_SEC,
+        # The library default retries three times with up to 10s of backoff, which
+        # holds a request thread for the whole wait when Redis is down.
+        "retry": Retry(ExponentialBackoff(cap=0.25, base=0.05), 1),
+        "retry_on_error": [redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+    }
+    if url.startswith("rediss://"):
+        # Heroku Redis often requires SSL with cert verification disabled for self-signed certs
+        kwargs["ssl_cert_reqs"] = None
+    pool = redis.BlockingConnectionPool.from_url(url, **kwargs)
+    return redis.Redis(connection_pool=pool)
+
+
+class _RedisCircuit:
+    """Fail Redis calls at once while Redis is unreachable.
+
+    Without this, every call during an outage waits out a connect timeout, and with
+    40 request threads doing that the whole server stalls. After a connection or
+    timeout error the circuit opens for `cooldown` seconds: calls raise immediately
+    and callers use their in-memory copies. One call is then let through as a probe;
+    its success closes the circuit. Other errors (a bad command, a decode failure)
+    do not count.
+    """
+
+    def __init__(self, client, cooldown=None):
+        self._client = client
+        self._cooldown = REDIS_CIRCUIT_COOLDOWN_SEC if cooldown is None else cooldown
+        self._lock = threading.Lock()
+        self._open_until = 0.0
+        self._probing = False
+
+    def is_open(self):
+        return self._open_until > 0.0
+
+    def _enter(self):
+        with self._lock:
+            if self._open_until == 0.0:
+                return
+            if time.time() < self._open_until or self._probing:
+                raise redis.exceptions.ConnectionError("Redis circuit open")
+            self._probing = True
+
+    def _succeeded(self):
+        with self._lock:
+            self._open_until = 0.0
+            self._probing = False
+
+    def _failed(self):
+        with self._lock:
+            if self._open_until == 0.0:
+                print(f"Redis unreachable; skipping it for {self._cooldown:g}s at a time")
+            self._open_until = time.time() + self._cooldown
+            self._probing = False
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def guarded(*args, **kwargs):
+            self._enter()
+            try:
+                result = attr(*args, **kwargs)
+            except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
+                self._failed()
+                raise
+            except Exception:
+                self._succeeded()
+                raise
+            self._succeeded()
+            return result
+
+        return guarded
+
+
+REDIS_CIRCUIT_COOLDOWN_SEC = float(os.getenv("REDIS_CIRCUIT_COOLDOWN_SEC", "5"))
+
+
+# The launch list is ~170 KB of JSON and the satellite catalogs run to megabytes;
+# compressed they are a fraction of that on a phone's connection.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+
+
 # Redis Configuration for persistence across Heroku builds
 def get_redis_client():
     # List of potential Redis environment variables used by various Heroku add-ons
@@ -91,20 +225,28 @@ def get_redis_client():
         if key.startswith("HEROKU_REDIS_") and key.endswith("_URL"):
             redis_env_vars.append(key)
 
+    unreachable = None
     for var in redis_env_vars:
         url = os.getenv(var)
         if url:
+            client = None
             try:
-                # Heroku Redis often requires SSL with cert verification disabled for self-signed certs
-                if url.startswith("rediss://"):
-                    client = redis.from_url(url, decode_responses=True, ssl_cert_reqs=None)
-                else:
-                    client = redis.from_url(url, decode_responses=True)
+                client = _RedisCircuit(_build_redis_client(url))
                 client.ping()
-                print(f"Connected to Redis via {var}")
+                print(f"Connected to Redis via {var} (pool cap {REDIS_MAX_CONNECTIONS})")
                 return client
             except Exception as e:
                 print(f"Failed to connect to Redis via {var}: {e}")
+                if unreachable is None and client is not None and isinstance(
+                    e, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)
+                ):
+                    unreachable = client
+
+    if unreachable is not None:
+        # Configured but down at boot. Returning None here used to leave the process
+        # without Redis until its next restart; keep the client so it reconnects.
+        print("Redis is configured but unreachable at startup; will keep retrying.")
+        return unreachable
 
     print("No Redis instance found or connection failed. Using in-memory fallback (non-persistent).")
     return None
@@ -195,6 +337,11 @@ HOT_RAW_KEY_PREFIX = "launch_raw_hot_v1:"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
 HOT_RAW_TTL = int(os.getenv("HOT_RAW_TTL", "20"))  # 20–30s stale-while-revalidate for ?hot=1
 LAUNCHES_MEM_TTL = 45  # seconds; avoid repeatedly inflating the Redis blob
+# After a failed read of a list cache, serve the copy in memory for this long before
+# asking Redis again.
+CACHE_READ_BACKOFF_SEC = 10.0
+# Sent with a 503 when a list cannot be read and this process holds no copy of it.
+CACHE_UNAVAILABLE_RETRY_AFTER = "15"
 WEATHER_CACHE_TTL = 300
 WEATHER_DEBOUNCE_SEC = 20.0
 REFRESH_LOCK_TTL = 90
@@ -419,7 +566,8 @@ _weather_last_result = None
 _local_weather_store = {}
 _local_raw_launches = {}
 _local_hot_raw = {}
-_launches_mem = {"data": None, "at": 0.0}
+_launches_mem = {"data": None, "at": 0.0, "retry_at": 0.0}
+_narratives_mem = {"payload": None, "at": 0.0, "retry_at": 0.0}
 _local_satellites = {}
 _local_satellite_http = {}
 _satellite_flights = {}
@@ -806,6 +954,11 @@ def _reset_cache_coordination_for_tests():
         _local_notify_copy.clear()
     _launches_mem["data"] = None
     _launches_mem["at"] = 0.0
+    _launches_mem["retry_at"] = 0.0
+    _narratives_mem.update({"payload": None, "at": 0.0, "retry_at": 0.0})
+    _raw_launch_mem.clear()
+    with _metric_pending_lock:
+        _metric_pending.clear()
     _local_satellites.clear()
     _local_satellite_http.clear()
     with _satellite_refresh_lock:
@@ -871,6 +1024,35 @@ def _keep_list_trajectory(bucket, idx, upcoming_count):
     return False
 
 
+# The launch records clients opened most recently, so a failed Redis read does not
+# turn each detail request into a live Launch Library GET (which then rate-limits).
+RAW_LAUNCH_MEM_MAX = 48
+# A record fetched live for a launch with no stored copy is reused for this long.
+RAW_LAUNCH_LIVE_TTL = 300
+_raw_launch_mem = {}
+_raw_launch_mem_lock = threading.Lock()
+
+
+def _remember_raw_launch(launch_id, raw, ttl=None):
+    if not launch_id or raw is None:
+        return
+    key = str(launch_id)
+    expires_at = time.time() + ttl if ttl else None
+    with _raw_launch_mem_lock:
+        _raw_launch_mem.pop(key, None)
+        _raw_launch_mem[key] = (raw, expires_at)
+        while len(_raw_launch_mem) > RAW_LAUNCH_MEM_MAX:
+            _raw_launch_mem.pop(next(iter(_raw_launch_mem)))
+
+
+def _remembered_raw_launch(launch_id):
+    with _raw_launch_mem_lock:
+        entry = _raw_launch_mem.get(str(launch_id))
+    if entry and (entry[1] is None or entry[1] > time.time()):
+        return entry[0]
+    return None
+
+
 def _store_raw_launch(launch_id, raw):
     """Persist one launch's raw LL blob outside the slim list cache."""
     if not launch_id or raw is None:
@@ -888,7 +1070,11 @@ def _get_raw_launch(launch_id):
     if r:
         cached = get_cached_data(f"{RAW_LAUNCH_KEY_PREFIX}{key}")
         if cached is not None:
+            _remember_raw_launch(key, cached)
             return cached
+        held = _remembered_raw_launch(key)
+        if held is not None:
+            return held
     return _local_raw_launches.get(key)
 
 
@@ -903,13 +1089,17 @@ def _hot_flight(launch_id):
 
 
 def _read_hot_raw(launch_id):
-    """Return the short-TTL hot blob if it is still fresh."""
+    """Return the short-TTL hot blob if it is still fresh.
+
+    This process's copy first: it is as fresh as the Redis one, and without it a
+    failed Redis read sent every ?hot=1 poll to Launch Library.
+    """
     key = str(launch_id)
-    if r:
-        return get_cached_data(f"{HOT_RAW_KEY_PREFIX}{key}")
     entry = _local_hot_raw.get(key)
     if entry and entry[1] > time.time():
         return entry[0]
+    if r:
+        return get_cached_data(f"{HOT_RAW_KEY_PREFIX}{key}")
     return None
 
 
@@ -1002,9 +1192,10 @@ def _serve_cached_or_live_raw(launch_id):
             leftover = launch.get("all_data")
             if leftover:
                 return leftover, True
-            details = fetch_launch_details(launch_id)
-            return details, False
+            break
     details = fetch_launch_details(launch_id)
+    if details and r:
+        _remember_raw_launch(launch_id, details, ttl=RAW_LAUNCH_LIVE_TTL)
     return details, False
 
 
@@ -1078,7 +1269,20 @@ def _hydrate_launch_payload(data):
 def _remember_launches(data):
     _launches_mem["data"] = data
     _launches_mem["at"] = time.time()
+    _launches_mem["retry_at"] = 0.0
     return data
+
+
+class CacheUnavailable(Exception):
+    """A list cache could not be read and this process holds no copy of it."""
+
+
+def _cache_unavailable_response(what):
+    return HTTPException(
+        status_code=503,
+        detail=f"{what} temporarily unavailable",
+        headers={"Retry-After": CACHE_UNAVAILABLE_RETRY_AFTER},
+    )
 
 
 def _set_weather_loc(location, data, ttl=WEATHER_CACHE_TTL):
@@ -2354,18 +2558,51 @@ def reset_stuck_seeding():
             print(f"Error resetting stuck seeding: {e}")
 
 
-def increment_metric(field):
-    """Increment a metric in Redis or memory."""
-    if r:
-        try:
-            r.hincrby(METRICS_KEY, field, 1)
-            return
-        except Exception as e:
-            print(f"Redis error in increment_metric: {e}")
+# Counters are added up in memory and written to Redis every METRICS_FLUSH_SEC, so a
+# request does not make two Redis round trips just to be counted.
+METRICS_FLUSH_SEC = 10.0
+_metric_pending = {}
+_metric_pending_lock = threading.Lock()
+_metric_last_flush = 0.0
 
-    # Fallback to in-memory
-    if field in _local_metrics:
-        _local_metrics[field] += 1
+
+def increment_metric(field):
+    """Count one event. Redis sees it at the next flush; memory at once without Redis."""
+    global _metric_last_flush
+    if not r:
+        if field in _local_metrics:
+            _local_metrics[field] += 1
+        return
+    now = time.time()
+    with _metric_pending_lock:
+        _metric_pending[field] = _metric_pending.get(field, 0) + 1
+        due = now - _metric_last_flush >= METRICS_FLUSH_SEC
+        if due:
+            _metric_last_flush = now
+    if due:
+        flush_metrics()
+
+
+def flush_metrics():
+    """Write the buffered counters to Redis. Counts are kept for the next try on failure."""
+    global _metric_last_flush
+    if not r:
+        return
+    with _metric_pending_lock:
+        batch = dict(_metric_pending)
+        _metric_pending.clear()
+        _metric_last_flush = time.time()
+    written = set()
+    try:
+        for field, amount in batch.items():
+            r.hincrby(METRICS_KEY, field, amount)
+            written.add(field)
+    except Exception as e:
+        print(f"Redis error in flush_metrics: {e}")
+        with _metric_pending_lock:
+            for field, amount in batch.items():
+                if field not in written:
+                    _metric_pending[field] = _metric_pending.get(field, 0) + amount
 
 
 def record_snapshot():
@@ -2431,6 +2668,7 @@ def get_metrics(include_history=True, range_type="1h"):
     }
 
     if r:
+        flush_metrics()
         try:
             data = r.hgetall(METRICS_KEY)
             if data:
@@ -2908,7 +3146,10 @@ def fallback_notify_copy(payload: NotifyCopyRequest):
     prob_bit = f" {phrase}." if phrase else ""
     pad_bit = f" from {pad}" if pad else ""
 
-    if payload.event == "t1h":
+    if payload.event == "t5m":
+        title = f"T-5m: {mission}"
+        body = f"{mission} lifts off in 5 minutes{pad_bit}.{prob_bit}"
+    elif payload.event == "t1h":
         title = f"T-1h: {mission}"
         body = f"{mission} T-1 hour{pad_bit}.{prob_bit}"
     elif payload.event == "t24h":
@@ -2925,6 +3166,11 @@ def fallback_notify_copy(payload: NotifyCopyRequest):
 
 
 def _event_prompt_instructions(event):
+    if event == "t5m":
+        return (
+            "t5m: liftoff is five minutes away; this is the last call to tune in. "
+            "Include the mission short name and a T-5m feel. Include the pad if it fits."
+        )
     if event == "t1h":
         return (
             "t1h: convey T-1 hour urgency without sounding like spam. "
@@ -2972,6 +3218,7 @@ Rules:
 Examples:
 - t24h: {{"title":"T-24h: Starlink 10-20","body":"Falcon 9 is on the 24-hour clock at SLC-40. Weather 80% go."}}
 - t1h: {{"title":"T-1h: Starlink 10-20","body":"T-1 hour at SLC-40. 70% go — last coffee before liftoff."}}
+- t5m: {{"title":"T-5m: Starlink 10-20","body":"Five minutes to liftoff at SLC-40. 70% go — eyes up."}}
 - scrub: {{"title":"Hold: Starlink 10-20","body":"Go became Hold at SLC-40. Plans changed; weather 40%."}}
 """
 
@@ -4842,7 +5089,7 @@ def get_launches(
     """
     if not internal:
         increment_metric("total_requests")
-    data = _load_launch_payload(force)
+    data = _load_launch_payload_or_503(force)
     if data and (data.get("upcoming") or data.get("previous")):
         increment_metric("cache_hits" if not force else "cache_misses")
     else:
@@ -4857,7 +5104,7 @@ def get_launches_slim(force: bool = False, internal: bool = False):
     """Dashboard-optimized endpoint that strips 'all_data'."""
     if not internal:
         increment_metric("total_requests")
-    data = _load_launch_payload(force)
+    data = _load_launch_payload_or_503(force)
     if data and (data.get("upcoming") or data.get("previous")):
         increment_metric("cache_hits" if not force else "cache_misses")
         return _slim_launch_payload(data, keep_next_trajectory=True)
@@ -6998,21 +7245,48 @@ def _repair_mismatched_trajectory(data):
     return True
 
 
-def _load_launch_payload(force=False):
+def _load_launch_payload(force=False, strict=False):
+    """The launch list: this process's copy while it is fresh, else Redis.
+
+    A copy in memory outlives its TTL when Redis cannot be read or no longer has the
+    key: an old list is right far more often than an empty one, which clients show as
+    "no upcoming launches". With nothing in memory either, the result is an empty
+    payload, or `CacheUnavailable` when `strict` and the read itself failed, so a
+    public route can answer 503 and not claim that nothing is scheduled.
+    """
     now = time.time()
-    if not force and _launches_mem["data"] is not None and (now - _launches_mem["at"]) < LAUNCHES_MEM_TTL:
-        return _launches_mem["data"]
+    held = _launches_mem["data"]
+    if not force and held is not None:
+        if (now - _launches_mem["at"]) < LAUNCHES_MEM_TTL or now < _launches_mem["retry_at"]:
+            return held
+    read_failed = False
     if force:
         data = refresh_launches_internal()
     else:
-        data = get_cached_data(LAUNCHES_CACHE_KEY)
+        try:
+            data = get_cached_data(LAUNCHES_CACHE_KEY, strict=True)
+        except Exception:
+            data = None
+            read_failed = True
         if data:
             _sanitize_launch_list_cache(data, persist=True)
     if not data:
+        if held is not None:
+            _launches_mem["retry_at"] = now + CACHE_READ_BACKOFF_SEC
+            return held
+        if strict and read_failed:
+            raise CacheUnavailable("launches")
         return {"upcoming": [], "previous": [], "last_updated": None}
     if _repair_mismatched_trajectory(data):
         set_cached_data(LAUNCHES_CACHE_KEY, data)
     return _remember_launches(data)
+
+
+def _load_launch_payload_or_503(force=False):
+    try:
+        return _load_launch_payload(force, strict=True)
+    except CacheUnavailable:
+        raise _cache_unavailable_response("Launch list")
 
 
 def _slim_launch_payload(data, keep_next_trajectory=True):
@@ -7550,15 +7824,32 @@ def get_narratives(force: bool = False, internal: bool = False):
         descriptions = refresh_narratives_internal()
         return {"descriptions": descriptions, "last_updated": _utc_isoformat()}
 
-    # Try to get from Redis
-    data = get_cached_data(CACHE_KEY)
-    time_str = get_cached_data(CACHE_TIME_KEY)
+    # This process's copy while it is fresh, or while Redis is being left alone
+    # after a failed read.
+    now = time.time()
+    held = _narratives_mem["payload"]
+    if held is not None and (
+        (now - _narratives_mem["at"]) < LAUNCHES_MEM_TTL or now < _narratives_mem["retry_at"]
+    ):
+        increment_metric("cache_hits")
+        return held
+
+    read_failed = False
+    try:
+        data = get_cached_data(CACHE_KEY, strict=True)
+        time_str = get_cached_data(CACHE_TIME_KEY, strict=True)
+    except Exception:
+        data = time_str = None
+        read_failed = True
 
     if data and time_str:
         increment_metric("cache_hits")
-        return {"descriptions": data, "last_updated": _utc_isoformat(time_str)}
+        payload = {"descriptions": data, "last_updated": _utc_isoformat(time_str)}
+        _narratives_mem.update({"payload": payload, "at": now, "retry_at": 0.0})
+        return payload
 
-    # Fallback to in-memory
+    # What this process generated itself, then whatever it last served: old
+    # narratives beat an empty list.
     cached_narratives = _local_cache["launch_narratives"]
     last_updated = _local_cache["last_updated"]
 
@@ -7566,7 +7857,14 @@ def get_narratives(force: bool = False, internal: bool = False):
         increment_metric("cache_hits")
         return {"descriptions": cached_narratives, "last_updated": _utc_isoformat(last_updated)}
 
+    if held is not None:
+        _narratives_mem["retry_at"] = now + CACHE_READ_BACKOFF_SEC
+        increment_metric("cache_hits")
+        return held
+
     increment_metric("cache_misses")
+    if read_failed:
+        raise _cache_unavailable_response("Narratives")
     return {"descriptions": [], "last_updated": None}
 
 
@@ -7621,6 +7919,7 @@ def post_notify_copy(payload: NotifyCopyRequest, response: Response):
     Supported `event` values:
     - **t24h** — 24 hours before NET
     - **t1h** — one hour before NET
+    - **t5m** — five minutes before NET
     - **scrub** — launch scrubbed / delayed / hold (status change)
 
     Always mentions `probability` when provided (e.g. `70% go` or `weather 40%`).
@@ -7666,6 +7965,36 @@ def get_notify_copy(
         probability=probability,
         previous_status=previous_status,
     )
+
+
+@app.get("/health")
+def get_health(response: Response):
+    """Whether this process can serve the app's core data, for uptime checks.
+
+    Answers from memory only (no Redis or upstream call), so it stays cheap and
+    still answers when a dependency is down. 503 when this process holds no launch
+    list at all, which is the state clients show as "no upcoming launches".
+    """
+    now = time.time()
+    held = _launches_mem["data"]
+    launches_held = bool(isinstance(held, dict) and (held.get("upcoming") or held.get("previous")))
+    redis_state = "none"
+    if r:
+        is_open = getattr(r, "is_open", None)
+        redis_state = "down" if callable(is_open) and is_open() else "ok"
+    status = "ok"
+    if redis_state == "down":
+        status = "degraded"
+    if not launches_held:
+        status = "unavailable"
+        response.status_code = 503
+    return {
+        "status": status,
+        "redis": redis_state,
+        "launches_held": launches_held,
+        "launches_age_sec": round(now - _launches_mem["at"], 1) if launches_held else None,
+        "launches_last_updated": held.get("last_updated") if launches_held else None,
+    }
 
 
 @app.get("/metrics")

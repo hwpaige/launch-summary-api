@@ -535,7 +535,7 @@ class ExistingShapeRegressionTests(unittest.TestCase):
     def test_route_table_only_adds_the_insights_path(self):
         paths = {getattr(route, "path", None) for route in app.app.routes}
         paths.discard(None)
-        self.assertEqual(paths - self.FROZEN_PATHS, {"/launch/{ll2_launch_id}/insights"})
+        self.assertEqual(paths - self.FROZEN_PATHS, {"/launch/{ll2_launch_id}/insights", "/health"})
         self.assertTrue(self.FROZEN_PATHS <= paths)
 
     def test_existing_endpoints_keep_their_shapes(self):
