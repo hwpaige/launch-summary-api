@@ -961,6 +961,7 @@ def _reset_cache_coordination_for_tests():
     _launches_mem["at"] = 0.0
     _launches_mem["retry_at"] = 0.0
     _narratives_mem.update({"payload": None, "at": 0.0, "retry_at": 0.0})
+    _ll_backoff["until"] = 0.0
     _raw_launch_mem.clear()
     with _user_weather_lock:
         _user_weather_mem.clear()
@@ -3587,9 +3588,31 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
     }
 
 
+# After Launch Library answers 429, single-launch fetches are skipped for this long
+# (or for its Retry-After, up to the cap). The hot path asked again every ~20s while
+# limited, which kept the limit in force; callers already serve their stored copy when
+# this returns None.
+LL_RATE_LIMIT_BACKOFF_SEC = 300.0
+LL_RATE_LIMIT_BACKOFF_MAX_SEC = 900.0
+_ll_backoff = {"until": 0.0}
+
+
+def _note_ll_rate_limit(response):
+    wait = LL_RATE_LIMIT_BACKOFF_SEC
+    try:
+        wait = float(response.headers.get("Retry-After"))
+    except (TypeError, ValueError, AttributeError):
+        pass
+    wait = max(30.0, min(wait, LL_RATE_LIMIT_BACKOFF_MAX_SEC))
+    _ll_backoff["until"] = time.time() + wait
+    print(f"Launch Library rate limit: no single-launch fetches for {wait:.0f}s")
+
+
 def fetch_launch_details(launch_id: str):
     """Fetch one launch from Launch Library using the same auth token as list fetch."""
     if not launch_id:
+        return None
+    if time.time() < _ll_backoff["until"]:
         return None
     increment_metric("api_calls")
     url = f"https://ll.thespacedevs.com/2.3.0/launches/{launch_id}/"
@@ -3601,6 +3624,9 @@ def fetch_launch_details(launch_id: str):
         except Exception:
             # Fallback for SSL issues
             response = requests.get(url, headers=headers, timeout=10, verify=False)
+        if getattr(response, "status_code", None) == 429:
+            _note_ll_rate_limit(response)
+            return None
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -3953,6 +3979,47 @@ def is_nws_fresh(timestamp_str):
         return False
 
 
+# Half-size of the box searched for reporting stations, in nautical miles.
+METAR_SEARCH_RADIUS_NM = 50.0
+METAR_SEARCH_MAX_STATIONS = 3
+
+
+def nearest_metar_stations(lat, lon, limit=METAR_SEARCH_MAX_STATIONS):
+    """ICAO ids of the stations reporting nearest to a point, nearest first.
+
+    aviationweather.gov dropped the `radialDistance` search this used (it answers 400),
+    after which every nearby-weather request without a station silently got
+    Brownsville's METAR. The bounding-box search is the supported one; it returns each
+    station's coordinates, so the nearest is chosen here.
+    """
+    try:
+        lat = float(lat)
+        lon = float(lon)
+        dlat = METAR_SEARCH_RADIUS_NM / 60.0
+        dlon = dlat / max(0.2, math.cos(math.radians(lat)))
+        box = f"{lat - dlat:.3f},{lon - dlon:.3f},{lat + dlat:.3f},{lon + dlon:.3f}"
+        res = requests.get(
+            f"https://aviationweather.gov/api/data/metar?bbox={box}&format=json", timeout=5
+        )
+        if res.status_code != 200:
+            return []
+        found = {}
+        for row in res.json() or []:
+            sid = row.get("icaoId")
+            slat, slon = row.get("lat"), row.get("lon")
+            if not sid or not isinstance(slat, (int, float)) or not isinstance(slon, (int, float)):
+                continue
+            north = (slat - lat) * 60.0
+            east = (slon - lon) * 60.0 * math.cos(math.radians(lat))
+            distance = math.hypot(north, east)
+            if sid not in found or distance < found[sid]:
+                found[sid] = distance
+        return [sid for sid, _distance in sorted(found.items(), key=lambda item: item[1])[:limit]]
+    except Exception as e:
+        print(f"METAR station search error: {e}")
+        return []
+
+
 def fetch_weather(location: str = None, station_id: str = None, lat: float = None, lon: float = None):
     """Fetch METAR weather data with multiple station fallbacks and Open-Meteo backup."""
     increment_metric("api_calls")
@@ -3967,20 +4034,15 @@ def fetch_weather(location: str = None, station_id: str = None, lat: float = Non
             if coords:
                 lat, lon = coords['lat'], coords['lon']
     elif lat is not None and lon is not None:
-        try:
-            # Search within 50nm
-            search_url = f"https://aviationweather.gov/api/data/metar?radialDistance={lat},{lon};50&format=raw"
-            res = requests.get(search_url, timeout=5)
-            if res.status_code == 200 and res.text.strip():
-                # Take the first METAR station ID
-                first_metar = res.text.strip().split('\n')[0]
-                found_sid = first_metar.split(' ')[0]
-                stations_to_try = [found_sid]
-        except Exception:
-            pass
+        stations_to_try = nearest_metar_stations(lat, lon)
 
     if not stations_to_try:
-        if location == 'Starbase' or not location:
+        if lat is not None and lon is not None and not location:
+            # A place with no reporting station nearby: leave the list empty so the
+            # modeled weather for these coordinates is used below. This used to fall
+            # through to Brownsville's station for every such request.
+            pass
+        elif location == 'Starbase' or not location:
             stations_to_try = ['KBRO']
             if not lat: lat, lon = LOCATION_COORDS['Starbase']['lat'], LOCATION_COORDS['Starbase']['lon']
         else:
