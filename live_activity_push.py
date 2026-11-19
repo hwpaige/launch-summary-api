@@ -28,6 +28,7 @@ App Store) or ``sandbox`` (Xcode installs).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -58,8 +59,13 @@ UNCONFIRMED_END_SEC = 30 * 60
 # 9 Payload Deployed.
 FLOWN_STATUS_IDS = (3, 4, 6, 7, 9)
 NET_CHANGE_SEC = 2
+# v1 kept every record in one JSON value: each change rewrote the whole document, two
+# processes registering at once could drop a token, and the list was capped at 40.
 STORE_KEY = "live_activity_push_v1"
-MAX_RECORDS = 40
+# v2: one Redis hash field per activity, or one SQL row when DATABASE_URL is set.
+HASH_KEY = "live_activity_push_v2"
+SQL_TABLE = "live_activity_tokens"
+MAX_RECORDS = 5000
 DROP_AFTER_NET_SEC = 12 * 3600
 
 _lock = threading.Lock()
@@ -121,7 +127,10 @@ def start_worker() -> None:
             return
         while getattr(app_module, "_background_enabled", False):
             try:
-                tick()
+                # One sender per dyno: every uvicorn worker used to run this loop
+                # and decide on the same tokens.
+                if app_module.is_background_leader():
+                    tick()
             except Exception as exc:
                 print(f"Live Activity push tick error: {exc}")
             time.sleep(15)
@@ -153,10 +162,9 @@ def missing_apns_env() -> list:
 def upsert_token(*, token: str, launch_id: str, activity_id: str, net: Optional[str], content_state: Optional[dict]) -> dict:
     now = time.time()
     with _lock:
-        records = _load()
-        previous = records.get(activity_id) or {}
+        previous = _get(activity_id) or {}
         content = content_state if isinstance(content_state, dict) else previous.get("content_state")
-        records[activity_id] = {
+        record = {
             "token": token,
             "launch_id": launch_id,
             "activity_id": activity_id,
@@ -167,9 +175,8 @@ def upsert_token(*, token: str, launch_id: str, activity_id: str, net: Optional[
             "pushed_net_unix": previous.get("pushed_net_unix"),
             "pushed_dismiss_unix": previous.get("pushed_dismiss_unix"),
         }
-        _prune(records, now)
-        _save(records)
-        return dict(records[activity_id])
+        _put(activity_id, record)
+        return dict(record)
 
 
 def delete_token(activity_id: str) -> bool:
@@ -177,11 +184,7 @@ def delete_token(activity_id: str) -> bool:
     if not activity_id:
         return False
     with _lock:
-        records = _load()
-        removed = records.pop(activity_id, None) is not None
-        if removed:
-            _save(records)
-        return removed
+        return _remove(activity_id)
 
 
 def decide(record: dict, launch: Optional[dict], raw: Optional[dict], now: datetime) -> Optional[dict]:
@@ -487,10 +490,9 @@ def tick(
     send = sender or send_push
     sent = 0
     with _lock:
-        activity_ids = list(_load().keys())
-    for activity_id in activity_ids:
-        with _lock:
-            record = dict((_load().get(activity_id) or {}))
+        snapshot = {key: dict(value) for key, value in _load().items() if isinstance(value, dict)}
+        _prune(snapshot)
+    for activity_id, record in snapshot.items():
         if not record:
             continue
         launch, raw = find(record.get("launch_id"))
@@ -506,9 +508,8 @@ def tick(
         kind = action["kind"]
         if kind == "note":
             with _lock:
-                current = _load()
-                _note_action_applied(current, activity_id, action)
-                _save(current)
+                _note_action_applied(snapshot, activity_id, action)
+                _put(activity_id, snapshot[activity_id])
             continue
         if kind == "drop":
             delete_token(activity_id)
@@ -521,14 +522,13 @@ def tick(
             continue
         if result.get("sent") and kind == "update":
             with _lock:
-                current = _load()
-                stored = current.get(activity_id)
+                stored = snapshot.get(activity_id)
                 if stored:
                     stored["pushed_net_unix"] = action.get("net_unix")
                     stored["pushed_dismiss_unix"] = action.get("dismiss_unix")
                     stored["content_state"] = action["payload"]["aps"]["content-state"]
                     stored["updated_at"] = time.time()
-                    _save(current)
+                    _put(activity_id, stored)
     return {"push": "enabled", "sent": sent, "stored": _count()}
 
 
@@ -854,32 +854,249 @@ def _app():
     return app_module
 
 
-def _load() -> dict:
-    app_module = _app()
-    if app_module is not None:
+class _RedisHashStore:
+    """One hash field per activity: a change touches that activity only."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def all(self) -> dict:
+        records = {}
+        for activity_id, blob in (self._client.hgetall(HASH_KEY) or {}).items():
+            try:
+                record = json.loads(blob)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(record, dict):
+                records[str(activity_id)] = record
+        return records
+
+    def get(self, activity_id: str) -> Optional[dict]:
+        blob = self._client.hget(HASH_KEY, activity_id)
+        if not blob:
+            return None
         try:
-            cached = app_module.get_cached_data(STORE_KEY)
-        except Exception:
-            cached = None
-        if isinstance(cached, dict):
-            _memory.clear()
-            _memory.update(cached)
+            record = json.loads(blob)
+        except (TypeError, ValueError):
+            return None
+        return record if isinstance(record, dict) else None
+
+    def put(self, activity_id: str, record: dict) -> None:
+        self._client.hset(HASH_KEY, activity_id, json.dumps(record))
+
+    def delete(self, activity_id: str) -> bool:
+        return bool(self._client.hdel(HASH_KEY, activity_id))
+
+
+class SqlTokenStore:
+    """One row per activity in a SQL table, so tokens survive a Redis restart.
+
+    The Redis plan in use keeps nothing on disk: a restart or failover there used to
+    forget every registered Live Activity. `connect` returns a DB-API connection
+    (psycopg for Postgres; sqlite3 in tests) and `placeholder` is its parameter mark.
+    One connection, reopened after any error.
+    """
+
+    def __init__(self, connect: Callable, placeholder: str = "%s"):
+        self._connect = connect
+        self._placeholder = placeholder
+        self._lock = threading.Lock()
+        self._connection = None
+
+    def _run(self, sql: str, params: tuple = (), fetch: bool = False):
+        sql = sql.replace("?", self._placeholder)
+        with self._lock:
+            for attempt in (1, 2):
+                try:
+                    if self._connection is None:
+                        self._connection = self._connect()
+                        cursor = self._connection.cursor()
+                        cursor.execute(
+                            f"CREATE TABLE IF NOT EXISTS {SQL_TABLE} ("
+                            "activity_id TEXT PRIMARY KEY, "
+                            "record TEXT NOT NULL, "
+                            "updated_at DOUBLE PRECISION NOT NULL)"
+                        )
+                        self._connection.commit()
+                    cursor = self._connection.cursor()
+                    cursor.execute(sql, params)
+                    result = cursor.fetchall() if fetch else cursor.rowcount
+                    self._connection.commit()
+                    return result
+                except Exception:
+                    try:
+                        if self._connection is not None:
+                            self._connection.close()
+                    except Exception:
+                        pass
+                    self._connection = None
+                    if attempt == 2:
+                        raise
+
+    def all(self) -> dict:
+        records = {}
+        for activity_id, blob in self._run(f"SELECT activity_id, record FROM {SQL_TABLE}", fetch=True):
+            try:
+                record = json.loads(blob)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(record, dict):
+                records[str(activity_id)] = record
+        return records
+
+    def get(self, activity_id: str) -> Optional[dict]:
+        rows = self._run(
+            f"SELECT record FROM {SQL_TABLE} WHERE activity_id = ?", (activity_id,), fetch=True
+        )
+        if not rows:
+            return None
+        try:
+            record = json.loads(rows[0][0])
+        except (TypeError, ValueError):
+            return None
+        return record if isinstance(record, dict) else None
+
+    def put(self, activity_id: str, record: dict) -> None:
+        self._run(
+            f"INSERT INTO {SQL_TABLE} (activity_id, record, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (activity_id) DO UPDATE SET record = excluded.record, updated_at = excluded.updated_at",
+            (activity_id, json.dumps(record), float(record.get("updated_at") or time.time())),
+        )
+
+    def delete(self, activity_id: str) -> bool:
+        return bool(self._run(f"DELETE FROM {SQL_TABLE} WHERE activity_id = ?", (activity_id,)))
+
+
+_sql_store: Optional[SqlTokenStore] = None
+_sql_store_checked = False
+_migrated: set = set()
+
+
+def _database_url() -> str:
+    return _env("LIVE_ACTIVITY_DATABASE_URL") or _env("DATABASE_URL")
+
+
+def _configured_sql_store() -> Optional[SqlTokenStore]:
+    """The SQL store when a database URL is set and its driver is installed."""
+    global _sql_store, _sql_store_checked
+    if _sql_store_checked:
+        return _sql_store
+    _sql_store_checked = True
+    url = _database_url()
+    if not url:
+        return None
+    try:
+        import psycopg
+    except ImportError:
+        print("Live Activity tokens: DATABASE_URL is set but psycopg is not installed; using Redis")
+        return None
+    _sql_store = SqlTokenStore(lambda: psycopg.connect(url, connect_timeout=5))
+    print("Live Activity tokens: stored in the SQL database")
+    return _sql_store
+
+
+def _redis_store() -> Optional[_RedisHashStore]:
+    app_module = _app()
+    client = getattr(app_module, "r", None) if app_module is not None else None
+    return _RedisHashStore(client) if client else None
+
+
+def _store():
+    return _configured_sql_store() or _redis_store()
+
+
+def _migrate_once(store, records: dict) -> dict:
+    """Copy records from the store this one replaces, once.
+
+    A marker in Redis records that the copy happened, so an activity that has since
+    ended is not brought back from the old copy at the next restart. Without Redis
+    there is nothing to copy from.
+    """
+    name = type(store).__name__
+    if name in _migrated:
+        return records
+    _migrated.add(name)
+    app_module = _app()
+    client = getattr(app_module, "r", None) if app_module is not None else None
+    if not client:
+        return records
+    marker = f"{HASH_KEY}:migrated:{name}"
+    if client.get(marker):
+        return records
+    older: dict = {}
+    legacy = app_module.get_cached_data(STORE_KEY, strict=True)
+    if isinstance(legacy, dict):
+        older.update({str(k): v for k, v in legacy.items() if isinstance(v, dict)})
+    if isinstance(store, SqlTokenStore):
+        older.update(_RedisHashStore(client).all())
+    moved = 0
+    for activity_id, record in older.items():
+        if activity_id not in records:
+            store.put(activity_id, record)
+            records[activity_id] = record
+            moved += 1
+    client.set(marker, str(int(time.time())))
+    if moved:
+        print(f"Live Activity tokens: moved {moved} record(s) into {name}")
+    return records
+
+
+def _load() -> dict:
+    """Every stored record. This process's last copy when the store cannot be read."""
+    store = _store()
+    if store is not None:
+        try:
+            records = store.all()
+        except Exception as exc:
+            print(f"Live Activity token read error: {exc}")
+            return _memory
+        try:
+            records = _migrate_once(store, records)
+        except Exception as exc:
+            # Try again at the next read: the old copy could not be read just now.
+            _migrated.discard(type(store).__name__)
+            print(f"Live Activity token migration error: {exc}")
+        _memory.clear()
+        _memory.update(records)
     return _memory
 
 
-def _save(records: dict) -> None:
-    snapshot = {}
-    for key, value in records.items():
-        snapshot[key] = dict(value) if isinstance(value, dict) else value
-    _memory.clear()
-    _memory.update(snapshot)
-    app_module = _app()
-    if app_module is None:
+def _get(activity_id: str) -> Optional[dict]:
+    """One record, without reading every other one."""
+    store = _store()
+    if store is not None:
+        try:
+            record = store.get(activity_id)
+        except Exception as exc:
+            print(f"Live Activity token read error: {exc}")
+        else:
+            if record is not None:
+                _memory[activity_id] = record
+            return record
+    return _memory.get(activity_id)
+
+
+def _put(activity_id: str, record: dict) -> None:
+    _memory[activity_id] = dict(record)
+    store = _store()
+    if store is None:
         return
     try:
-        app_module.set_cached_data(STORE_KEY, snapshot)
+        store.put(activity_id, record)
     except Exception as exc:
         print(f"Live Activity token store error: {exc}")
+
+
+def _remove(activity_id: str) -> bool:
+    removed = _memory.pop(activity_id, None) is not None
+    store = _store()
+    if store is None:
+        return removed
+    try:
+        return store.delete(activity_id) or removed
+    except Exception as exc:
+        print(f"Live Activity token store error: {exc}")
+        return removed
 
 
 def _count() -> int:
@@ -887,19 +1104,23 @@ def _count() -> int:
         return len(_load())
 
 
-def _prune(records: dict, now: float) -> None:
+def _prune(records: dict) -> None:
+    """Drop the oldest registrations past MAX_RECORDS."""
     if len(records) <= MAX_RECORDS:
         return
     ordered = sorted(records.items(), key=lambda item: item[1].get("registered_at") or 0)
     for activity_id, _record in ordered[: len(records) - MAX_RECORDS]:
         records.pop(activity_id, None)
-    _ = now
+        _remove(activity_id)
 
 
 def reset_for_tests() -> None:
-    global _logged_disabled
+    global _logged_disabled, _sql_store, _sql_store_checked
     with _lock:
         _memory.clear()
+        _migrated.clear()
+        _sql_store = None
+        _sql_store_checked = False
         _logged_disabled = False
         _jwt_cache["token"] = None
         _jwt_cache["exp"] = 0
