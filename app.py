@@ -86,8 +86,10 @@ app = FastAPI(
 # 20 and reports 18 as usable. The default client pool has no useful cap (100), and
 # every thread that talks to Redis at the same moment opens its own connection: a
 # burst of 40+ concurrent requests went past the limit, after which every read failed.
-# With more than one dyno, lower this so that dynos x budget stays under the limit.
-REDIS_CONNECTION_BUDGET = max(1, int(os.getenv("REDIS_CONNECTION_BUDGET", "16")))
+# The budget leaves room for one-off dynos and for the old and new release overlapping
+# during a deploy. With more than one dyno, lower it so that dynos x budget stays
+# under the limit.
+REDIS_CONNECTION_BUDGET = max(1, int(os.getenv("REDIS_CONNECTION_BUDGET", "12")))
 
 
 def _redis_connections_per_process(workers=None, budget=None):
