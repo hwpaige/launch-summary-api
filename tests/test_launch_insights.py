@@ -629,5 +629,258 @@ class ExistingShapeRegressionTests(unittest.TestCase):
         self.assertEqual(set(calendar.json()), {"calendar", "timezone", "last_updated"})
 
 
+def _warm_id(index):
+    return f"00000000-0000-4000-8000-{index:012d}"
+
+
+def _warm_net(index):
+    return f"2026-12-{index + 1:02d}T00:00:00Z"
+
+
+def _warm_detail(launch_id, serial, net):
+    return {
+        "id": launch_id,
+        "name": f"Falcon 9 Block 5 | {serial}",
+        "net": net,
+        "mission": {"name": serial, "orbit": {"name": "Low Earth Orbit", "abbrev": "LEO"}},
+        "rocket": {
+            "configuration": {"name": "Falcon 9", "apogee": 200},
+            "launcher_stage": [{
+                "type": "Core",
+                "launcher_flight_number": 2,
+                "launcher": {
+                    "serial_number": serial,
+                    "flights": 2,
+                    "successful_landings": 1,
+                    "attempted_landings": 1,
+                    "first_launch_date": "2024-01-01T00:00:00Z",
+                },
+                "landing": {
+                    "attempt": True,
+                    "success": None,
+                    "downrange_distance": 600,
+                    "type": {"name": "Autonomous Spaceport Drone Ship", "abbrev": "ASDS"},
+                    "landing_location": {
+                        "name": "A Shortfall of Gravitas",
+                        "abbrev": "ASOG",
+                        "successful_landings": 10,
+                        "attempted_landings": 10,
+                    },
+                },
+            }],
+        },
+        "timeline": [{"type": {"abbrev": "Liftoff"}, "relative_time": "PT0S"}],
+    }
+
+
+def _store_upcoming(launches):
+    app._launches_mem["data"] = {
+        "upcoming": launches,
+        "previous": [],
+        "last_updated": "2026-11-17T00:00:00Z",
+    }
+    app._launches_mem["at"] = 1_000_000_000
+
+
+class _LockRedis:
+    """Just enough Redis for the warm lock and the shared insights budget."""
+
+    def __init__(self):
+        self.store = {}
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+    def get(self, key):
+        value = self.store.get(key)
+        return None if value is None else str(value)
+
+    def delete(self, key):
+        self.store.pop(key, None)
+        return 1
+
+    def incr(self, key):
+        self.store[key] = int(self.store.get(key) or 0) + 1
+        return self.store[key]
+
+    def decr(self, key):
+        self.store[key] = int(self.store.get(key) or 0) - 1
+        return self.store[key]
+
+    def expire(self, key, ttl):
+        return True
+
+    def setex(self, key, ttl, value):
+        self.store[key] = value
+        return True
+
+
+class InsightsWarmTests(unittest.TestCase):
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+        self._redis = app.r
+        app.r = None
+        self._warm_env = os.environ.get("INSIGHTS_WARM")
+        os.environ["INSIGHTS_WARM"] = "1"
+        launch_insights.LL_HOURLY_BUDGET = 15
+        launch_insights.LL_RESERVED_FOR_MAIN_FEED = 12
+        launch_insights.reset_state()
+
+    def tearDown(self):
+        app.r = self._redis
+        if self._warm_env is None:
+            os.environ.pop("INSIGHTS_WARM", None)
+        else:
+            os.environ["INSIGHTS_WARM"] = self._warm_env
+        launch_insights.LL_HOURLY_BUDGET = int(os.getenv("LL_HOURLY_BUDGET", "15"))
+        launch_insights.LL_RESERVED_FOR_MAIN_FEED = int(os.getenv("LL_RESERVED_FOR_MAIN_FEED", "12"))
+        launch_insights.reset_state()
+
+    def _upcoming(self, count):
+        """Stored newest-first so a warmer that skips the sort warms the wrong launch."""
+        launches = []
+        details = {}
+        soonest_first = []
+        for index in range(count):
+            launch_id = _warm_id(index)
+            net = _warm_net(index)
+            serial = f"B{index:04d}"
+            soonest_first.append(launch_id)
+            launches.append({
+                "id": launch_id,
+                "name": f"Falcon 9 | {serial}",
+                "mission": serial,
+                "net": net,
+                "rocket": "Falcon 9",
+                "orbit": "LEO",
+            })
+            details[launch_id] = _warm_detail(launch_id, serial, net)
+        launches.reverse()
+        _store_upcoming(launches)
+        return soonest_first, details
+
+    def _router(self, details, calls):
+        def fake(url, params, timeout):
+            calls.append((url, params.get("serial_number")))
+            serial = params.get("serial_number")
+            if serial:
+                return 200, {"count": 0, "results": []}
+            for launch_id, record in details.items():
+                if launch_id in url:
+                    return 200, record
+            return 404, None
+
+        return fake
+
+    def test_warmer_spends_only_the_surplus_and_starts_with_the_soonest(self):
+        soonest_first, details = self._upcoming(12)
+        calls = []
+        with patch.object(launch_insights, "_ll_get", side_effect=self._router(details, calls)), \
+             patch.object(app, "fetch_launches", side_effect=AssertionError("list refresh")), \
+             patch.object(app, "_load_launch_payload", side_effect=AssertionError("list load")):
+            result = launch_insights.warm_upcoming_insights()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["considered"], 12)
+        self.assertEqual(launch_insights._allowance(), 3)
+        self.assertEqual(len(calls), 3)
+        self.assertLess(len(calls), 12)
+        detail_ids = [launch_id for url, serial in calls if not serial for launch_id in soonest_first if launch_id in url]
+        self.assertEqual(detail_ids, soonest_first[:2])
+        self.assertEqual(calls[1][1], "B0000")
+        for launch_id in soonest_first[2:]:
+            self.assertFalse(any(launch_id in url for url, _serial in calls))
+        self.assertLessEqual(launch_insights._budget.remaining() + len(calls), launch_insights._allowance())
+        self.assertEqual(launch_insights._budget.remaining(), 0)
+
+    def test_warmer_covers_twelve_and_leaves_the_thirteenth(self):
+        soonest_first, details = self._upcoming(13)
+        launch_insights.LL_HOURLY_BUDGET = 100
+        launch_insights.LL_RESERVED_FOR_MAIN_FEED = 0
+        calls = []
+        with patch.object(launch_insights, "_ll_get", side_effect=self._router(details, calls)):
+            result = launch_insights.warm_upcoming_insights()
+        detail_ids = [launch_id for url, serial in calls if not serial for launch_id in soonest_first if launch_id in url]
+        self.assertEqual(detail_ids, soonest_first[:12])
+        self.assertEqual(result["considered"], 12)
+        self.assertNotIn(soonest_first[12], detail_ids)
+        self.assertFalse(any(soonest_first[12] in url for url, _serial in calls))
+
+    def test_repeated_serial_reuses_the_booster_cache(self):
+        first, second = _warm_id(0), _warm_id(1)
+        _store_upcoming([
+            {"id": second, "name": "Later", "mission": "Later", "net": _warm_net(1), "rocket": "Falcon 9"},
+            {"id": first, "name": "Sooner", "mission": "Sooner", "net": _warm_net(0), "rocket": "Falcon 9"},
+        ])
+        app._local_raw_launches[first] = _warm_detail(first, "B1067", _warm_net(0))
+        app._local_raw_launches[second] = _warm_detail(second, "B1067", _warm_net(1))
+        launch_insights.LL_HOURLY_BUDGET = 15
+        launch_insights.LL_RESERVED_FOR_MAIN_FEED = 0
+        calls = []
+
+        def fake(url, params, timeout):
+            calls.append(params.get("serial_number"))
+            if params.get("serial_number"):
+                return 200, {"results": []}
+            raise AssertionError("detail fetch")
+
+        with patch.object(launch_insights, "_ll_get", side_effect=fake):
+            launch_insights.warm_upcoming_insights()
+        self.assertEqual(calls, ["B1067"])
+
+    def test_fresh_launch_is_skipped(self):
+        soonest_first, details = self._upcoming(2)
+        launch_id = soonest_first[0]
+        record = details[launch_id]
+        doc = launch_insights._sections_from_record(record, launch_id)
+        doc["_detailed"] = True
+        launch_insights._cache_set(launch_insights._launch_key(launch_id), doc, launch_insights.LAUNCH_TTL)
+        launch_insights._cache_set(
+            launch_insights._booster_key("B0000"),
+            {"flights": []},
+            launch_insights.BOOSTER_TTL,
+        )
+        calls = []
+        with patch.object(launch_insights, "_ll_get", side_effect=self._router(details, calls)):
+            result = launch_insights.warm_upcoming_insights()
+        self.assertGreaterEqual(result["skipped"], 1)
+        self.assertFalse(any(launch_id in url for url, _serial in calls))
+        self.assertTrue(any(soonest_first[1] in url for url, _serial in calls))
+
+    def test_disabled_flag_makes_no_upstream_calls(self):
+        self._upcoming(4)
+        os.environ["INSIGHTS_WARM"] = "0"
+        with patch.object(launch_insights, "_ll_get", side_effect=AssertionError("LL2")):
+            result = launch_insights.warm_upcoming_insights()
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["warmed"], 0)
+
+    def test_other_worker_holding_the_lock_does_not_fetch(self):
+        self._upcoming(4)
+        fake = _LockRedis()
+        fake.store[launch_insights.WARM_LOCK_KEY] = "other-dyno"
+        app.r = fake
+        with patch.object(launch_insights, "_ll_get", side_effect=AssertionError("LL2")):
+            result = launch_insights.warm_upcoming_insights()
+        self.assertEqual(result["status"], "busy")
+        self.assertEqual(fake.store[launch_insights.WARM_LOCK_KEY], "other-dyno")
+
+    def test_finished_pass_releases_the_lock(self):
+        self._upcoming(1)
+        fake = _LockRedis()
+        app.r = fake
+        launch_insights.LL_HOURLY_BUDGET = 15
+        launch_insights.LL_RESERVED_FOR_MAIN_FEED = 12
+        with patch.object(launch_insights, "_ll_get", return_value=(429, None)):
+            first = launch_insights.warm_upcoming_insights()
+            second = launch_insights.warm_upcoming_insights()
+        self.assertEqual(first["status"], "ok")
+        self.assertNotIn(launch_insights.WARM_LOCK_KEY, fake.store)
+        self.assertEqual(second["status"], "ok")
+
+
 if __name__ == "__main__":
     unittest.main()
