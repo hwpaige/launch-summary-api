@@ -157,3 +157,45 @@ class LaunchLibraryBudgetTests(unittest.TestCase):
         self.assertEqual(app._hot_raw_ttl({"net": iso(-20 * 60)}, now=now), app.HOT_RAW_TTL)
         self.assertEqual(app._hot_raw_ttl({"net": "not a date"}, now=now), app.HOT_RAW_TTL)
         self.assertEqual(app._hot_raw_ttl(None, now=now), app.HOT_RAW_TTL)
+
+
+class NetPrecisionTests(unittest.TestCase):
+    """How firm a launch's date is, passed through from Launch Library."""
+
+    def _parsed(self, **extra):
+        launch = {
+            "id": "precision-1",
+            "name": "Falcon 9 Block 5 | Amazon Leo (LF-04)",
+            "net": "2026-12-31T00:00:00Z",
+            "status": {"id": 2, "name": "To Be Determined"},
+        }
+        launch.update(extra)
+        return app.parse_launch_data(launch)
+
+    def test_month_precision_reaches_the_launch(self):
+        parsed = self._parsed(net_precision={"id": 7, "name": "Month", "abbrev": "M"})
+        self.assertEqual(parsed["net_precision"], "Month")
+        self.assertEqual(parsed["net_precision_id"], 7)
+
+    def test_missing_or_malformed_precision_is_none(self):
+        for value in (None, "Month", 7, {}, {"name": "  "}, {"id": "7"}, {"id": True}):
+            parsed = self._parsed(net_precision=value)
+            self.assertIsNone(parsed["net_precision"], value)
+            self.assertIsNone(parsed["net_precision_id"], value)
+        self.assertIsNone(self._parsed()["net_precision"])
+
+    def test_weather_concerns_are_text_or_none(self):
+        self.assertEqual(
+            self._parsed(weather_concerns=" Cumulus Cloud Rule ")["weather_concerns"],
+            "Cumulus Cloud Rule",
+        )
+        for value in (None, "", "   ", 5):
+            self.assertIsNone(self._parsed(weather_concerns=value)["weather_concerns"], value)
+
+    def test_the_slim_list_keeps_the_new_fields(self):
+        parsed = self._parsed(net_precision={"id": 7, "name": "Month"}, weather_concerns="Winds")
+        slim = app._slim_launch(parsed)
+        self.assertEqual(slim["net_precision"], "Month")
+        self.assertEqual(slim["net_precision_id"], 7)
+        self.assertEqual(slim["weather_concerns"], "Winds")
+        self.assertNotIn("all_data", slim)

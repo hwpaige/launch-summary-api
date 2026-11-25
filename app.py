@@ -3615,11 +3615,38 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
         'probability': launch.get('probability'),
         'holdreason': launch.get('holdreason'),
         'failreason': launch.get('failreason'),
+        # How firm the NET is. A launch dated to a month or a quarter carries a
+        # placeholder day and time; clients need this to avoid showing them.
+        'net_precision': _net_precision_name(launch),
+        'net_precision_id': _net_precision_id(launch),
+        'weather_concerns': _clean_text(launch.get('weather_concerns')),
         # Captured for GET /launches compatibility, then moved to a side store
         # so the Redis list cache / slim / dashboard hot path stays small.
         'all_data': {k: v for k, v in launch.items() if
                      k not in ['vidURLs', 'infoURLs', 'vid_urls', 'info_urls', 'infographic']},
     }
+
+
+def _net_precision(launch):
+    precision = launch.get('net_precision') if isinstance(launch, dict) else None
+    return precision if isinstance(precision, dict) else {}
+
+
+def _net_precision_name(launch):
+    """Launch Library's name for how exact the NET is: "Minute", "Day",
+    "Month", "Quarter 1", "Year"... None when the feed does not say."""
+    name = _net_precision(launch).get('name')
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def _net_precision_id(launch):
+    value = _net_precision(launch).get('id')
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _clean_text(value):
+    """A non-empty stripped string, else None."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 # After Launch Library answers 429, single-launch fetches are skipped for this long
