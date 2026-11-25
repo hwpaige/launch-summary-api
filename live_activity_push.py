@@ -9,8 +9,16 @@ SECO-1, or SECO-2 when that cutoff is at or before T+75; SECO-3 and
 later burns are ignored. A hold is not terminal. Every end is
 re-checked against a fresh Launch Library read before it is sent, so a
 recycled T0 reschedules instead of ending early. An ``update`` goes out
-when NET or that milestone changes. The content state carries
+when NET or that milestone changes, and when a hold starts or clears. A
+countdown that is on screen and whose NET moves more than four hours away
+(a scrub to another day) ends with ``Delayed``. The content state carries
 ``milestoneSource`` (for example ``SECO-2``) with the milestone time.
+
+From T-1h until the flight ends the loop reads the launch from the short
+single-flight copy (90s near liftoff, else 180s) instead of the list
+refresh, which is ten minutes apart. A slip called in the last minutes
+used to arrive after the old T0. The cadence is set by Launch Library's
+hourly request limit; see ``HOT_RAW_TTL`` in ``app.py``.
 
 If the APNs env vars are missing the routes still store tokens and every
 send is a no-op. Nothing in here reads a key file off disk.
@@ -59,6 +67,24 @@ UNCONFIRMED_END_SEC = 30 * 60
 # 9 Payload Deployed.
 FLOWN_STATUS_IDS = (3, 4, 6, 7, 9)
 NET_CHANGE_SEC = 2
+# The app shows the countdown from T-1h.
+START_WINDOW_SEC = 60 * 60
+# A countdown already on screen ends when its NET moves further away than this.
+# Not one hour: the app can only schedule the next countdown while it is open,
+# so ending on a slip inside the launch window would leave a locked phone with
+# no countdown at liftoff. A scrub to another day is well past it.
+DELAYED_END_SEC = 4 * 60 * 60
+DELAYED_LABEL = "Delayed"
+HOLD_LABEL = "On Hold"
+HOLD_ABBREV = "Hold"
+# A hold publishes a far end date so the card never goes stale into ``SECO ✓``.
+# Same horizon as the app: the later of NET+36h and six hours from now.
+HOLD_NET_HORIZON_SEC = 36 * 3600
+HOLD_STALE_HORIZON_SEC = 6 * 3600
+# APNs reasons that mean this token will never work. Anything else is retried.
+DEAD_TOKEN_REASONS = ("BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered", "ExpiredToken")
+SEND_RETRY_BASE_SEC = 15
+SEND_RETRY_MAX_SEC = 600
 # v1 kept every record in one JSON value: each change rewrote the whole document, two
 # processes registering at once could drop a token, and the list was capped at 40.
 STORE_KEY = "live_activity_push_v1"
@@ -72,6 +98,8 @@ _lock = threading.Lock()
 _memory: dict = {}
 _logged_disabled = False
 _jwt_cache: dict = {"token": None, "exp": 0}
+# activity_id -> (failed sends in a row, earliest next attempt). This process only.
+_send_backoff: dict = {}
 
 # SECO-1 / bare SECO only. SECO-2 is selected in ``activity_end_plan``
 # when it falls at or before ``ASCENT_SECO_LIMIT_SEC``. Ship SECO on
@@ -174,6 +202,8 @@ def upsert_token(*, token: str, launch_id: str, activity_id: str, net: Optional[
             "updated_at": now,
             "pushed_net_unix": previous.get("pushed_net_unix"),
             "pushed_dismiss_unix": previous.get("pushed_dismiss_unix"),
+            # The app's own state says whether it shows a hold; ours only until then.
+            "pushed_hold": None if isinstance(content_state, dict) else previous.get("pushed_hold"),
         }
         _put(activity_id, record)
         return dict(record)
@@ -239,45 +269,174 @@ def decide(record: dict, launch: Optional[dict], raw: Optional[dict], now: datet
             "payload": _end_payload(record, launch, content, net, plan, plan["label"], dismissal, now),
         }
 
-    if content is None:
-        return None
-    dismiss_unix = plan["dismissal"].timestamp()
     net_unix = net.timestamp()
+    now_unix = now.timestamp()
     pushed_net = record.get("pushed_net_unix")
     pushed_dismiss = record.get("pushed_dismiss_unix")
-    content_net = _content_net_unix(content)
+    content_net = _content_net_unix(content) if content is not None else None
+    shown_net = pushed_net if pushed_net is not None else content_net
+
+    # The countdown is on screen (its NET was inside T-1h) and the new NET is
+    # hours away: a scrub to another day. Without this the update below left a
+    # 23-hour countdown on the Lock Screen.
+    if (
+        shown_net is not None
+        and not flown
+        and net_unix - now_unix > DELAYED_END_SEC
+        and float(shown_net) - now_unix <= START_WINDOW_SEC
+        and net_unix - float(shown_net) > NET_CHANGE_SEC
+    ):
+        dismissal = now + timedelta(seconds=PROMPT_LINGER_SEC)
+        return {
+            "kind": "end",
+            "priority": 10,
+            "net_unix": net_unix,
+            "dismiss_unix": dismissal.timestamp(),
+            "payload": _end_payload(
+                record, launch, content, net, plan, DELAYED_LABEL, dismissal, now, final_now=True
+            ),
+        }
+
+    if content is None:
+        return None
     content_dismiss = _content_dismiss_unix(content)
-    if pushed_net is None and pushed_dismiss is None:
-        nets_match = content_net is not None and abs(content_net - net_unix) <= NET_CHANGE_SEC
+    first = pushed_net is None and pushed_dismiss is None
+    nets_match = content_net is not None and abs(content_net - net_unix) <= NET_CHANGE_SEC
+    if pushed_net is None:
+        net_changed = not nets_match
+    else:
+        net_changed = abs(float(pushed_net) - net_unix) > NET_CHANGE_SEC
+    shown_hold = record.get("pushed_hold")
+    if shown_hold is None:
+        shown_hold = _content_is_hold(content)
+
+    if _is_hold(status):
+        # A hold changes the status, not the NET. Nothing used to go out, so the
+        # card counted through zero as if the vehicle had left.
+        horizon = _hold_horizon(net, now)
+        if shown_hold and not net_changed:
+            if first:
+                return {
+                    "kind": "note",
+                    "net_unix": net_unix,
+                    "dismiss_unix": content_dismiss if content_dismiss is not None else horizon.timestamp(),
+                    "hold": True,
+                    "payload": {"aps": {"content-state": content}},
+                }
+            return None
+        base = _update_content(content, net, plan)
+        return {
+            "kind": "update",
+            "priority": 10,
+            "net_unix": net_unix,
+            "dismiss_unix": horizon.timestamp(),
+            "hold": True,
+            "store_content": base,
+            "payload": {
+                "aps": {
+                    "timestamp": int(now_unix),
+                    "event": "update",
+                    "stale-date": int(horizon.timestamp()),
+                    "content-state": _hold_content(base, horizon),
+                }
+            },
+        }
+
+    published = _published_end(net, plan, flown or unconfirmed_due)
+    dismiss_unix = published["dismissal"].timestamp()
+    if first and not shown_hold:
         dismiss_match = content_dismiss is not None and abs(content_dismiss - dismiss_unix) <= NET_CHANGE_SEC
         if nets_match and (dismiss_match or content_dismiss is None):
             return {
                 "kind": "note",
                 "net_unix": net_unix,
                 "dismiss_unix": content_dismiss if content_dismiss is not None else dismiss_unix,
+                "hold": False,
                 "payload": {"aps": {"content-state": content}},
             }
-    net_changed = pushed_net is None or abs(float(pushed_net) - net_unix) > NET_CHANGE_SEC
-    if content_net is not None and abs(content_net - net_unix) <= NET_CHANGE_SEC and pushed_net is None:
-        net_changed = False
     dismiss_changed = pushed_dismiss is None or abs(float(pushed_dismiss) - dismiss_unix) > NET_CHANGE_SEC
-    if not net_changed and not dismiss_changed:
+    if not net_changed and not dismiss_changed and not shown_hold:
         return None
-    updated = _update_content(content, net, plan)
+    updated = _update_content(content, net, plan, published)
+    if shown_hold:
+        updated = _release_hold(updated, status)
     return {
         "kind": "update",
         "priority": 10,
         "net_unix": net_unix,
         "dismiss_unix": dismiss_unix,
+        "hold": False,
         "payload": {
             "aps": {
-                "timestamp": int(now.timestamp()),
+                "timestamp": int(now_unix),
                 "event": "update",
                 "stale-date": int(dismiss_unix),
                 "content-state": updated,
             }
         },
     }
+
+
+def _published_end(net: datetime, plan: dict, liftoff_known: bool) -> dict:
+    """The end the card may show now. Same gate as the app.
+
+    Until Launch Library shows the vehicle flew (or T+30 passes with no word),
+    a milestone before T+30 is withheld and T+30 stands in. Publishing
+    ``SECO ✓`` at T+11 on a Go row froze the card into that line while the
+    rocket was still on the pad.
+    """
+    gate = net + timedelta(seconds=UNCONFIRMED_END_SEC)
+    if liftoff_known or plan["milestone"] >= gate:
+        return {"milestone": plan["milestone"], "dismissal": plan["dismissal"]}
+    return {"milestone": gate, "dismissal": gate}
+
+
+def _hold_horizon(net: datetime, now: datetime) -> datetime:
+    return max(
+        net + timedelta(seconds=HOLD_NET_HORIZON_SEC),
+        now + timedelta(seconds=HOLD_STALE_HORIZON_SEC),
+    )
+
+
+def _content_is_hold(content: Optional[dict]) -> bool:
+    if not isinstance(content, dict):
+        return False
+    return "hold" in str(content.get("statusLabel") or "").lower()
+
+
+def _hold_content(content: dict, horizon: datetime) -> dict:
+    """The card for a hold: ``On Hold`` before and after the old T0, no flight end.
+
+    The timeline is left out on purpose. The app re-reads the phase names
+    from it when it decodes the state, which would put ``Engine Chill`` and
+    ``Liftoff`` back over the hold text.
+    """
+    held = dict(content)
+    held.pop("timelineEvents", None)
+    held["phase"] = "scrubbed"
+    held["statusLabel"] = HOLD_LABEL
+    held["preLiftoffLabel"] = HOLD_LABEL
+    held["preLiftoffAbbrev"] = HOLD_ABBREV
+    held["postLiftoffLabel"] = HOLD_LABEL
+    held["postLiftoffAbbrev"] = HOLD_ABBREV
+    held["finalPhaseLabel"] = HOLD_LABEL
+    held["activityMilestone"] = _unix_to_swift(horizon.timestamp())
+    held["activityDismissAt"] = _unix_to_swift(horizon.timestamp())
+    return held
+
+
+def _release_hold(content: dict, status: Optional[str]) -> dict:
+    """Back to a countdown after a hold clears. Hold text must not outlive it."""
+    released = dict(content)
+    if _content_is_hold(released) or released.get("phase") == "scrubbed":
+        released["phase"] = "upcoming"
+        released["statusLabel"] = (status or "").strip() or "Go for Launch"
+    # The app refills these from the timeline, or with its defaults.
+    for label, abbrev in (("preLiftoffLabel", "preLiftoffAbbrev"), ("postLiftoffLabel", "postLiftoffAbbrev")):
+        if "hold" in str(released.get(label) or "").lower():
+            released.pop(label, None)
+            released.pop(abbrev, None)
+    return released
 
 
 def activity_end_plan(net: datetime, events: list) -> dict:
@@ -387,14 +546,28 @@ def send_push(token: str, payload: dict, priority: int = 10) -> dict:
         return {"sent": False, "reason": "transport"}
     if response.status_code == 200:
         return {"sent": True}
-    if response.status_code == 410:
-        return {"sent": False, "unregistered": True}
     body = (response.text or "")[:300]
+    reason = _apns_reason(body)
+    if response.status_code == 410 or reason in DEAD_TOKEN_REASONS:
+        # A debug build's sandbox token sent to production is BadDeviceToken. It
+        # was retried every 15 seconds until twelve hours after NET.
+        print(f"Live Activity APNs {response.status_code}: {reason or 'gone'}; dropping the token")
+        return {"sent": False, "unregistered": True, "status": response.status_code, "reason": reason}
     print(f"Live Activity APNs {response.status_code}: {body}")
-    return {"sent": False, "status": response.status_code}
+    return {"sent": False, "status": response.status_code, "reason": reason}
 
 
-def _end_payload(record, launch, content, net, plan, label, dismissal, now) -> dict:
+def _apns_reason(body: str) -> Optional[str]:
+    try:
+        parsed = json.loads(body or "")
+    except ValueError:
+        return None
+    reason = parsed.get("reason") if isinstance(parsed, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
+def _end_payload(record, launch, content, net, plan, label, dismissal, now, final_now: bool = False) -> dict:
+    """The last card. ``final_now`` shows ``label`` at once instead of at the milestone."""
     state = dict(content or {})
     state["missionName"] = state.get("missionName") or _mission_name(launch, record) or "Launch"
     state["net"] = _unix_to_swift(net.timestamp())
@@ -404,6 +577,14 @@ def _end_payload(record, launch, content, net, plan, label, dismissal, now) -> d
     state["activityMilestone"] = _unix_to_swift(plan["milestone"].timestamp())
     state["activityDismissAt"] = _unix_to_swift(dismissal.timestamp())
     state["milestoneSource"] = plan.get("milestone_source")
+    if final_now:
+        # The milestone is on the new NET, far ahead; the app reveals the final
+        # line there. Put it just behind now and drop the names it would
+        # otherwise re-read from the timeline.
+        state.pop("timelineEvents", None)
+        state["activityMilestone"] = _unix_to_swift(now.timestamp() - 1)
+        for key in ("preLiftoffLabel", "preLiftoffAbbrev", "postLiftoffLabel", "postLiftoffAbbrev"):
+            state[key] = label
     state = _fit_content(state)
     return {
         "aps": {
@@ -416,7 +597,8 @@ def _end_payload(record, launch, content, net, plan, label, dismissal, now) -> d
     }
 
 
-def _update_content(content: dict, net: datetime, plan: dict) -> dict:
+def _update_content(content: dict, net: datetime, plan: dict, published: Optional[dict] = None) -> dict:
+    published = published or plan
     updated = dict(content)
     old_net = _content_net_unix(content)
     if old_net is not None:
@@ -424,8 +606,8 @@ def _update_content(content: dict, net: datetime, plan: dict) -> dict:
         if abs(delta) > 0.5:
             _shift_swift_dates(updated, delta)
     updated["net"] = _unix_to_swift(net.timestamp())
-    updated["activityMilestone"] = _unix_to_swift(plan["milestone"].timestamp())
-    updated["activityDismissAt"] = _unix_to_swift(plan["dismissal"].timestamp())
+    updated["activityMilestone"] = _unix_to_swift(published["milestone"].timestamp())
+    updated["activityDismissAt"] = _unix_to_swift(published["dismissal"].timestamp())
     updated["finalPhaseLabel"] = plan["label"]
     updated["milestoneSource"] = plan.get("milestone_source")
     return _fit_content(updated)
@@ -437,7 +619,13 @@ def _shift_swift_dates(content: dict, delta_unix: float) -> None:
             content[key] = float(content[key]) + delta_unix
     for key in ("timerInterval", "radarLoopInterval"):
         span = content.get(key)
-        if isinstance(span, dict):
+        if isinstance(span, list) and len(span) == 2 and all(
+            isinstance(bound, (int, float)) and not isinstance(bound, bool) for bound in span
+        ):
+            # Swift encodes ClosedRange<Date> as [lower, upper]. This is the shape
+            # the app sends; the keyed form below never came from it.
+            content[key] = [float(span[0]) + delta_unix, float(span[1]) + delta_unix]
+        elif isinstance(span, dict):
             shifted = dict(span)
             for bound in ("lowerBound", "upperBound"):
                 if isinstance(shifted.get(bound), (int, float)):
@@ -459,6 +647,24 @@ def _note_action_applied(records, activity_id, action) -> None:
         return
     stored["pushed_net_unix"] = action.get("net_unix")
     stored["pushed_dismiss_unix"] = action.get("dismiss_unix")
+    stored["pushed_hold"] = action.get("hold")
+
+
+def _wants_fresh(record: dict, launch: Optional[dict], raw: Optional[dict], now: datetime) -> bool:
+    """True from T-1h until the flight ends (or while a hold is up).
+
+    Outside that the ten-minute list copy is close enough. A launch id the
+    server has never seen (a debug simulation) is never worth a Launch Library
+    read: each one was a 404 that counted against the hourly limit.
+    """
+    if launch is None and raw is None:
+        return False
+    net = _launch_net(launch, raw, record)
+    if net is None:
+        return False
+    status, _status_id = _status(launch, raw)
+    after = HOLD_STALE_HORIZON_SEC if _is_hold(status) else HARD_CAP_SEC + FINAL_LINGER_SEC
+    return net.timestamp() - START_WINDOW_SEC <= now.timestamp() <= net.timestamp() + after
 
 
 def tick(
@@ -492,16 +698,34 @@ def tick(
     with _lock:
         snapshot = {key: dict(value) for key, value in _load().items() if isinstance(value, dict)}
         _prune(snapshot)
+    # One lookup per launch per pass, however many phones are watching it.
+    seen: dict = {}
+
+    def resolve(launch_id, want_fresh: bool):
+        entry = seen.get(launch_id)
+        if entry is None:
+            entry = {"data": find(launch_id), "fresh": False}
+            seen[launch_id] = entry
+        if want_fresh and not entry["fresh"] and fresh is not None:
+            entry["fresh"] = True
+            try:
+                entry["data"] = fresh(launch_id)
+            except Exception as exc:
+                print(f"Live Activity fresh lookup error: {exc}")
+        return entry["data"]
+
+    for activity_id in [key for key in _send_backoff if key not in snapshot]:
+        _send_backoff.pop(activity_id, None)
     for activity_id, record in snapshot.items():
         if not record:
             continue
-        launch, raw = find(record.get("launch_id"))
+        launch_id = record.get("launch_id")
+        launch, raw = resolve(launch_id, False)
+        if _wants_fresh(record, launch, raw, moment):
+            launch, raw = resolve(launch_id, True)
         action = decide(record, launch, raw, moment)
-        if action is not None and action["kind"] == "end" and fresh is not None:
-            try:
-                launch, raw = fresh(record.get("launch_id"))
-            except Exception as exc:
-                print(f"Live Activity fresh lookup error: {exc}")
+        if action is not None and action["kind"] == "end" and not seen[launch_id]["fresh"] and fresh is not None:
+            launch, raw = resolve(launch_id, True)
             action = decide(record, launch, raw, moment)
         if action is None:
             continue
@@ -513,20 +737,33 @@ def tick(
             continue
         if kind == "drop":
             delete_token(activity_id)
+            _send_backoff.pop(activity_id, None)
+            continue
+        waiting = _send_backoff.get(activity_id)
+        if waiting is not None and moment.timestamp() < waiting[1]:
             continue
         result = send(record["token"], action["payload"], priority=action.get("priority", 10))
         if result.get("sent"):
             sent += 1
         if result.get("unregistered") or (result.get("sent") and kind == "end"):
             delete_token(activity_id)
+            _send_backoff.pop(activity_id, None)
             continue
-        if result.get("sent") and kind == "update":
+        if not result.get("sent"):
+            # Not a dead token: try again, but not on every pass.
+            failures = (waiting[0] if waiting is not None else 0) + 1
+            delay = min(SEND_RETRY_BASE_SEC * (2 ** failures), SEND_RETRY_MAX_SEC)
+            _send_backoff[activity_id] = (failures, moment.timestamp() + delay)
+            continue
+        _send_backoff.pop(activity_id, None)
+        if kind == "update":
             with _lock:
                 stored = snapshot.get(activity_id)
                 if stored:
                     stored["pushed_net_unix"] = action.get("net_unix")
                     stored["pushed_dismiss_unix"] = action.get("dismiss_unix")
-                    stored["content_state"] = action["payload"]["aps"]["content-state"]
+                    stored["pushed_hold"] = action.get("hold")
+                    stored["content_state"] = action.get("store_content") or action["payload"]["aps"]["content-state"]
                     stored["updated_at"] = time.time()
                     _put(activity_id, stored)
     return {"push": "enabled", "sent": sent, "stored": _count()}
@@ -834,10 +1071,14 @@ def _default_lookup(launch_id):
 
 
 def _default_refresh(launch_id):
-    """Same as the cached lookup, but raw comes from the ~20s hot single-flight."""
+    """Same as the cached lookup, but raw comes from the short-lived hot single-flight."""
     launch, raw = _default_lookup(launch_id)
     app_module = _app()
     if app_module is None or not launch_id:
+        return launch, raw
+    if launch is None and raw is None:
+        # Not a launch this server knows. Asking Launch Library is a 404 that
+        # still counts against the hourly limit.
         return launch, raw
     try:
         hot = app_module._refresh_hot_launch_raw(launch_id)
@@ -1122,5 +1363,6 @@ def reset_for_tests() -> None:
         _sql_store = None
         _sql_store_checked = False
         _logged_disabled = False
+        _send_backoff.clear()
         _jwt_cache["token"] = None
         _jwt_cache["exp"] = 0

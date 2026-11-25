@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 import requests
 import ast
+import collections
 import re
 import redis
 import json
@@ -341,7 +342,17 @@ LAUNCHES_CACHE_KEY = "launches_cache_v2"
 RAW_LAUNCH_KEY_PREFIX = "launch_raw_v2:"
 HOT_RAW_KEY_PREFIX = "launch_raw_hot_v1:"
 CACHE_TTL = 900  # 15 minutes TTL in seconds (aligned with dashboard)
-HOT_RAW_TTL = int(os.getenv("HOT_RAW_TTL", "20"))  # 20–30s stale-while-revalidate for ?hot=1
+# Launch Library allows this account 45 requests an hour, and the two list reads every
+# ten minutes use 12 of them. The old 20s refresh asked for 180 an hour for one launch,
+# so Launch Library refused it from about fifteen minutes in, through liftoff. One
+# launch now costs at most ~29 an hour: every HOT_RAW_TTL_NEAR seconds from T-15 min to
+# T+10 min, every HOT_RAW_TTL seconds otherwise.
+HOT_RAW_TTL = int(os.getenv("HOT_RAW_TTL", "180"))
+HOT_RAW_TTL_NEAR = int(os.getenv("HOT_RAW_TTL_NEAR", "90"))
+HOT_RAW_NEAR_BEFORE_SEC = 15 * 60
+HOT_RAW_NEAR_AFTER_SEC = 10 * 60
+# Single-launch reads allowed in any hour, so the list refresh always has room.
+LL_SINGLE_LAUNCH_BUDGET_PER_HOUR = int(os.getenv("LL_SINGLE_LAUNCH_BUDGET_PER_HOUR", "30"))
 LAUNCHES_MEM_TTL = 45  # seconds; avoid repeatedly inflating the Redis blob
 # After a failed read of a list cache, serve the copy in memory for this long before
 # asking Redis again.
@@ -965,6 +976,9 @@ def _reset_cache_coordination_for_tests():
     with _prebuilt_json_lock:
         _prebuilt_json.clear()
     _ll_backoff["until"] = 0.0
+    with _ll_single_calls_lock:
+        _ll_single_calls.clear()
+    _ll_budget_logged["at"] = 0.0
     _raw_launch_mem.clear()
     with _user_weather_lock:
         _user_weather_mem.clear()
@@ -1115,14 +1129,31 @@ def _read_hot_raw(launch_id):
     return None
 
 
+def _hot_raw_ttl(raw, now=None):
+    """How long one launch's fresh copy is reused before Launch Library is asked again."""
+    net = raw.get("net") if isinstance(raw, dict) else None
+    if isinstance(net, str) and net.strip():
+        try:
+            parsed = datetime.fromisoformat(net.strip().replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            delta = parsed.timestamp() - (time.time() if now is None else now)
+            if -HOT_RAW_NEAR_AFTER_SEC <= delta <= HOT_RAW_NEAR_BEFORE_SEC:
+                return min(HOT_RAW_TTL, HOT_RAW_TTL_NEAR)
+        except ValueError:
+            pass
+    return HOT_RAW_TTL
+
+
 def _write_hot_raw(launch_id, raw):
     """Store hot raw on a short TTL; also refresh the long-lived side store."""
     if not launch_id or raw is None:
         return
     key = str(launch_id)
-    _local_hot_raw[key] = (raw, time.time() + HOT_RAW_TTL)
+    ttl = _hot_raw_ttl(raw)
+    _local_hot_raw[key] = (raw, time.time() + ttl)
     if r:
-        set_cached_data(f"{HOT_RAW_KEY_PREFIX}{key}", raw, ttl=HOT_RAW_TTL)
+        set_cached_data(f"{HOT_RAW_KEY_PREFIX}{key}", raw, ttl=ttl)
     _store_raw_launch(key, raw)
 
 
@@ -1179,7 +1210,7 @@ def _refresh_hot_launch_raw(launch_id):
 
 
 def _get_hot_launch_raw(launch_id):
-    """Stale-while-revalidate: serve fresh ~20s cache, else one LL2 GET.
+    """Stale-while-revalidate: serve the fresh copy (90s near liftoff, else 180s), else one LL2 GET.
 
     Returns (payload, cache_hit).
     """
@@ -3598,6 +3629,27 @@ def parse_launch_data(launch: dict, is_detailed: bool = False) -> dict:
 LL_RATE_LIMIT_BACKOFF_SEC = 300.0
 LL_RATE_LIMIT_BACKOFF_MAX_SEC = 900.0
 _ll_backoff = {"until": 0.0}
+_ll_single_calls = collections.deque()
+_ll_single_calls_lock = threading.Lock()
+_ll_budget_logged = {"at": 0.0}
+
+
+def _ll_single_launch_allowed(now=None):
+    """Count one single-launch read against this hour's budget. False when it is spent."""
+    now = time.time() if now is None else now
+    with _ll_single_calls_lock:
+        while _ll_single_calls and now - _ll_single_calls[0] >= 3600:
+            _ll_single_calls.popleft()
+        if len(_ll_single_calls) >= LL_SINGLE_LAUNCH_BUDGET_PER_HOUR:
+            if now - _ll_budget_logged["at"] >= 600:
+                _ll_budget_logged["at"] = now
+                print(
+                    "Launch Library single-launch budget spent "
+                    f"({LL_SINGLE_LAUNCH_BUDGET_PER_HOUR}/hour); serving stored copies"
+                )
+            return False
+        _ll_single_calls.append(now)
+        return True
 
 
 def _note_ll_rate_limit(response):
@@ -3616,6 +3668,8 @@ def fetch_launch_details(launch_id: str):
     if not launch_id:
         return None
     if time.time() < _ll_backoff["until"]:
+        return None
+    if not _ll_single_launch_allowed():
         return None
     increment_metric("api_calls")
     url = f"https://ll.thespacedevs.com/2.3.0/launches/{launch_id}/"
@@ -5302,7 +5356,7 @@ def get_launch_raw(
         Query(
             description=(
                 "If true, refresh the current/next launch from Launch Library on a "
-                "~20s stale-while-revalidate TTL. Ignored for any other launch id."
+                "short stale-while-revalidate TTL (90s near liftoff, else 180s). Ignored for any other launch id."
             )
         ),
     ] = False,
@@ -5311,7 +5365,7 @@ def get_launch_raw(
     """Return the full Launch Library record for one launch.
 
     Default (no `hot`): leftover side-store / list blob, else one live LL GET.
-    `?hot=1` on the current/next launch only: serve a ~20s hot cache, or one
+    `?hot=1` on the current/next launch only: serve the short-lived hot cache, or one
     single-flight LL2 GET when that cache is stale. Other ids ignore `hot`.
     """
     if not internal:
