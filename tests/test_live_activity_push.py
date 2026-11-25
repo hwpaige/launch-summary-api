@@ -168,7 +168,9 @@ class LiveActivityPushTests(unittest.TestCase):
         record = {"token": "ab" * 16, "launch_id": "launch-1", "content_state": _content(NET, NET + timedelta(minutes=11))}
         launch = {"net": _iso(NET), "status": "Hold", "status_id": 1}
         action = push.decide(record, launch, None, now)
-        self.assertEqual(action["kind"], "note")
+        # The phone is not showing a hold yet, so it is told. It is not ended.
+        self.assertEqual(action["kind"], "update")
+        self.assertEqual(action["payload"]["aps"]["event"], "update")
 
     def test_net_change_sends_update_with_shifted_range(self):
         slipped = NET + timedelta(minutes=20)
@@ -266,7 +268,8 @@ class LiveActivityPushTests(unittest.TestCase):
         os.environ["APNS_TEAM_ID"] = "TEAMID"
         os.environ["APNS_LIVE_ACTIVITY_TOPIC"] = "hp.launchBuddy.push-type.liveactivity"
         push._logged_disabled = False
-        dismiss = NET + timedelta(minutes=11)
+        # A Go row before liftoff: the app publishes T+30, not the T+11 flight end.
+        dismiss = NET + timedelta(minutes=30)
         push.upsert_token(
             token="ab" * 16,
             launch_id="launch-1",
@@ -565,6 +568,289 @@ class LiveActivityPushTests(unittest.TestCase):
             self.assertEqual(plan["label"], label, name)
             self.assertEqual(plan["milestone"], NET + timedelta(seconds=seconds), name)
             self.assertEqual(plan["dismissal"], NET + timedelta(seconds=seconds + 120), name)
+
+    # --- slips, holds and rejected pushes close to liftoff (2026-11-24) ---
+
+    def _app_content(self, net, registered):
+        """What a real phone registers before liftoff: Go, T+30 gate, [lower, upper] ranges."""
+        gate = net + timedelta(minutes=30)
+        return {
+            "missionName": "NROL-136",
+            "net": net.timestamp() - SWIFT,
+            "statusLabel": "Go for Launch",
+            "phase": "upcoming",
+            "timelineEvents": [
+                {"label": "Engine Chill", "relativeSeconds": -420},
+                {"label": "Liftoff", "relativeSeconds": 0},
+                {"label": "Max-Q", "relativeSeconds": 62},
+            ],
+            "preLiftoffLabel": "Engine Chill",
+            "preLiftoffAbbrev": "Eng Chill",
+            "postLiftoffLabel": "Liftoff",
+            "postLiftoffAbbrev": "Liftoff",
+            "timerInterval": [registered.timestamp() - SWIFT, net.timestamp() - SWIFT],
+            "timerCountsDown": True,
+            "activityMilestone": gate.timestamp() - SWIFT,
+            "activityDismissAt": gate.timestamp() - SWIFT,
+            "finalPhaseLabel": "SECO \u2713",
+            "padWeather": {"f": 46, "w": 25},
+        }
+
+    def _settled(self, net, now):
+        """A registration the loop has already looked at once."""
+        return {
+            "token": "ab" * 16,
+            "launch_id": "launch-1",
+            "content_state": self._app_content(net, now - timedelta(minutes=30)),
+            "pushed_net_unix": net.timestamp(),
+            "pushed_dismiss_unix": (net + timedelta(minutes=30)).timestamp(),
+            "pushed_hold": False,
+        }
+
+    def _raw(self, net, status="Go for Launch", status_id=1):
+        return {
+            "net": _iso(net),
+            "status": {"id": status_id, "name": status},
+            "timeline": [
+                {"type": {"abbrev": "Stage 1 Landing"}, "relative_time": "PT7M34S"},
+                {"type": {"abbrev": "SECO-1"}, "relative_time": "PT8M40S"},
+            ],
+        }
+
+    def test_go_row_registration_matches_the_liftoff_gate(self):
+        # The flight end is T+8:40. Before liftoff is known the card must not carry it.
+        now = NET - timedelta(minutes=20)
+        record = {"token": "ab" * 16, "launch_id": "launch-1",
+                  "content_state": self._app_content(NET, now - timedelta(minutes=30))}
+        self.assertEqual(push.decide(record, None, self._raw(NET), now)["kind"], "note")
+
+    def test_liftoff_confirmation_publishes_the_real_end(self):
+        now = NET + timedelta(minutes=1)
+        action = push.decide(self._settled(NET, now), None, self._raw(NET, "Launch in Flight", 6), now)
+        self.assertEqual(action["kind"], "update")
+        expected = (NET + timedelta(seconds=8 * 60 + 40 + 120)).timestamp()
+        self.assertEqual(action["payload"]["aps"]["stale-date"], int(expected))
+        self.assertAlmostEqual(action["payload"]["aps"]["content-state"]["activityDismissAt"], expected - SWIFT, places=3)
+
+    def test_slip_keeps_the_gate_and_shifts_the_apps_range_shape(self):
+        now = NET - timedelta(minutes=20)
+        slipped = NET + timedelta(minutes=15)
+        record = self._settled(NET, now)
+        action = push.decide(record, None, self._raw(slipped), now)
+        self.assertEqual(action["kind"], "update")
+        state = action["payload"]["aps"]["content-state"]
+        self.assertAlmostEqual(state["net"], slipped.timestamp() - SWIFT, places=3)
+        gate = (slipped + timedelta(minutes=30)).timestamp()
+        self.assertAlmostEqual(state["activityDismissAt"], gate - SWIFT, places=3)
+        self.assertEqual(action["payload"]["aps"]["stale-date"], int(gate))
+        before = record["content_state"]["timerInterval"]
+        self.assertEqual(state["timerInterval"], [before[0] + 900, before[1] + 900])
+        self.assertEqual(state["padWeather"], {"f": 46, "w": 25})
+
+    def test_hold_is_pushed_once_and_cleared_when_it_ends(self):
+        now = NET - timedelta(minutes=2)
+        record = self._settled(NET, now)
+        held = self._raw(NET, "On Hold", 5)
+        action = push.decide(record, None, held, now)
+        self.assertEqual(action["kind"], "update")
+        self.assertTrue(action["hold"])
+        state = action["payload"]["aps"]["content-state"]
+        self.assertEqual(state["phase"], "scrubbed")
+        self.assertEqual(state["statusLabel"], "On Hold")
+        self.assertEqual(state["preLiftoffLabel"], "On Hold")
+        self.assertEqual(state["postLiftoffLabel"], "On Hold")
+        self.assertEqual(state["finalPhaseLabel"], "On Hold")
+        self.assertNotIn("timelineEvents", state)
+        # Never stale into a flight-end line while holding.
+        self.assertGreater(action["payload"]["aps"]["stale-date"], (NET + timedelta(hours=5)).timestamp())
+        # The stored copy keeps the countdown so the hold can be undone.
+        self.assertEqual(action["store_content"]["phase"], "upcoming")
+        self.assertIn("timelineEvents", action["store_content"])
+
+        record.update(pushed_hold=True, content_state=action["store_content"])
+        for later in (timedelta(seconds=15), timedelta(minutes=12), timedelta(minutes=45)):
+            self.assertIsNone(push.decide(record, None, held, now + later), later)
+
+        recycled = NET + timedelta(minutes=6)
+        action = push.decide(record, None, self._raw(recycled), NET + timedelta(minutes=1))
+        self.assertEqual(action["kind"], "update")
+        self.assertFalse(action["hold"])
+        state = action["payload"]["aps"]["content-state"]
+        self.assertEqual(state["phase"], "upcoming")
+        self.assertEqual(state["statusLabel"], "Go for Launch")
+        self.assertEqual(state["postLiftoffLabel"], "Liftoff")
+        self.assertAlmostEqual(state["net"], recycled.timestamp() - SWIFT, places=3)
+
+    def test_hold_the_phone_already_shows_is_not_pushed_again(self):
+        now = NET - timedelta(minutes=2)
+        content = self._app_content(NET, now - timedelta(minutes=30))
+        content.update(phase="scrubbed", statusLabel="On Hold", postLiftoffLabel="On Hold", postLiftoffAbbrev="Hold")
+        record = {"token": "ab" * 16, "launch_id": "launch-1", "content_state": content}
+        action = push.decide(record, None, self._raw(NET, "On Hold", 5), now)
+        self.assertEqual(action["kind"], "note")
+        self.assertTrue(action["hold"])
+        # Cleared from the app's own hold state: the hold words go, the app refills them.
+        record.update(pushed_net_unix=NET.timestamp(), pushed_dismiss_unix=action["dismiss_unix"], pushed_hold=True)
+        action = push.decide(record, None, self._raw(NET + timedelta(minutes=10)), now)
+        state = action["payload"]["aps"]["content-state"]
+        self.assertEqual(state["phase"], "upcoming")
+        self.assertNotIn("postLiftoffLabel", state)
+        self.assertEqual(state["preLiftoffLabel"], "Engine Chill")
+
+    def test_new_registration_from_the_app_resets_the_hold_flag(self):
+        push.upsert_token(token="ab" * 16, launch_id="launch-1", activity_id="a1", net=_iso(NET), content_state={"net": 1.0})
+        with push._lock:
+            stored = push._get("a1")
+            stored["pushed_hold"] = True
+            push._put("a1", stored)
+        self.assertTrue(push.upsert_token(token="ab" * 16, launch_id="launch-1", activity_id="a1", net=None, content_state=None)["pushed_hold"])
+        self.assertIsNone(push.upsert_token(token="ab" * 16, launch_id="launch-1", activity_id="a1", net=None, content_state={"net": 2.0})["pushed_hold"])
+
+    def test_scrub_to_another_day_ends_the_countdown(self):
+        now = NET - timedelta(minutes=20)
+        tomorrow = NET + timedelta(hours=24)
+        action = push.decide(self._settled(NET, now), None, self._raw(tomorrow, "To Be Confirmed", 8), now)
+        self.assertEqual(action["kind"], "end")
+        aps = action["payload"]["aps"]
+        self.assertEqual(aps["event"], "end")
+        self.assertEqual(aps["dismissal-date"], int((now + timedelta(seconds=60)).timestamp()))
+        state = aps["content-state"]
+        self.assertEqual(state["statusLabel"], "Delayed")
+        self.assertEqual(state["phase"], "complete")
+        self.assertEqual(state["preLiftoffLabel"], "Delayed")
+        self.assertNotIn("timelineEvents", state)
+        self.assertLess(state["activityMilestone"], now.timestamp() - SWIFT)
+        # Also after the old T0 has passed on the phone.
+        late = NET + timedelta(minutes=3)
+        self.assertEqual(push.decide(self._settled(NET, late), None, self._raw(tomorrow), late)["kind"], "end")
+
+    def test_slip_inside_the_launch_window_keeps_the_countdown(self):
+        # The app cannot bring a countdown back while the phone is locked.
+        now = NET - timedelta(minutes=20)
+        for slip in (timedelta(minutes=35), timedelta(minutes=90), timedelta(hours=3)):
+            action = push.decide(self._settled(NET, now), None, self._raw(NET + slip), now)
+            self.assertEqual(action["kind"], "update", slip)
+        action = push.decide(self._settled(NET, now), None, self._raw(NET + timedelta(hours=5)), now)
+        self.assertEqual(action["kind"], "end")
+
+    def test_countdown_not_on_screen_yet_is_not_ended_by_a_slip(self):
+        # Scheduled to appear at T-1h, five hours away. Its NET moving is not an end.
+        now = NET - timedelta(hours=5)
+        action = push.decide(self._settled(NET, now), None, self._raw(NET + timedelta(hours=24)), now)
+        self.assertEqual(action["kind"], "update")
+        fresh = {"token": "ab" * 16, "launch_id": "launch-1",
+                 "content_state": self._app_content(NET, now)}
+        self.assertEqual(push.decide(fresh, None, self._raw(NET), now)["kind"], "note")
+
+    def test_loop_reads_fresh_data_inside_the_hour(self):
+        self._apns_env()
+        now = NET - timedelta(minutes=20)
+        slipped = NET + timedelta(minutes=15)
+        for activity in ("a1", "a2"):
+            push.upsert_token(token="ab" * 16, launch_id="launch-1", activity_id=activity, net=_iso(NET),
+                              content_state=self._app_content(NET, now - timedelta(minutes=30)))
+        looked, refreshed, sent = [], [], []
+        result = push.tick(
+            now=now,
+            lookup=lambda _id: (looked.append(_id) or ({"net": _iso(NET), "status": "Go for Launch", "status_id": 1}, self._raw(NET))),
+            refresh=lambda _id: (refreshed.append(_id) or (None, self._raw(slipped))),
+            sender=lambda token, payload, priority=10: sent.append(payload) or {"sent": True},
+        )
+        self.assertEqual(result["sent"], 2)
+        # Two phones, one launch: one cached lookup and one fresh read.
+        self.assertEqual(looked, ["launch-1"])
+        self.assertEqual(refreshed, ["launch-1"])
+        self.assertAlmostEqual(sent[0]["aps"]["content-state"]["net"], slipped.timestamp() - SWIFT, places=3)
+
+    def test_loop_uses_the_list_copy_outside_the_hour_and_for_unknown_launches(self):
+        self._apns_env()
+        refreshed = []
+        push.upsert_token(token="ab" * 16, launch_id="launch-1", activity_id="a1", net=_iso(NET),
+                          content_state=self._app_content(NET, NET - timedelta(hours=4)))
+        push.tick(
+            now=NET - timedelta(hours=3),
+            lookup=lambda _id: ({"net": _iso(NET), "status": "Go for Launch", "status_id": 1}, self._raw(NET)),
+            refresh=lambda _id: refreshed.append(_id) or (None, self._raw(NET)),
+            sender=lambda *a, **k: {"sent": True},
+        )
+        self.assertEqual(refreshed, [])
+        # A debug simulation: no list row, no stored record. Inside the hour, still no read.
+        self.assertFalse(push._wants_fresh({"net": _iso(NET)}, None, None, NET - timedelta(minutes=5)))
+        self.assertTrue(push._wants_fresh({}, None, self._raw(NET), NET - timedelta(minutes=5)))
+        self.assertTrue(push._wants_fresh({}, None, self._raw(NET, "On Hold", 5), NET + timedelta(hours=3)))
+        self.assertFalse(push._wants_fresh({}, None, self._raw(NET), NET + timedelta(hours=3)))
+
+    def test_default_refresh_never_asks_launch_library_about_an_unknown_id(self):
+        class Stub:
+            @staticmethod
+            def _load_launch_payload(force=False):
+                return {"upcoming": [{"id": "real-1", "net": _iso(NET)}], "previous": []}
+
+            @staticmethod
+            def _get_raw_launch(launch_id):
+                return None
+
+            asked = []
+
+            @classmethod
+            def _refresh_hot_launch_raw(cls, launch_id):
+                cls.asked.append(launch_id)
+                return {"net": _iso(NET)}
+
+        original = push._app
+        push._app = lambda: Stub
+        try:
+            self.assertEqual(push._default_refresh("debug-sim-1"), (None, None))
+            self.assertEqual(Stub.asked, [])
+            launch, raw = push._default_refresh("real-1")
+            self.assertEqual(Stub.asked, ["real-1"])
+            self.assertEqual(raw, {"net": _iso(NET)})
+        finally:
+            push._app = original
+
+    def test_rejected_token_is_dropped_and_other_failures_back_off(self):
+        self._apns_env()
+        now = NET - timedelta(minutes=20)
+        lookup = lambda _id: (None, self._raw(NET + timedelta(minutes=15)))
+
+        def register(activity):
+            push.upsert_token(token="ab" * 16, launch_id="launch-1", activity_id=activity, net=_iso(NET),
+                              content_state=self._app_content(NET, now - timedelta(minutes=30)))
+            with push._lock:
+                stored = push._get(activity)
+                stored.update(pushed_net_unix=NET.timestamp(), pushed_dismiss_unix=(NET + timedelta(minutes=30)).timestamp())
+                push._put(activity, stored)
+
+        register("dead")
+        tries = []
+        push.tick(now=now, lookup=lookup,
+                  sender=lambda *a, **k: tries.append(1) or {"sent": False, "unregistered": True, "reason": "BadDeviceToken"})
+        self.assertEqual(len(tries), 1)
+        self.assertEqual(push._count(), 0)
+
+        register("flaky")
+        tries = []
+        for step in range(9):  # 0s … 120s, a pass every 15 seconds
+            push.tick(now=now + timedelta(seconds=15 * step), lookup=lookup,
+                      sender=lambda *a, **k: tries.append(1) or {"sent": False, "status": 503})
+        # 0s, then 30s later, then 60s after that: three tries, not nine.
+        self.assertEqual(len(tries), 3)
+        self.assertEqual(push._count(), 1)
+        sent = []
+        push.tick(now=now + timedelta(seconds=200), lookup=lookup,
+                  sender=lambda token, payload, priority=10: sent.append(payload) or {"sent": True})
+        self.assertEqual(sent, [])  # the third failure waits 120s
+        push.tick(now=now + timedelta(seconds=215), lookup=lookup,
+                  sender=lambda token, payload, priority=10: sent.append(payload) or {"sent": True})
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("flaky", push._send_backoff)
+
+    def test_apns_reason_is_read_from_the_body(self):
+        self.assertEqual(push._apns_reason('{"reason":"BadDeviceToken"}'), "BadDeviceToken")
+        self.assertIn("BadDeviceToken", push.DEAD_TOKEN_REASONS)
+        self.assertNotIn("TooManyRequests", push.DEAD_TOKEN_REASONS)
+        self.assertIsNone(push._apns_reason(""))
+        self.assertIsNone(push._apns_reason("not json"))
 
     def test_rejects_non_hex_token(self):
         self.assertIsNone(push._normalize_token("not a token!!!!!"))

@@ -116,3 +116,44 @@ class LaunchLibraryBackoffTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LaunchLibraryBudgetTests(unittest.TestCase):
+    """The account is allowed 45 requests an hour; the list refresh needs 12 of them."""
+
+    def setUp(self):
+        app._reset_cache_coordination_for_tests()
+
+    def tearDown(self):
+        app._reset_cache_coordination_for_tests()
+
+    def test_single_launch_reads_stop_at_the_hourly_budget(self):
+        with patch.object(app.requests, "get", return_value=_response(payload={"id": "u1"})) as get:
+            for _ in range(app.LL_SINGLE_LAUNCH_BUDGET_PER_HOUR):
+                self.assertEqual(app.fetch_launch_details("u1"), {"id": "u1"})
+            self.assertIsNone(app.fetch_launch_details("u1"))
+            self.assertIsNone(app.fetch_launch_details("u2"))
+        self.assertEqual(get.call_count, app.LL_SINGLE_LAUNCH_BUDGET_PER_HOUR)
+
+    def test_budget_frees_up_as_the_hour_rolls(self):
+        start = 1_000_000.0
+        for i in range(app.LL_SINGLE_LAUNCH_BUDGET_PER_HOUR):
+            self.assertTrue(app._ll_single_launch_allowed(now=start + i))
+        self.assertFalse(app._ll_single_launch_allowed(now=start + 100))
+        self.assertTrue(app._ll_single_launch_allowed(now=start + 3601))
+
+    def test_one_launch_and_the_list_refresh_fit_inside_the_limit(self):
+        near = (app.HOT_RAW_NEAR_BEFORE_SEC + app.HOT_RAW_NEAR_AFTER_SEC) / app.HOT_RAW_TTL_NEAR
+        far = (3600 - app.HOT_RAW_NEAR_BEFORE_SEC - app.HOT_RAW_NEAR_AFTER_SEC) / app.HOT_RAW_TTL
+        self.assertLessEqual(near + far, app.LL_SINGLE_LAUNCH_BUDGET_PER_HOUR)
+        self.assertLessEqual(app.LL_SINGLE_LAUNCH_BUDGET_PER_HOUR + 12, 45)
+
+    def test_fresh_copy_is_reused_longer_away_from_liftoff(self):
+        now = 1_800_000_000.0
+        iso = lambda offset: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + offset))
+        self.assertEqual(app._hot_raw_ttl({"net": iso(40 * 60)}, now=now), app.HOT_RAW_TTL)
+        self.assertEqual(app._hot_raw_ttl({"net": iso(10 * 60)}, now=now), app.HOT_RAW_TTL_NEAR)
+        self.assertEqual(app._hot_raw_ttl({"net": iso(-5 * 60)}, now=now), app.HOT_RAW_TTL_NEAR)
+        self.assertEqual(app._hot_raw_ttl({"net": iso(-20 * 60)}, now=now), app.HOT_RAW_TTL)
+        self.assertEqual(app._hot_raw_ttl({"net": "not a date"}, now=now), app.HOT_RAW_TTL)
+        self.assertEqual(app._hot_raw_ttl(None, now=now), app.HOT_RAW_TTL)
