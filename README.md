@@ -493,6 +493,7 @@ Chart data for **one** launch. Pad cadence and yearly vehicle totals stay off th
 *   **Response:** JSON, HTTP 200. A Launch Library error or HTTP 429 omits the section that call would have filled. That call is not retried.
 *   **Caching:** The launch record (timeline, orbit, landing, booster stats) is cached 6 hours (`launch_insights_v1:{id}`). Each booster's flight list is cached 24 hours (`launch_insights_booster_v1:{SERIAL}`). A hit does not call Launch Library. The route never refreshes `/launches`.
 *   **Budget:** Insights only spends the surplus above the main list refresh. Defaults are `LL_HOURLY_BUDGET=15` and `LL_RESERVED_FOR_MAIN_FEED=12` (two list calls every 10 minutes). Booster history is skipped when fewer than 2 surplus calls remain, so a launch-detail miss can still run. A 429 blocks further insights calls until the next UTC hour. Set the env vars if the token's real cap is higher.
+*   **Warmer:** After each list refresh the background worker fills this route for the next 12 upcoming launches already in the stored list, soonest first. A launch whose insights cache is still fresh is skipped. A booster serial that was just cached is not fetched again for the next launch. The warmer spends only the surplus above the 12 calls/hour kept for the list. One dyno holds a Redis lock that expires on its own, so a restart or a second worker does not start a second pass. Set `INSIGHTS_WARM=0` to disable it.
 *   **`cached`:** `true` when this response did not call Launch Library.
 
 Sections, included only when the source has them:
